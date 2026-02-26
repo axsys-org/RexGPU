@@ -80,6 +80,23 @@ export class RexGPU {
     // ── Readback (GPU → CPU) ──
     this._readbacks = [];           // [{srcBuffer, srcOffset, size, staging, pending, callback}]
     this.onReadback = null;         // callback(name, values) — GPU readback results
+
+    // ── MSAA ──
+    this._msaaTextures = new Map();
+
+    // ── Render bundles ──
+    this._renderBundles = new Map();
+
+    // ── Queries (timestamp, occlusion) ──
+    this._querySets = new Map();
+
+    // ── Video / external textures ──
+    this._videoTextures = new Map();
+    this._externalTextures = new Map();
+
+    // ── Mipmap generation pipeline (lazy) ──
+    this._mipPipeline = null;
+    this._mipSampler = null;
   }
 
   registerCompileType(typeName, handler) { this._compileHandlers.set(typeName, handler); }
@@ -98,6 +115,9 @@ export class RexGPU {
       'timestamp-query','shader-f16','float32-filterable',
       'indirect-first-instance','bgra8unorm-storage',
       'rg11b10ufloat-renderable','depth-clip-control',
+      'float32-blendable','dual-source-blending',
+      'subgroups','clip-distances',
+      'depth32float-stencil8',
     ];
     const available = DESIRED.filter(f => ad.features.has(f));
     this._features = new Set(available);
@@ -225,6 +245,9 @@ export class RexGPU {
     this._frameDirty = true;
     this._dirtyMin = 0;
     this._dirtyMax = this._heapSize||256;
+    // MSAA textures are resolution-dependent — must recreate
+    for (const [,t] of this._msaaTextures) t.destroy();
+    this._msaaTextures.clear();
   }
 
   destroy() {
@@ -242,6 +265,20 @@ export class RexGPU {
     this._bindGroups.clear();
     this.pipelines.clear();
     this.shaderModules.clear();
+    // MSAA textures
+    for (const [,t] of this._msaaTextures) t.destroy();
+    this._msaaTextures.clear();
+    // Render bundles
+    this._renderBundles.clear();
+    // Query sets
+    for (const [,qs] of this._querySets) { qs.querySet.destroy(); qs.resolveBuffer.destroy(); qs.readBuffer.destroy(); }
+    this._querySets.clear();
+    // Video textures
+    this._videoTextures.clear();
+    this._externalTextures.clear();
+    // Mipmap pipeline
+    this._mipPipeline = null;
+    this._mipSampler = null;
   }
 
   // ════════════════════════════════════════════════════════════════
@@ -255,10 +292,13 @@ export class RexGPU {
     // 0. Shared libs — compile @lib nodes into importable WGSL
     this._compileLibs(tree);
 
+    // 0.5. Canvas configuration
+    this._configureCanvas(tree);
+
     // 1. Structs
     this._compileStructs(tree);
 
-    // 2. Shaders (resolve #import for structs AND libs)
+    // 2. Shaders (resolve #import for structs AND libs, auto-inject WGSL enables)
     this._compileShaders(tree);
 
     // 3. Heap layout
@@ -273,7 +313,7 @@ export class RexGPU {
     // 6. Storage buffers
     this._compileStorageBuffers(tree);
 
-    // 7. Textures
+    // 7. Textures (mipmaps, views, video, transient, array/cube)
     this._compileTextures(tree);
 
     // 8. Vertex/Index buffers
@@ -282,8 +322,11 @@ export class RexGPU {
     // 8.5. Resource scopes (@resources → shared bind group layouts)
     this._compileResourceScopes(tree);
 
-    // 9. Pipelines (with vertex layout support + resource scopes)
+    // 9. Pipelines (MSAA, stencil, blend modes, write mask, dual-source)
     for (const p of Rex.findAll(tree,'pipeline')) this._buildPipeline(p.name, p);
+
+    // 9.5. Render bundles
+    this._compileRenderBundles(tree);
 
     // 10. Barrier schedule
     this._compileBarrierSchedule(tree);
@@ -291,7 +334,7 @@ export class RexGPU {
     // 11. Resource aliasing
     this._compileAliasingPlan(tree);
 
-    // 12. Command list
+    // 12. Command list (stencil, MSAA, bundles, indirect dispatch, queries)
     this._compileCommandList(tree);
 
     // 13. Write defaults
@@ -299,6 +342,9 @@ export class RexGPU {
 
     // 14. Readback descriptors
     this._compileReadbacks(tree);
+
+    // 14.5. Query sets (timestamp, occlusion)
+    this._compileQueries(tree);
 
     // 15. Extension compile hooks
     for (const [typeName, handler] of this._compileHandlers) {
@@ -324,6 +370,101 @@ export class RexGPU {
       this._readbacks.push({ name: node.name || from, srcBuffer: srcBuf, srcOffset: offset, size, staging, pending: false });
       this.log(`readback: "${node.name||from}" ${count} floats from "${from}"+${offset}`, 'ok');
     }
+  }
+
+  _configureCanvas(tree) {
+    const canvasNode = Rex.findAll(tree, 'canvas')[0];
+    if (!canvasNode) return;
+    const config = { device: this.device, format: this.format, alphaMode: canvasNode.attrs['alpha-mode'] || 'premultiplied' };
+    const toneMapping = canvasNode.attrs['tone-mapping'];
+    const colorSpace = canvasNode.attrs['color-space'];
+    if (toneMapping) config.toneMapping = { mode: toneMapping };
+    if (colorSpace) config.colorSpace = colorSpace;
+    this.context.configure(config);
+    this.log(`canvas: alpha=${config.alphaMode}${toneMapping ? ` tone=${toneMapping}` : ''}${colorSpace ? ` color-space=${colorSpace}` : ''}`,'ok');
+  }
+
+  _compileQueries(tree) {
+    for (const [,qs] of this._querySets) { qs.querySet.destroy(); qs.resolveBuffer.destroy(); qs.readBuffer.destroy(); }
+    this._querySets.clear();
+    for (const q of Rex.findAll(tree, 'query')) {
+      const type = q.attrs.type || 'timestamp';
+      if (type === 'timestamp' && !this._features.has('timestamp-query')) {
+        this.log(`query "${q.name}": timestamp-query feature not available`,'warn');
+        continue;
+      }
+      const count = +(q.attrs.count || 2);
+      const querySet = this.device.createQuerySet({ type, count });
+      const resolveBuffer = this.device.createBuffer({
+        size: count * 8, usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC,
+      });
+      const readBuffer = this.device.createBuffer({
+        size: count * 8, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+      });
+      this._querySets.set(q.name, { querySet, resolveBuffer, readBuffer, count, type, nextIndex: 0, readPending: false });
+      this.log(`query: "${q.name}" ${type} x${count}`,'ok');
+    }
+  }
+
+  _compileRenderBundles(tree) {
+    this._renderBundles.clear();
+    for (const bundle of Rex.findAll(tree, 'bundle')) {
+      const name = bundle.name;
+      if (!name) continue;
+      const draws = Rex.findAll(bundle, 'draw');
+      if (draws.length === 0) continue;
+      const firstPe = this.pipelines.get(draws[0].attrs.pipeline);
+      if (!firstPe) continue;
+      const depthFmt = bundle.attrs['depth-format'] || (bundle.attrs.depth ? 'depth24plus' : undefined);
+      const bundleEnc = this.device.createRenderBundleEncoder({
+        colorFormats: [firstPe.format || this.format],
+        depthStencilFormat: depthFmt,
+        sampleCount: firstPe.sampleCount || 1,
+      });
+      for (const draw of draws) {
+        const pe = this.pipelines.get(draw.attrs.pipeline);
+        if (!pe) continue;
+        bundleEnc.setPipeline(pe.pipeline);
+        if (pe.resourceScope && this._resourceScopes?.has(pe.resourceScope)) {
+          bundleEnc.setBindGroup(0, this._resourceScopes.get(pe.resourceScope).bindGroup);
+        }
+        for (const b of draw.children.filter(c => c.type === 'bind')) {
+          this._setBindGroup(bundleEnc, pe, {
+            group: Number(b.name)||0, buffer: b.attrs.buffer,
+            texture: b.attrs.texture, sampler: b.attrs.sampler, storage: b.attrs.storage,
+          });
+        }
+        if (draw.attrs.bind) this._setBindGroup(bundleEnc, pe, { group: 0, buffer: draw.attrs.bind });
+        if (draw.attrs['vertex-buffer']) {
+          const vb = this._vertexBuffers.get(draw.attrs['vertex-buffer']);
+          if (vb) bundleEnc.setVertexBuffer(0, vb);
+        }
+        if (draw.attrs['index-buffer'] && draw.attrs['index-count']) {
+          const ib = this._indexBuffers.get(draw.attrs['index-buffer']);
+          if (ib) { bundleEnc.setIndexBuffer(ib, 'uint32'); bundleEnc.drawIndexed(+(draw.attrs['index-count']), +(draw.attrs.instances||1)); }
+        } else {
+          bundleEnc.draw(+(draw.attrs.vertices||3), +(draw.attrs.instances||1));
+        }
+      }
+      this._renderBundles.set(name, bundleEnc.finish());
+      this.log(`bundle: "${name}" ${draws.length} draws recorded`,'ok');
+    }
+  }
+
+  _rebuildVideoScope(scopeName) {
+    const scope = this._resourceScopes.get(scopeName);
+    if (!scope || !scope._layoutEntries) return;
+    const entries = [];
+    for (const le of scope._entries) {
+      if (le._videoName) {
+        const extTex = this._externalTextures.get(le._videoName);
+        if (extTex) entries.push({ binding: le.binding, resource: extTex });
+        else return; // skip rebuild if video not ready
+      } else {
+        entries.push(le);
+      }
+    }
+    scope.bindGroup = this.device.createBindGroup({ layout: scope.layout, entries });
   }
 
   _compileLibs(tree) {
@@ -374,6 +515,13 @@ export class RexGPU {
         this.log(`shader "${key}": #import ${name} not found`,'warn');
         return `// #import ${name} \u2014 NOT FOUND`;
       });
+      // Auto-inject WGSL feature enables
+      const enables = [];
+      if (this._features.has('shader-f16') && /\bf16\b/.test(code)) enables.push('enable f16;');
+      if (this._features.has('subgroups') && /subgroup/.test(code)) enables.push('enable subgroups;');
+      if (this._features.has('clip-distances') && /clip_distances/.test(code)) enables.push('enable clip_distances;');
+      if (this._features.has('dual-source-blending') && /blend_src/.test(code)) enables.push('enable dual_source_blending;');
+      if (enables.length > 0) code = enables.join('\n') + '\n' + code;
       try {
         const mod = this.device.createShaderModule({code});
         this.shaderModules.set(key, mod);
@@ -511,29 +659,88 @@ export class RexGPU {
 
     for (const tex of Rex.findAll(tree, 'texture')) {
       const name = tex.name;
+
+      // View-of: create a view referencing another texture
+      if (tex.attrs['view-of']) {
+        const parentTex = this._textures.get(tex.attrs['view-of']);
+        if (!parentTex) { this.log(`texture "${name}": view-of "${tex.attrs['view-of']}" not found`,'err'); continue; }
+        const viewDesc = {};
+        if (tex.attrs['base-mip-level'] !== undefined) viewDesc.baseMipLevel = +tex.attrs['base-mip-level'];
+        if (tex.attrs['mip-level-count'] !== undefined) viewDesc.mipLevelCount = +tex.attrs['mip-level-count'];
+        if (tex.attrs['base-array-layer'] !== undefined) viewDesc.baseArrayLayer = +tex.attrs['base-array-layer'];
+        if (tex.attrs['array-layer-count'] !== undefined) viewDesc.arrayLayerCount = +tex.attrs['array-layer-count'];
+        if (tex.attrs['view-dimension']) viewDesc.dimension = tex.attrs['view-dimension'];
+        this._textures.set(name, parentTex); // share same GPUTexture
+        this._textureViews.set(name, parentTex.createView(viewDesc));
+        this.log(`texture: "${name}" view-of "${tex.attrs['view-of']}"`,'ok');
+        continue;
+      }
+
+      // Video textures — handled per-frame
+      if (tex.attrs.type === 'video' || tex.attrs.video) {
+        const videoId = tex.attrs['video-element'] || tex.attrs.video;
+        this._videoTextures.set(name, { elementId: videoId, name });
+        this.log(`texture: "${name}" [video: ${videoId}]`,'ok');
+        continue;
+      }
+
       const fmt = tex.attrs.format || 'rgba8unorm';
       const isDepth = fmt.startsWith('depth');
       const hasSrc = !!tex.attrs.src && !isDepth;
       const w = tex.attrs.width || (hasSrc ? 4 : 256);
       const h = tex.attrs.height || (hasSrc ? 4 : 256);
-      const usage = GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST |
-                    (tex.attrs.render ? GPUTextureUsage.RENDER_ATTACHMENT : 0) |
-                    (tex.attrs.storage ? GPUTextureUsage.STORAGE_BINDING : 0);
+      const wantMips = tex.attrs.mipmaps === true;
+      const mipLevelCount = wantMips ? Math.floor(Math.log2(Math.max(w, h))) + 1 : +(tex.attrs['mip-levels'] || 1);
+      const dim = tex.attrs.dimension || '2d';
+      const depthOrArrayLayers = +(tex.attrs['array-layers'] || tex.attrs['depth-layers'] || 1);
+      const isTransient = tex.attrs.transient === true;
+      const sampleCount = +(tex.attrs['sample-count'] || 1);
+      const usage = (isTransient ? 0 : (GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST)) |
+                    (tex.attrs.render || wantMips ? GPUTextureUsage.RENDER_ATTACHMENT : 0) |
+                    (tex.attrs.storage ? GPUTextureUsage.STORAGE_BINDING : 0) |
+                    (isTransient ? (GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TRANSIENT_ATTACHMENT) : 0);
 
-      const gpuTex = this.device.createTexture({
-        size: [w, h], format: fmt, usage,
-      });
+      const texDesc = {
+        size: { width: w, height: h, depthOrArrayLayers },
+        format: fmt, usage, mipLevelCount,
+        dimension: (dim === '2d-array' || dim === 'cube' || dim === 'cube-array') ? '2d' : dim,
+      };
+      if (sampleCount > 1) texDesc.sampleCount = sampleCount;
+
+      const gpuTex = this.device.createTexture(texDesc);
       this._textures.set(name, gpuTex);
-      this._textureViews.set(name, gpuTex.createView()); // Cache view at compile time
+
+      // Build view descriptor
+      const viewDesc = {};
+      if (tex.attrs['view-dimension']) viewDesc.dimension = tex.attrs['view-dimension'];
+      else if (dim === '2d-array') viewDesc.dimension = '2d-array';
+      else if (dim === 'cube') viewDesc.dimension = 'cube';
+      else if (dim === 'cube-array') viewDesc.dimension = 'cube-array';
+      if (tex.attrs['base-mip-level'] !== undefined) viewDesc.baseMipLevel = +tex.attrs['base-mip-level'];
+      if (tex.attrs['mip-level-count'] !== undefined) viewDesc.mipLevelCount = +tex.attrs['mip-level-count'];
+      if (tex.attrs['base-array-layer'] !== undefined) viewDesc.baseArrayLayer = +tex.attrs['base-array-layer'];
+      if (tex.attrs['array-layer-count'] !== undefined) viewDesc.arrayLayerCount = +tex.attrs['array-layer-count'];
+      this._textureViews.set(name, gpuTex.createView(Object.keys(viewDesc).length ? viewDesc : undefined));
 
       // Create matching sampler
       const filterMode = tex.attrs.filter || 'linear';
       const addressMode = tex.attrs.wrap || 'repeat';
-      const sampler = this.device.createSampler({
+      const aniso = +(tex.attrs.anisotropy || tex.attrs['max-anisotropy'] || 1);
+      const mipFilter = tex.attrs['mipmap-filter'] || (aniso > 1 ? 'linear' : 'nearest');
+      const compareFunc = tex.attrs.compare; // 'less', 'greater', 'equal', etc.
+      if (aniso > 1 && filterMode !== 'linear') this.log(`texture "${name}": anisotropy requires linear filtering`,'warn');
+      const samplerDesc = {
         magFilter: filterMode, minFilter: filterMode,
+        mipmapFilter: mipFilter,
         addressModeU: addressMode, addressModeV: addressMode,
-      });
-      this._samplers.set(name, sampler);
+        addressModeW: tex.attrs['wrap-w'] || addressMode,
+      };
+      if (aniso > 1) samplerDesc.maxAnisotropy = Math.min(aniso, 16);
+      if (compareFunc) samplerDesc.compare = compareFunc;
+      if (tex.attrs['lod-min'] !== undefined) samplerDesc.lodMinClamp = +tex.attrs['lod-min'];
+      if (tex.attrs['lod-max'] !== undefined) samplerDesc.lodMaxClamp = +tex.attrs['lod-max'];
+      const sampler = this.device.createSampler(samplerDesc);
+      this._samplers.set(name, { sampler, comparison: !!compareFunc });
 
       // Fill strategy
       if (hasSrc) {
@@ -548,7 +755,17 @@ export class RexGPU {
         this._fillNoise(gpuTex, w, h);
       }
 
-      this.log(`texture: "${name}" ${w}x${h} ${fmt}${hasSrc?' [loading]':''}`,'ok');
+      // Generate mipmaps for non-async textures
+      if (wantMips && !hasSrc && !isDepth) this._generateMipmaps(gpuTex, w, h, fmt);
+
+      const extras = [];
+      if (wantMips) extras.push(`${mipLevelCount} mips`);
+      if (depthOrArrayLayers > 1) extras.push(`${depthOrArrayLayers} layers`);
+      if (sampleCount > 1) extras.push(`${sampleCount}x MSAA`);
+      if (isTransient) extras.push('transient');
+      if (aniso > 1) extras.push(`aniso ${aniso}`);
+      if (compareFunc) extras.push(`compare: ${compareFunc}`);
+      this.log(`texture: "${name}" ${w}x${h} ${fmt}${hasSrc?' [loading]':''}${extras.length?' ['+extras.join(', ')+']':''}`,'ok');
     }
   }
 
@@ -587,15 +804,18 @@ export class RexGPU {
 
       const w = bitmap.width, h = bitmap.height;
       const fmt = attrs.format || 'rgba8unorm';
+      const wantMips = attrs.mipmaps === true;
+      const mipLevelCount = wantMips ? Math.floor(Math.log2(Math.max(w, h))) + 1 : +(attrs['mip-levels'] || 1);
       const newTex = this.device.createTexture({
-        size: [w, h], format: fmt,
+        size: [w, h], format: fmt, mipLevelCount,
         usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST |
-               (attrs.render ? GPUTextureUsage.RENDER_ATTACHMENT : 0),
+               (attrs.render || wantMips ? GPUTextureUsage.RENDER_ATTACHMENT : 0),
       });
       this.device.queue.copyExternalImageToTexture(
         { source: bitmap }, { texture: newTex }, [w, h]
       );
       bitmap.close();
+      if (wantMips) this._generateMipmaps(newTex, w, h, fmt);
       this._textures.set(name, newTex);
       this._bindGroups.clear();
       this._frameDirty = true;
@@ -622,6 +842,50 @@ export class RexGPU {
       data[i] = v; data[i+1] = v; data[i+2] = v; data[i+3] = 255;
     }
     this.device.queue.writeTexture({texture:tex}, data, {bytesPerRow:w*4}, [w,h]);
+  }
+
+  _generateMipmaps(texture, width, height, format) {
+    if (!this._mipPipeline) {
+      const mod = this.device.createShaderModule({ code: `
+@group(0) @binding(0) var s: sampler;
+@group(0) @binding(1) var t: texture_2d<f32>;
+struct VSOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
+@vertex fn vs(@builtin(vertex_index) i: u32) -> VSOut {
+  let uv = vec2f(f32((i << 1u) & 2u), f32(i & 2u));
+  return VSOut(vec4f(uv * 2.0 - 1.0, 0.0, 1.0), vec2f(uv.x, 1.0 - uv.y));
+}
+@fragment fn fs(v: VSOut) -> @location(0) vec4f {
+  return textureSample(t, s, v.uv);
+}` });
+      this._mipPipeline = this.device.createRenderPipeline({
+        layout: 'auto',
+        vertex: { module: mod, entryPoint: 'vs' },
+        fragment: { module: mod, entryPoint: 'fs', targets: [{ format }] },
+        primitive: { topology: 'triangle-list' },
+      });
+      this._mipSampler = this.device.createSampler({ minFilter: 'linear', magFilter: 'linear' });
+    }
+    const enc = this.device.createCommandEncoder();
+    const mipCount = Math.floor(Math.log2(Math.max(width, height))) + 1;
+    for (let level = 1; level < mipCount; level++) {
+      const srcView = texture.createView({ baseMipLevel: level - 1, mipLevelCount: 1 });
+      const dstView = texture.createView({ baseMipLevel: level, mipLevelCount: 1 });
+      const bg = this.device.createBindGroup({
+        layout: this._mipPipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: this._mipSampler },
+          { binding: 1, resource: srcView },
+        ],
+      });
+      const pass = enc.beginRenderPass({
+        colorAttachments: [{ view: dstView, loadOp: 'clear', storeOp: 'store', clearValue: {r:0,g:0,b:0,a:0} }],
+      });
+      pass.setPipeline(this._mipPipeline);
+      pass.setBindGroup(0, bg);
+      pass.draw(3);
+      pass.end();
+    }
+    this.device.queue.submit([enc.finish()]);
   }
 
   // ── Vertex / Index buffers ──
@@ -681,50 +945,71 @@ export class RexGPU {
       const entries = [];
       const layoutEntries = [];
       let binding = 0;
+      let hasVideo = false;
 
       for (const child of res.children) {
         if (child.type === 'buffer') {
           const usage = child.attrs.usage;
           const isStorage = usage && Array.isArray(usage) && usage.includes('storage');
           const bufName = child.name;
+          const dynamic = child.attrs.dynamic === true;
 
           if (isStorage) {
             const sb = this._storageBuffers.get(bufName);
             if (sb) {
-              layoutEntries.push({ binding, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT | GPUShaderStage.COMPUTE, buffer: { type: 'storage' } });
+              layoutEntries.push({ binding, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT | GPUShaderStage.COMPUTE, buffer: { type: 'storage', hasDynamicOffset: dynamic } });
               entries.push({ binding, resource: { buffer: sb } });
+              if (dynamic) this.log(`resources "${name}": buffer "${bufName}" has dynamic offset`,'ok');
               binding++;
             }
           } else {
             const hl = this._heapLayout.get(bufName);
             if (hl && this._heapBuffer) {
-              layoutEntries.push({ binding, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT | GPUShaderStage.COMPUTE, buffer: { type: 'uniform', hasDynamicOffset: false, minBindingSize: hl.size } });
+              layoutEntries.push({ binding, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT | GPUShaderStage.COMPUTE, buffer: { type: 'uniform', hasDynamicOffset: dynamic, minBindingSize: hl.size } });
               entries.push({ binding, resource: { buffer: this._heapBuffer, offset: hl.offset, size: hl.size } });
               binding++;
             }
           }
         } else if (child.type === 'texture') {
           const texName = child.name;
+
+          // Video / external texture
+          if (this._videoTextures.has(texName)) {
+            layoutEntries.push({ binding, visibility: GPUShaderStage.FRAGMENT, externalTexture: {} });
+            const extTex = this._externalTextures.get(texName);
+            if (extTex) {
+              entries.push({ binding, resource: extTex });
+            } else {
+              // Placeholder — will be rebuilt per-frame
+              entries.push({ binding, resource: this.device.importExternalTexture({ source: new VideoFrame(new Uint8Array(4), { timestamp: 0, codedWidth: 1, codedHeight: 1, format: 'RGBA' }) }) });
+            }
+            entries[entries.length - 1]._videoName = texName;
+            hasVideo = true;
+            binding++;
+            continue;
+          }
+
           const tex = this._textures.get(texName);
           const samp = this._samplers.get(texName);
           const isStorageTex = child.attrs.storage === true || child.attrs.usage === 'storage';
           if (isStorageTex) {
-            // Writable storage texture (texture_storage_2d)
             if (tex) {
               const storageFmt = child.attrs.format || 'rgba8unorm';
-              layoutEntries.push({ binding, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: storageFmt } });
+              const access = child.attrs.access || 'write-only';
+              layoutEntries.push({ binding, visibility: GPUShaderStage.COMPUTE, storageTexture: { access, format: storageFmt } });
               entries.push({ binding, resource: (this._textureViews && this._textureViews.get(texName)) || tex.createView() });
               binding++;
             }
           } else {
-            // Sampled texture + sampler
             if (samp) {
-              layoutEntries.push({ binding, visibility: GPUShaderStage.FRAGMENT | GPUShaderStage.COMPUTE, sampler: {} });
-              entries.push({ binding, resource: samp });
+              const isComparison = samp.comparison;
+              layoutEntries.push({ binding, visibility: GPUShaderStage.FRAGMENT | GPUShaderStage.COMPUTE, sampler: { type: isComparison ? 'comparison' : 'filtering' } });
+              entries.push({ binding, resource: samp.sampler });
               binding++;
             }
             if (tex) {
-              layoutEntries.push({ binding, visibility: GPUShaderStage.FRAGMENT | GPUShaderStage.COMPUTE, texture: {} });
+              const isDepthTex = (tex.format || '').startsWith('depth');
+              layoutEntries.push({ binding, visibility: GPUShaderStage.FRAGMENT | GPUShaderStage.COMPUTE, texture: isDepthTex ? { sampleType: 'depth' } : {} });
               entries.push({ binding, resource: (this._textureViews && this._textureViews.get(texName)) || tex.createView() });
               binding++;
             }
@@ -738,8 +1023,8 @@ export class RexGPU {
       if (layoutEntries.length > 0) {
         const layout = this.device.createBindGroupLayout({ entries: layoutEntries });
         const bindGroup = this.device.createBindGroup({ layout, entries });
-        this._resourceScopes.set(name, { layout, bindGroup, entries: layoutEntries.length });
-        this.log(`resources: "${name}" ${layoutEntries.length} bindings`, 'ok');
+        this._resourceScopes.set(name, { layout, bindGroup, entries: layoutEntries.length, hasVideo, _layoutEntries: layoutEntries, _entries: entries });
+        this.log(`resources: "${name}" ${layoutEntries.length} bindings${hasVideo ? ' [video]' : ''}`, 'ok');
       }
     }
   }
@@ -779,6 +1064,18 @@ export class RexGPU {
           target: node.attrs.target || null,
           targets: node.attrs.targets || null,
           depthTarget: node.attrs['depth-target'] || null,
+          // Stencil
+          stencilClearValue: +(node.attrs['stencil-clear'] ?? 0),
+          stencilLoadOp: node.attrs['stencil-load'] || 'clear',
+          stencilStoreOp: node.attrs['stencil-store'] || 'store',
+          stencilRef: +(node.attrs['stencil-ref'] ?? 0),
+          // Queries
+          query: node.attrs.query || null,
+          occlusionQuery: node.attrs['occlusion-query'] || null,
+          // Bundles
+          executeBundles: node.attrs['execute-bundle']
+            ? (Array.isArray(node.attrs['execute-bundle']) ? node.attrs['execute-bundle'] : [node.attrs['execute-bundle']])
+            : null,
         };
         for (const child of node.children) {
           if (child.type === 'draw') {
@@ -793,6 +1090,11 @@ export class RexGPU {
               indirect: child.attrs.indirect === true,
               indirectBuffer: child.attrs['indirect-buffer'] || null,
               indirectOffset: this._resolveDrawValue(child.attrs['indirect-offset']) || 0,
+              // Dynamic offsets
+              dynamicOffsets: child.attrs['dynamic-offsets']
+                ? child.attrs['dynamic-offsets'].map(v => +v) : null,
+              // Occlusion query per-draw
+              occlusionIndex: +(child.attrs['occlusion-index'] ?? -1),
             };
             for (const b of child.children.filter(c=>c.type==='bind')) {
               draw.binds.push({
@@ -807,6 +1109,13 @@ export class RexGPU {
             passCmd.draws.push(draw);
           }
         }
+        // Derive MSAA sample count from pipeline draws
+        let maxMsaa = 1;
+        for (const d of passCmd.draws) {
+          const pe = this.pipelines.get(d.pipelineKey);
+          if (pe?.sampleCount > maxMsaa) maxMsaa = pe.sampleCount;
+        }
+        passCmd.sampleCount = maxMsaa;
         this._commandList.push(passCmd);
         return;
       }
@@ -817,6 +1126,10 @@ export class RexGPU {
           pipelineKey: node.attrs.pipeline,
           grid: [this._resolveDrawValue(grid[0])||1, this._resolveDrawValue(grid[1])||1, this._resolveDrawValue(grid[2])||1],
           binds: [],
+          indirect: node.attrs.indirect === true,
+          indirectBuffer: node.attrs['indirect-buffer'] || null,
+          indirectOffset: +(node.attrs['indirect-offset'] || 0),
+          query: node.attrs.query || null,
         };
         for (const b of node.children.filter(c=>c.type==='bind')) {
           dispCmd.binds.push({
@@ -983,12 +1296,24 @@ export class RexGPU {
       targets = [{ format: this._resolveFmt(pNode.attrs.format || 'canvas') }];
     }
     const format = targets[0].format;
+    const sampleCount = +(pNode.attrs.msaa || pNode.attrs['sample-count'] || 1);
+    const prim = {
+      topology: pNode.attrs.topology || 'triangle-list',
+      cullMode: pNode.attrs.cull || 'none',
+      frontFace: pNode.attrs['front-face'] || 'ccw',
+    };
+    if (pNode.attrs['strip-index-format']) prim.stripIndexFormat = pNode.attrs['strip-index-format'];
+    if (pNode.attrs['unclipped-depth'] && this._features.has('depth-clip-control')) prim.unclippedDepth = true;
+
     const desc = {
       layout: explicitLayout,
       vertex: { module:vm, entryPoint:vEntry, buffers: [] },
       fragment: { module:fm, entryPoint:fEntry, targets },
-      primitive: { topology: (pNode.attrs.topology||'triangle-list'), cullMode: pNode.attrs.cull || 'none' },
+      primitive: prim,
     };
+
+    // MSAA
+    if (sampleCount > 1) desc.multisample = { count: sampleCount };
 
     // Vertex buffer layout from @vertex-layout children
     const layouts = Rex.findAll(pNode, 'vertex-layout');
@@ -1008,13 +1333,32 @@ export class RexGPU {
       });
     }
 
-    // Depth stencil
-    if (pNode.attrs.depth === true || pNode.attrs['depth-format']) {
+    // Depth/stencil
+    const hasStencilOps = pNode.attrs['stencil-front-compare'] || pNode.attrs['stencil-back-compare'];
+    if (pNode.attrs.depth === true || pNode.attrs['depth-format'] || hasStencilOps) {
+      let fmt = pNode.attrs['depth-format'] || 'depth24plus';
+      if (hasStencilOps && !fmt.includes('stencil')) fmt = 'depth24plus-stencil8';
       desc.depthStencil = {
-        format: pNode.attrs['depth-format'] || 'depth24plus',
-        depthWriteEnabled: true,
+        format: fmt,
+        depthWriteEnabled: pNode.attrs['depth-write'] !== false,
         depthCompare: pNode.attrs['depth-compare'] || 'less',
       };
+      if (hasStencilOps) {
+        const parseFace = (prefix) => ({
+          compare: pNode.attrs[`${prefix}-compare`] || 'always',
+          passOp: pNode.attrs[`${prefix}-pass-op`] || 'keep',
+          failOp: pNode.attrs[`${prefix}-fail-op`] || 'keep',
+          depthFailOp: pNode.attrs[`${prefix}-depth-fail-op`] || 'keep',
+        });
+        desc.depthStencil.stencilFront = parseFace('stencil-front');
+        desc.depthStencil.stencilBack = pNode.attrs['stencil-back-compare']
+          ? parseFace('stencil-back') : parseFace('stencil-front');
+        if (pNode.attrs['stencil-read-mask'] !== undefined) desc.depthStencil.stencilReadMask = +pNode.attrs['stencil-read-mask'];
+        if (pNode.attrs['stencil-write-mask'] !== undefined) desc.depthStencil.stencilWriteMask = +pNode.attrs['stencil-write-mask'];
+      }
+      if (pNode.attrs['depth-bias'] !== undefined) desc.depthStencil.depthBias = +pNode.attrs['depth-bias'];
+      if (pNode.attrs['depth-bias-slope'] !== undefined) desc.depthStencil.depthBiasSlopeScale = +pNode.attrs['depth-bias-slope'];
+      if (pNode.attrs['depth-bias-clamp'] !== undefined) desc.depthStencil.depthBiasClamp = +pNode.attrs['depth-bias-clamp'];
     }
 
     // Blending — apply to all targets
@@ -1026,16 +1370,43 @@ export class RexGPU {
         'multiply': {color:{srcFactor:'dst-color',dstFactor:'zero',operation:'add'},alpha:{srcFactor:'dst-alpha',dstFactor:'zero',operation:'add'}},
         'screen': {color:{srcFactor:'one',dstFactor:'one-minus-src-color',operation:'add'},alpha:{srcFactor:'one',dstFactor:'one-minus-src-alpha',operation:'add'}},
         'premultiplied': {color:{srcFactor:'one',dstFactor:'one-minus-src-alpha',operation:'add'},alpha:{srcFactor:'one',dstFactor:'one-minus-src-alpha',operation:'add'}},
+        'min': {color:{srcFactor:'one',dstFactor:'one',operation:'min'},alpha:{srcFactor:'one',dstFactor:'one',operation:'min'}},
+        'max': {color:{srcFactor:'one',dstFactor:'one',operation:'max'},alpha:{srcFactor:'one',dstFactor:'one',operation:'max'}},
+        'subtract': {color:{srcFactor:'one',dstFactor:'one',operation:'subtract'},alpha:{srcFactor:'one',dstFactor:'one',operation:'subtract'}},
+        'reverse-subtract': {color:{srcFactor:'one',dstFactor:'one',operation:'reverse-subtract'},alpha:{srcFactor:'one',dstFactor:'one',operation:'reverse-subtract'}},
       };
-      const blend = BLEND_MODES[blendMode];
+      let blend = BLEND_MODES[blendMode];
       if (blend) for (const t of desc.fragment.targets) t.blend = blend;
       else this.log(`pipeline "${key}": unknown blend mode "${blendMode}"`,'warn');
+    }
+    // Custom blend via individual attrs
+    if (pNode.attrs['blend-src-color']) {
+      const blend = {
+        color: { srcFactor: pNode.attrs['blend-src-color']||'one', dstFactor: pNode.attrs['blend-dst-color']||'zero', operation: pNode.attrs['blend-op-color']||'add' },
+        alpha: { srcFactor: pNode.attrs['blend-src-alpha']||'one', dstFactor: pNode.attrs['blend-dst-alpha']||'zero', operation: pNode.attrs['blend-op-alpha']||'add' },
+      };
+      for (const t of desc.fragment.targets) t.blend = blend;
+    }
+
+    // Color write mask
+    const writeMaskAttr = pNode.attrs['write-mask'];
+    if (writeMaskAttr !== undefined) {
+      let mask = 0;
+      if (Array.isArray(writeMaskAttr)) {
+        for (const ch of writeMaskAttr) {
+          if (ch === 'r' || ch === 'red') mask |= 0x1;    // GPUColorWrite.RED
+          if (ch === 'g' || ch === 'green') mask |= 0x2;  // GPUColorWrite.GREEN
+          if (ch === 'b' || ch === 'blue') mask |= 0x4;   // GPUColorWrite.BLUE
+          if (ch === 'a' || ch === 'alpha') mask |= 0x8;   // GPUColorWrite.ALPHA
+        }
+      }
+      for (const t of desc.fragment.targets) t.writeMask = mask;
     }
 
     try {
       const newPipeline = this.device.createRenderPipeline(desc);
-      this.pipelines.set(key, {pipeline:newPipeline, type:'render', format, resourceScope: resName || null});
-      this.log(`pipeline "${key}": render \u2713${resScope ? ` [resources: ${resName}]` : ''}`,'ok');
+      this.pipelines.set(key, {pipeline:newPipeline, type:'render', format, resourceScope: resName || null, sampleCount});
+      this.log(`pipeline "${key}": render \u2713${sampleCount > 1 ? ` [${sampleCount}x MSAA]` : ''}${resScope ? ` [resources: ${resName}]` : ''}`,'ok');
     } catch(e) {
       this.log(`pipeline "${key}": ${e.message} \u2014 keeping last-good`,'err');
     }
@@ -1073,9 +1444,38 @@ export class RexGPU {
     this.inputState.mouseDY = 0;
     this.inputState.mouseWheel = 0;
 
+    // Re-import video textures every frame
+    for (const [name, vt] of this._videoTextures) {
+      const el = document.getElementById(vt.elementId);
+      if (el && el.readyState >= 2) {
+        try {
+          this._externalTextures.set(name, this.device.importExternalTexture({ source: el }));
+          // Invalidate bind groups referencing this video
+          for (const [k] of this._bindGroups) { if (k.includes(name)) this._bindGroups.delete(k); }
+        } catch(e) { /* video not ready */ }
+      }
+    }
+    // Rebuild resource scopes that contain video textures
+    if (this._videoTextures.size > 0) {
+      for (const [scopeName, scope] of this._resourceScopes) {
+        if (scope.hasVideo) this._rebuildVideoScope(scopeName);
+      }
+    }
+
+    // Reset query indices for this frame
+    for (const [, tq] of this._querySets) { tq.nextIndex = 0; }
+
     const enc = this.device.createCommandEncoder();
     const tv = this.context.getCurrentTexture().createView();
     this._executeCommandList(enc, tv);
+
+    // Query resolve (before readback copies)
+    for (const [, tq] of this._querySets) {
+      if (tq.nextIndex > 0) {
+        enc.resolveQuerySet(tq.querySet, 0, tq.nextIndex, tq.resolveBuffer, 0);
+        enc.copyBufferToBuffer(tq.resolveBuffer, 0, tq.readBuffer, 0, tq.nextIndex * 8);
+      }
+    }
 
     // Readback copies (before submit)
     for (const rb of this._readbacks) {
@@ -1084,7 +1484,7 @@ export class RexGPU {
 
     this.device.queue.submit([enc.finish()]);
 
-    // Async readback
+    // Async readback — standard buffers
     if (this.onReadback) {
       for (const rb of this._readbacks) {
         if (rb.pending) continue;
@@ -1097,59 +1497,157 @@ export class RexGPU {
         }).catch(() => { rb.pending = false; });
       }
     }
+
+    // Async readback — query results
+    for (const [name, tq] of this._querySets) {
+      if (tq.readPending || tq.nextIndex === 0) continue;
+      tq.readPending = true;
+      tq.readBuffer.mapAsync(GPUMapMode.READ).then(() => {
+        const data = new BigUint64Array(tq.readBuffer.getMappedRange().slice(0));
+        tq.readBuffer.unmap();
+        tq.readPending = false;
+        if (tq.type === 'timestamp' && data.length >= 2 && this.onReadback) {
+          const ms = Number(data[1] - data[0]) / 1_000_000;
+          this.onReadback(`${name}-timing`, new Float32Array([ms]));
+        } else if (tq.type === 'occlusion' && this.onReadback) {
+          const counts = new Float32Array(data.length);
+          for (let i = 0; i < data.length; i++) counts[i] = Number(data[i]);
+          this.onReadback(`${name}-occlusion`, counts);
+        }
+      }).catch(() => { tq.readPending = false; });
+    }
   }
 
   _executeCommandList(enc, tv) {
     if (!this._commandList) return;
+    const cw = this.canvas.width, ch = this.canvas.height;
+
     for (const cmd of this._commandList) {
       if (cmd.type === 'pass') {
+        const msaa = cmd.sampleCount || 1;
+
         // Resolve color attachment(s)
         const colorAttachments = [];
+        const buildAttachment = (resolvedView, clearVal, isFirst) => {
+          if (msaa > 1) {
+            // MSAA: render to multi-sample texture, resolve to actual target
+            const targetFmt = resolvedView._fmt || this.format;
+            const tw = resolvedView._w || cw, th = resolvedView._h || ch;
+            const msaaKey = `msaa_${tw}x${th}_${targetFmt}_${msaa}`;
+            if (!this._msaaTextures.has(msaaKey)) {
+              this._msaaTextures.set(msaaKey, this.device.createTexture({
+                size: [tw, th], format: targetFmt, sampleCount: msaa,
+                usage: GPUTextureUsage.RENDER_ATTACHMENT,
+              }));
+            }
+            return {
+              view: this._msaaTextures.get(msaaKey).createView(),
+              resolveTarget: resolvedView,
+              clearValue: clearVal, loadOp: cmd.loadOp, storeOp: 'discard',
+            };
+          }
+          return { view: resolvedView, clearValue: clearVal, loadOp: cmd.loadOp, storeOp: cmd.storeOp };
+        };
+
         if (cmd.targets && Array.isArray(cmd.targets)) {
           for (let i = 0; i < cmd.targets.length; i++) {
             const tex = this._textures.get(cmd.targets[i]);
             if (!tex) { this.log(`pass: MRT target "${cmd.targets[i]}" not found`,'err'); continue; }
-            colorAttachments.push({
-              view: this._textureViews.get(cmd.targets[i]) || tex.createView(),
-              clearValue: i === 0 ? cmd.clearValue : {r:0,g:0,b:0,a:0},
-              loadOp: cmd.loadOp, storeOp: cmd.storeOp,
-            });
+            const view = this._textureViews.get(cmd.targets[i]) || tex.createView();
+            view._w = tex.width; view._h = tex.height; view._fmt = tex.format;
+            colorAttachments.push(buildAttachment(view, i === 0 ? cmd.clearValue : {r:0,g:0,b:0,a:0}, i === 0));
           }
         } else if (cmd.target && cmd.target !== 'canvas') {
           const tex = this._textures.get(cmd.target);
-          colorAttachments.push({
-            view: tex ? (this._textureViews.get(cmd.target) || tex.createView()) : tv,
-            clearValue: cmd.clearValue, loadOp: cmd.loadOp, storeOp: cmd.storeOp,
-          });
+          const view = tex ? (this._textureViews.get(cmd.target) || tex.createView()) : tv;
+          if (tex) { view._w = tex.width; view._h = tex.height; view._fmt = tex.format; }
+          else { view._w = cw; view._h = ch; view._fmt = this.format; }
+          colorAttachments.push(buildAttachment(view, cmd.clearValue, true));
           if (!tex) this.log(`pass: target "${cmd.target}" not found, using canvas`,'warn');
         } else {
-          colorAttachments.push({
-            view: tv, clearValue: cmd.clearValue,
-            loadOp: cmd.loadOp, storeOp: cmd.storeOp,
-          });
+          tv._w = cw; tv._h = ch; tv._fmt = this.format;
+          colorAttachments.push(buildAttachment(tv, cmd.clearValue, true));
         }
 
         const passDesc = { colorAttachments };
 
-        // Depth attachment
+        // Depth/stencil attachment
         if (cmd.depthTarget) {
           const depthTex = this._textures.get(cmd.depthTarget);
           if (depthTex) {
-            passDesc.depthStencilAttachment = {
-              view: (this._textureViews && this._textureViews.get(cmd.depthTarget)) || depthTex.createView(),
-              depthClearValue: 1.0, depthLoadOp: 'clear', depthStoreOp: 'store',
+            const depthView = (this._textureViews && this._textureViews.get(cmd.depthTarget)) || depthTex.createView();
+            if (msaa > 1) {
+              // MSAA depth texture
+              const depthFmt = depthTex.format || 'depth24plus';
+              const dw = depthTex.width, dh = depthTex.height;
+              const depthMsaaKey = `msaa_depth_${dw}x${dh}_${depthFmt}_${msaa}`;
+              if (!this._msaaTextures.has(depthMsaaKey)) {
+                this._msaaTextures.set(depthMsaaKey, this.device.createTexture({
+                  size: [dw, dh], format: depthFmt, sampleCount: msaa,
+                  usage: GPUTextureUsage.RENDER_ATTACHMENT,
+                }));
+              }
+              passDesc.depthStencilAttachment = {
+                view: this._msaaTextures.get(depthMsaaKey).createView(),
+                depthClearValue: 1.0, depthLoadOp: 'clear', depthStoreOp: 'discard',
+                stencilClearValue: cmd.stencilClearValue || 0,
+                stencilLoadOp: cmd.stencilLoadOp || 'clear',
+                stencilStoreOp: cmd.stencilStoreOp || 'discard',
+              };
+            } else {
+              passDesc.depthStencilAttachment = {
+                view: depthView,
+                depthClearValue: 1.0, depthLoadOp: 'clear', depthStoreOp: 'store',
+                stencilClearValue: cmd.stencilClearValue || 0,
+                stencilLoadOp: cmd.stencilLoadOp || 'clear',
+                stencilStoreOp: cmd.stencilStoreOp || 'store',
+              };
+            }
+          }
+        }
+
+        // Timestamp queries
+        if (cmd.query && this._querySets.has(cmd.query)) {
+          const tq = this._querySets.get(cmd.query);
+          if (tq.nextIndex + 1 < tq.count) {
+            passDesc.timestampWrites = {
+              querySet: tq.querySet,
+              beginningOfPassWriteIndex: tq.nextIndex++,
+              endOfPassWriteIndex: tq.nextIndex++,
             };
           }
         }
 
+        // Occlusion query set
+        if (cmd.occlusionQuery && this._querySets.has(cmd.occlusionQuery)) {
+          passDesc.occlusionQuerySet = this._querySets.get(cmd.occlusionQuery).querySet;
+        }
+
         const pass = enc.beginRenderPass(passDesc);
+
+        // Execute bundles (mutually exclusive with inline draws)
+        if (cmd.executeBundles) {
+          const bundles = cmd.executeBundles.map(n => this._renderBundles.get(n)).filter(Boolean);
+          if (bundles.length > 0) pass.executeBundles(bundles);
+          pass.end();
+          continue;
+        }
+
+        // Stencil reference
+        if (cmd.stencilRef) pass.setStencilReference(cmd.stencilRef);
+
         for (const draw of cmd.draws) {
           const pe = this.pipelines.get(draw.pipelineKey);
           if (!pe) continue;
           pass.setPipeline(pe.pipeline);
           // Auto-set resource scope bind group at group 0 if pipeline uses one
           if (pe.resourceScope && this._resourceScopes?.has(pe.resourceScope)) {
-            pass.setBindGroup(0, this._resourceScopes.get(pe.resourceScope).bindGroup);
+            const scope = this._resourceScopes.get(pe.resourceScope);
+            if (draw.dynamicOffsets) {
+              pass.setBindGroup(0, scope.bindGroup, draw.dynamicOffsets);
+            } else {
+              pass.setBindGroup(0, scope.bindGroup);
+            }
           }
           for (const b of draw.binds) this._setBindGroup(pass, pe, b);
           // Vertex buffer
@@ -1157,34 +1655,55 @@ export class RexGPU {
             const vb = this._vertexBuffers.get(draw.vertexBuffer);
             if (vb) pass.setVertexBuffer(0, vb);
           }
+
+          // Occlusion query per-draw
+          const useOcclusion = draw.occlusionIndex >= 0 && cmd.occlusionQuery;
+
+          if (useOcclusion) pass.beginOcclusionQuery(draw.occlusionIndex);
+
           // Indirect draw
           if (draw.indirect && draw.indirectBuffer) {
             const indBuf = this._storageBuffers.get(draw.indirectBuffer);
-            if (!indBuf) { this.log(`draw: indirect buffer "${draw.indirectBuffer}" not found`,'err'); continue; }
+            if (!indBuf) { this.log(`draw: indirect buffer "${draw.indirectBuffer}" not found`,'err'); if (useOcclusion) pass.endOcclusionQuery(); continue; }
             if (draw.indexBuffer && draw.indexCount > 0) {
               const ib = this._indexBuffers.get(draw.indexBuffer);
               if (ib) { pass.setIndexBuffer(ib, 'uint32'); pass.drawIndexedIndirect(indBuf, draw.indirectOffset); }
             } else {
               pass.drawIndirect(indBuf, draw.indirectOffset);
             }
-            continue;
           }
           // Index buffer (direct)
-          if (draw.indexBuffer && draw.indexCount > 0) {
+          else if (draw.indexBuffer && draw.indexCount > 0) {
             const ib = this._indexBuffers.get(draw.indexBuffer);
             if (ib) {
               pass.setIndexBuffer(ib, 'uint32');
               pass.drawIndexed(draw.indexCount, draw.instances, 0, 0, 0);
-              continue;
+            } else {
+              pass.draw(draw.vertices, draw.instances, 0, 0);
             }
+          } else {
+            pass.draw(draw.vertices, draw.instances, 0, 0);
           }
-          pass.draw(draw.vertices, draw.instances, 0, 0);
+
+          if (useOcclusion) pass.endOcclusionQuery();
         }
         pass.end();
       } else if (cmd.type === 'dispatch') {
         const pe = this.pipelines.get(cmd.pipelineKey);
         if (!pe || pe.type !== 'compute') continue;
-        const cp = enc.beginComputePass();
+        const cpDesc = {};
+        // Timestamp queries for compute
+        if (cmd.query && this._querySets.has(cmd.query)) {
+          const tq = this._querySets.get(cmd.query);
+          if (tq.nextIndex + 1 < tq.count) {
+            cpDesc.timestampWrites = {
+              querySet: tq.querySet,
+              beginningOfPassWriteIndex: tq.nextIndex++,
+              endOfPassWriteIndex: tq.nextIndex++,
+            };
+          }
+        }
+        const cp = enc.beginComputePass(cpDesc);
         cp.setPipeline(pe.pipeline);
         // Auto-set resource scope bind group at group 0 if pipeline uses one
         if (pe.resourceScope && this._resourceScopes?.has(pe.resourceScope)) {
@@ -1193,7 +1712,14 @@ export class RexGPU {
         for (const b of cmd.binds) {
           this._setBindGroup(cp, pe, b);
         }
-        cp.dispatchWorkgroups(cmd.grid[0], cmd.grid[1], cmd.grid[2]);
+        // Indirect compute dispatch
+        if (cmd.indirect && cmd.indirectBuffer) {
+          const indBuf = this._storageBuffers.get(cmd.indirectBuffer);
+          if (indBuf) cp.dispatchWorkgroupsIndirect(indBuf, cmd.indirectOffset);
+          else this.log(`dispatch: indirect buffer "${cmd.indirectBuffer}" not found`,'err');
+        } else {
+          cp.dispatchWorkgroups(cmd.grid[0], cmd.grid[1], cmd.grid[2]);
+        }
         cp.end();
       } else {
         const h = this._commandHandlers.get(cmd.type);
@@ -1228,8 +1754,8 @@ export class RexGPU {
     // Texture + sampler
     if (bindDef.texture) {
       const tex = this._textures.get(bindDef.texture);
-      const samp = this._samplers.get(bindDef.sampler || bindDef.texture);
-      if (samp) entries.push({ binding: entries.length, resource: samp });
+      const sampEntry = this._samplers.get(bindDef.sampler || bindDef.texture);
+      if (sampEntry) entries.push({ binding: entries.length, resource: sampEntry.sampler });
       if (tex) entries.push({ binding: entries.length, resource: (this._textureViews && this._textureViews.get(bindDef.texture)) || tex.createView() });
     }
 
