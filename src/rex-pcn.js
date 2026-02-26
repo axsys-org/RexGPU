@@ -69,6 +69,7 @@ class ShrubLM {
     this.confidence = 0;
     this.ready = false;                 // all prototypes crystallized
     this.totalObservations = 0;
+    this.naturalPeriod = 0;            // set from RexPCN._shrubPeriods — 0 means unknown
   }
 
   // Normalize a slot delta into [0,1] range using schema/observed ranges
@@ -152,6 +153,7 @@ class ShrubLM {
         rejectCount: 0,
         crystallized: false,
         _notified: false,                      // true once crystallization event has been emitted
+        firstSeen: timestamp,
         lastSeen: timestamp,
       };
       this.prototypes.set(talkName, proto);
@@ -180,14 +182,20 @@ class ShrubLM {
       proto.preState.m2[i] += pd1 * pd2;
     }
 
-    // Check crystallization for this prototype
+    // Check crystallization: count threshold + time span requirement.
+    // A 60Hz game talk needs the same temporal coverage as a weekly checkout talk.
+    // Minimum: 20 observations AND span >= 3 natural periods (or 10s if period unknown).
     if (!proto.crystallized && proto.count >= LM_CRYSTALLIZE_COUNT) {
-      let allLowVariance = true;
-      for (let i = 0; i < this.dim; i++) {
-        const variance = proto.m2[i] / proto.count;
-        if (variance > LM_VARIANCE_THRESHOLD) { allLowVariance = false; break; }
+      const span = timestamp - proto.firstSeen;
+      const minSpan = this.naturalPeriod > 0 ? this.naturalPeriod * 3 : 10000; // 3 periods or 10s
+      if (span >= minSpan) {
+        let allLowVariance = true;
+        for (let i = 0; i < this.dim; i++) {
+          const variance = proto.m2[i] / proto.count;
+          if (variance > LM_VARIANCE_THRESHOLD) { allLowVariance = false; break; }
+        }
+        if (allLowVariance) proto.crystallized = true;
       }
-      if (allLowVariance) proto.crystallized = true;
     }
 
     // Update overall LM confidence and ready state
@@ -1777,6 +1785,10 @@ export class RexPCN {
       : new Map(Object.entries(record.slot_deltas || {}));
     const lm = this._ensureShrubLM(record.shrub, slotDeltas);
     if (lm) {
+      // Sync natural period so crystallization is time-aware
+      const period = this._shrubPeriods.get(record.shrub);
+      if (period) lm.naturalPeriod = period;
+
       // Build pre-state slot map (values BEFORE the talk) for position prototype tracking
       const preSlots = new Map();
       for (const { path, old_val, new_val } of (record.mutations_fired || [])) {
