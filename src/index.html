@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>RexGPU</title>
+<style>/* __CSS__ */</style>
+</head>
+<body>
+<div id="shell">
+
+  <!-- Header -->
+  <div id="header">
+    <h1>RexGPU</h1>
+    <span class="sep">&middot;</span>
+    <span class="sub">natural language &rarr; rex notation &rarr; GPU</span>
+    <span class="pill pill-ai">Claude</span>
+    <span class="pill pill-gpu">WebGPU</span>
+    <span id="gpu-status">initializing&hellip;</span>
+    <div id="key-area">
+      <label for="api-key">API key</label>
+      <input id="api-key" type="password" placeholder="sk-ant-&hellip; (optional in artifact)" autocomplete="off" spellcheck="false">
+      <button id="key-show">show</button>
+      <div id="key-dot"></div>
+    </div>
+  </div>
+
+  <!-- Tab bar -->
+  <div id="tab-bar">
+    <div id="tab-add" title="New session">+</div>
+  </div>
+
+  <!-- Top drag handle -->
+  <div class="dh-row" id="dh-row-top"></div>
+
+  <!-- Form sidebar (LEFT — was chat) -->
+  <div class="pane" id="form-sidebar">
+    <div class="ptitle" id="form-title"><span>form controls</span><span class="arrow">&#9662;</span></div>
+    <div id="form-mount"></div>
+  </div>
+
+  <!-- Col handle 1 -->
+  <div class="dh-col" id="dh-col-1"></div>
+
+  <!-- Editor pane -->
+  <div class="pane" id="editor-pane">
+    <div class="ptitle" id="editor-title"><span>rex source <span id="node-count" style="color:var(--accent2)"></span></span><span class="arrow">&#9662;</span></div>
+    <textarea id="rex-src" spellcheck="false"></textarea>
+  </div>
+
+  <!-- Col handle 2 -->
+  <div class="dh-col" id="dh-col-2"></div>
+
+  <!-- Canvas pane -->
+  <div class="pane" id="canvas-pane">
+    <div class="ptitle" id="canvas-title"><span>GPU output</span><span id="gpu-overlay" style="font-size:10px;color:var(--warn);margin-left:8px;font-weight:normal;"></span><span class="arrow">&#9662;</span></div>
+    <canvas id="gpu-canvas" tabindex="0"></canvas>
+  </div>
+
+  <!-- Bottom drag handle -->
+  <div class="dh-row" id="dh-row-bot"></div>
+
+  <!-- Bottom strip — now has Chat, Log, Heap -->
+  <div id="bottom">
+    <div class="bot-pane" id="chat-pane">
+      <div class="ptitle" id="chat-title"><span>Claude &rarr; Rex</span><span class="arrow">&#9662;</span></div>
+      <div id="messages">
+        <div class="msg msg-sys">Describe what to render. Claude writes Rex. RPE compiles and runs it.</div>
+      </div>
+      <div class="chips">
+        <span class="chip" data-p="Animated plasma wave with color controls">plasma</span>
+        <span class="chip" data-p="Raymarched 3D scene with orbiting sphere and drag to orbit">3D scene</span>
+        <span class="chip" data-p="Lissajous figure with frequency and phase sliders">lissajous</span>
+        <span class="chip" data-p="Voronoi noise field with speed and color controls">voronoi</span>
+        <span class="chip" data-p="Mandelbrot fractal with zoom and color palette">mandelbrot</span>
+        <span class="chip" data-p="WASD FPS camera with textured floor">fps demo</span>
+      </div>
+      <div id="chat-input">
+        <textarea id="prompt" placeholder="Describe what to render&hellip;" rows="1"></textarea>
+        <button id="send">Send</button>
+      </div>
+    </div>
+    <div class="bot-pane" id="log-pane">
+      <div class="ptitle" id="log-title"><span>transduction log</span><span class="arrow">&#9662;</span></div>
+      <div id="log-view"></div>
+    </div>
+    <div class="bot-pane" id="heap-pane">
+      <div class="ptitle" id="heap-title"><span>compiled heap &middot; optics</span><span class="arrow">&#9662;</span></div>
+      <div id="heap-view"></div>
+    </div>
+  </div>
+
+</div>
+<script>/* __JS__ */</script>
+</body>
+</html>

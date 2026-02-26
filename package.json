@@ -1,0 +1,13 @@
+{
+  "name": "rexgpu",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "build": "node build.js",
+    "dev": "node build.js --watch"
+  },
+  "devDependencies": {
+    "@webgpu/types": "^0.1.69",
+    "esbuild": "^0.27.3"
+  }
+}

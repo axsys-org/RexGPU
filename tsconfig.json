@@ -1,0 +1,18 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ES2022",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "allowJs": true,
+    "checkJs": false,
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "types": ["@webgpu/types"]
+  },
+  "include": ["src/**/*.ts", "src/**/*.js"],
+  "exclude": ["node_modules", "dist"]
+}
