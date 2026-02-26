@@ -524,6 +524,15 @@ export class RexGPU {
       if (enables.length > 0) code = enables.join('\n') + '\n' + code;
       try {
         const mod = this.device.createShaderModule({code});
+        // Catch async WGSL compile errors (deferred by the browser)
+        if (mod.getCompilationInfo) {
+          mod.getCompilationInfo().then(info => {
+            for (const msg of info.messages) {
+              if (msg.type === 'error') this.log(`shader "${key}" line ${msg.lineNum}: ${msg.message}`, 'err');
+              else if (msg.type === 'warning') this.log(`shader "${key}" line ${msg.lineNum}: ${msg.message}`, 'warn');
+            }
+          });
+        }
         this.shaderModules.set(key, mod);
         this._lastGoodShaders.set(key, code);
         this.log(`shader: ${key} \u2713`,'ok');
