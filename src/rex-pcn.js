@@ -317,44 +317,71 @@ class ShrubLM {
     return count > 0 ? Math.max(0, Math.min(1, total / count)) : 1.0;
   }
 
-  // Find the talk whose mean displacement best moves a slot toward a target value.
-  // Used by the recovery policy to select corrective actions.
+  // Find the talk whose displacement best recovers a slot to targetValue.
+  //
+  // Backward pass (Glass optic backward direction):
+  // Instead of asking "which talk moves slot X in the right direction?" (1D brute
+  // force), we ask: "which talk, fired from the current N-dimensional position,
+  // projects a landing point closest to the target in the full slot space?"
+  //
+  // Scoring:
+  //   1. Primary: distance of (currentPos + displacement)[idx] to normalizedTarget
+  //   2. Tiebreak: Mahalanobis distance from currentPos to proto.preState.mean —
+  //      how plausible is the current position as a starting point for this talk?
+  //      Talks with mismatched preState are penalized (they'd likely be guard-rejected).
+  //
   // Returns: {talk, expectedDelta} | null
   findGoalTalk(slotName, targetValue, currentSlots) {
     const idx = this.slotNames.indexOf(slotName);
     if (idx === -1) return null;
 
-    const range = this.slotRanges.get(slotName);
-    let normalizedTarget, normalizedCurrent;
-    const currentVal = currentSlots instanceof Map ? currentSlots.get(slotName)
-      : (currentSlots && currentSlots[slotName]);
+    const slots = currentSlots instanceof Map ? currentSlots : new Map(Object.entries(currentSlots || {}));
+    const currentVal = slots.get(slotName);
     if (typeof currentVal !== 'number') return null;
 
+    // Normalize current full position into reference frame
+    const currentPos = this._normalizePosition(slots);
+
+    // Normalize target value for the surprise slot
+    const range = this.slotRanges.get(slotName);
+    let normalizedTarget;
     if (range && range.max > range.min) {
-      const span = range.max - range.min;
-      normalizedTarget = (targetValue - range.min) / span;
-      normalizedCurrent = (currentVal - range.min) / span;
+      normalizedTarget = (targetValue - range.min) / (range.max - range.min);
     } else {
       normalizedTarget = targetValue;
-      normalizedCurrent = currentVal;
     }
 
-    const desiredDelta = normalizedTarget - normalizedCurrent;
-    if (Math.abs(desiredDelta) < 1e-8) return null; // already at target
+    if (Math.abs(normalizedTarget - currentPos[idx]) < 1e-8) return null; // already at target
 
     let bestTalk = null;
-    let bestDistance = Infinity;
+    let bestScore = Infinity;
 
     for (const [talkName, proto] of this.prototypes) {
       if (proto.rejectCount > 0 || proto.count < 3) continue;
       const meanDisp = proto.mean[idx];
       if (Math.abs(meanDisp) < 1e-6) continue; // talk doesn't move this slot
-      // Direction must match: both positive or both negative
-      if (Math.sign(meanDisp) !== Math.sign(desiredDelta)) continue;
 
-      const distance = Math.abs(desiredDelta - meanDisp);
-      if (distance < bestDistance) {
-        bestDistance = distance;
+      // Primary: projected landing distance on the surprise slot axis
+      const landingIdx = currentPos[idx] + meanDisp;
+      const primaryDist = Math.abs(normalizedTarget - landingIdx);
+
+      // Tiebreak: Mahalanobis-style pre-state plausibility (diagonal covariance)
+      // How far is the current position from where this talk is typically invoked?
+      let preStatePenalty = 0;
+      if (proto.preState && proto.count > 1) {
+        for (let i = 0; i < this.dim; i++) {
+          const variance = proto.preState.m2[i] / (proto.count - 1);
+          if (variance < 1e-8) continue;
+          const diff = currentPos[i] - proto.preState.mean[i];
+          preStatePenalty += (diff * diff) / variance;
+        }
+        preStatePenalty = Math.sqrt(preStatePenalty / this.dim); // normalize by dim
+      }
+
+      // Combined score: primary distance + 10% preState penalty weight
+      const score = primaryDist + 0.1 * preStatePenalty;
+      if (score < bestScore) {
+        bestScore = score;
         bestTalk = talkName;
       }
     }
