@@ -13,6 +13,7 @@ export class RexBehaviour {
     this._derives = [];          // [{shrub, slot, expr}] in dependency order
     this._talks = new Map();     // "shrub/name" → {inputs, guard, mutations}
     this._depReactions = new Map(); // "shrub/label" → {dead, mutations}
+    this._depTriggers = new Map();  // "sourceShrub/slot" → [{shrub, label}] (transitive closure)
     this._channels = [];         // [{from:{shrub,slot}, to:{buffer,field}, mode, lastValue}]
     this._compiled = false;
     this.onSlotChange = null;    // callback(shrubName, slotName, value)
@@ -88,6 +89,7 @@ export class RexBehaviour {
     this._derives = [];
     this._talks.clear();
     this._depReactions.clear();
+    this._depTriggers.clear();
     this._channels = [];
     this._warnedTypes.clear();
 
@@ -126,8 +128,11 @@ export class RexBehaviour {
     // 7. Order derives by dependency
     this._orderDerives();
 
+    // 8. Build transitive dep closure (promonad composition)
+    this._buildDepClosure();
+
     this._compiled = true;
-    this.log(`behaviour: ${this._shrubs.size} shrubs, ${this._defs.size} defs, ${this._derives.length} derives, ${this._talks.size} talks, ${this._channels.length} channels`, 'ok');
+    this.log(`behaviour: ${this._shrubs.size} shrubs, ${this._defs.size} defs, ${this._derives.length} derives, ${this._talks.size} talks, ${this._channels.length} channels, ${this._depTriggers.size} dep triggers`, 'ok');
   }
 
   _compileShrub(node) {
@@ -244,6 +249,120 @@ export class RexBehaviour {
     }
 
     this._depReactions.set(`${shrubName}/${label}`, { shrub: shrubName, dead, mutations });
+  }
+
+  // ── Transitive dep closure (promonad composition) ──
+  // Builds _depTriggers: "sourceShrub/slot" → [{shrub, label}]
+  // Direct edges come from schema-level @dep declarations on each shrub.
+  // Transitive edges: if A watches B via label L, and a dep reaction on A mutates
+  // slot S, any shrub C watching A/S also gets added — computed via BFS.
+  _buildDepClosure() {
+    // Step 1: build direct trigger map from schema @dep declarations
+    // A schema dep says: shrubName has label L pointing to sourcePath /other/slot
+    // → when other/slot changes, fire reaction shrubName/L
+    const direct = new Map(); // "sourceShrub/slot" → [{shrub, label}]
+    for (const [shrubName, shrub] of this._shrubs) {
+      for (const [label, depDef] of shrub.schema.deps) {
+        // Only care if there's a compiled reaction for this dep
+        if (!this._depReactions.has(`${shrubName}/${label}`)) continue;
+        const parts = depDef.path.split('/').filter(Boolean);
+        if (parts.length < 2) continue;
+        const sourceKey = `${parts[0]}/${parts.slice(1).join('/')}`;
+        if (!direct.has(sourceKey)) direct.set(sourceKey, []);
+        direct.get(sourceKey).push({ shrub: shrubName, label });
+      }
+    }
+
+    // Step 2: BFS transitive closure
+    // For each dep reaction, figure out which slots it can mutate, then
+    // propagate those slots into the trigger map.
+    // We do a fixed-point iteration: new triggers → new mutation slots → new triggers.
+    const closure = new Map(direct); // start from direct edges
+
+    // Helper: get all slot paths a reaction's mutations write to
+    const mutationSlots = (reactionKey) => {
+      const reaction = this._depReactions.get(reactionKey);
+      if (!reaction) return [];
+      const slots = [];
+      for (const mut of reaction.mutations) {
+        if ((mut.type === 'set') && mut.name) {
+          const slotName = mut.name.startsWith('/') ? mut.name.slice(1) : mut.name;
+          slots.push(`${reaction.shrub}/${slotName}`);
+        }
+      }
+      return slots;
+    };
+
+    // BFS: process queue of newly-discovered trigger edges
+    const queue = [...closure.values()].flat();
+    const visited = new Set();
+    while (queue.length > 0) {
+      const { shrub, label } = queue.shift();
+      const reactionKey = `${shrub}/${label}`;
+      if (visited.has(reactionKey)) continue;
+      visited.add(reactionKey);
+
+      // For each slot this reaction writes, add transitive watchers
+      for (const writtenSlot of mutationSlots(reactionKey)) {
+        const downstream = direct.get(writtenSlot) || [];
+        for (const edge of downstream) {
+          const edgeKey = `${writtenSlot}→${edge.shrub}/${edge.label}`;
+          if (visited.has(edgeKey)) continue;
+          visited.add(edgeKey);
+          if (!closure.has(writtenSlot)) closure.set(writtenSlot, []);
+          // Only add if not already present
+          const existing = closure.get(writtenSlot);
+          if (!existing.some(e => e.shrub === edge.shrub && e.label === edge.label)) {
+            existing.push(edge);
+            queue.push(edge);
+          }
+        }
+      }
+    }
+
+    this._depTriggers = closure;
+    if (closure.size > 0) {
+      const total = [...closure.values()].reduce((n, v) => n + v.length, 0);
+      this.log(`behaviour: dep closure: ${direct.size} direct keys, ${total} total edges`, 'ok');
+    }
+  }
+
+  // Fire dep reactions triggered by slot changes after a talk invocation.
+  // changedSlots: Map of slotName → newValue (already written to shrub.slots)
+  // Guards re-entrant firing with a depth counter.
+  _fireDepReactions(shrubName, changedSlots, depth = 0) {
+    if (depth > 8) {
+      this.log(`behaviour: dep reaction depth limit reached from "${shrubName}"`, 'warn');
+      return;
+    }
+    for (const [slotName] of changedSlots) {
+      const key = `${shrubName}/${slotName}`;
+      const reactions = this._depTriggers.get(key);
+      if (!reactions) continue;
+      for (const { shrub: targetShrub, label } of reactions) {
+        const reaction = this._depReactions.get(`${targetShrub}/${label}`);
+        if (!reaction) continue;
+        const targetShrubData = this._shrubs.get(targetShrub);
+        if (!targetShrubData) continue;
+        const ctx = {
+          shrub: targetShrub, slots: targetShrubData.slots, kids: targetShrubData.kids,
+          deps: targetShrubData.schema.deps, inputs: {}, src: null, now: Date.now(),
+        };
+        const preSnapshot = new Map(targetShrubData.slots);
+        for (const mut of reaction.mutations) {
+          this._executeMutation(mut, ctx);
+        }
+        // Collect what changed and recurse
+        const downstream = new Map();
+        for (const [s, v] of targetShrubData.slots) {
+          if (v !== preSnapshot.get(s)) downstream.set(s, v);
+        }
+        if (downstream.size > 0) {
+          this._recomputeDerives();
+          this._fireDepReactions(targetShrub, downstream, depth + 1);
+        }
+      }
+    }
   }
 
   // ── @channel: compiled bridge from behaviour slot → GPU heap field ──
@@ -559,6 +678,14 @@ export class RexBehaviour {
 
     // Recompute derives after mutations
     this._recomputeDerives();
+
+    // Fire transitive dep reactions triggered by slot changes
+    const directChanges = new Map();
+    for (const [s, v] of shrub.slots) {
+      if (v !== preSnapshot.get(s)) directChanges.set(s, v);
+    }
+    if (directChanges.size > 0) this._fireDepReactions(shrubName, directChanges);
+
     this._pushChannels();
 
     // Build causal record and emit
