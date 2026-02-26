@@ -690,9 +690,9 @@ import { callClaude } from './claude-api.js';
     let asp = u.res.x / u.res.y;
     let t = u.time * u.speed * 0.15;
     // Animated zoom into a deep Mandelbrot point
-    let target = vec2f(-0.7435669, 0.1314023);
+    let center = vec2f(-0.7435669, 0.1314023);
     let zf = pow(u.zoom * 0.5, 2.5) * exp(t * 0.08 * u.seed);
-    var c = v.uv * vec2f(asp, 1.0) / zf + target;
+    var c = v.uv * vec2f(asp, 1.0) / zf + center;
     // Mouse shifts the center
     c += (u.mouse - 0.5) * 0.002 / zf;
     // Twist
@@ -830,8 +830,8 @@ import { callClaude } from './claude-api.js';
     let camAng = t * 0.25 + u.twist + m.x;
     let camY = sin(t * 0.15 + m.y) * 1.2;
     let ro = vec3f(cos(camAng)*camDist, camY, sin(camAng)*camDist);
-    let target = vec3f(0.0);
-    let fwd = normalize(target - ro);
+    let lookat = vec3f(0.0);
+    let fwd = normalize(lookat - ro);
     let right = normalize(cross(vec3f(0,1,0), fwd));
     let up = cross(fwd, right);
     let rd = normalize(v.uv.x*vec2f(asp,1.0).x*right + v.uv.y*up + fwd*1.5);
