@@ -2,6 +2,7 @@
 // PCN TRANSDUCER — Predictive Coding Namespace
 // Learns patterns from behaviour events via GPU compute.
 // Memory matrix M[2048][2048] with surprise-modulated Hebbian learning.
+// ShrubLM: per-shrub reference frame learning modules (Thousand Brains).
 // SDR encoding: path → sparse distributed representation (2048 bits, ~50 active).
 // ═══════════════════════════════════════════════════════════════════
 
@@ -27,6 +28,415 @@ const PROPAGATION_ITERS = 3;
 const COALITION_TOP_K = 8;
 const CRYSTALLIZE_THRESHOLD = 0.8;
 const CRYSTALLIZE_MIN_COUNT = 20;
+
+// ── ShrubLM Constants ──
+const LM_CRYSTALLIZE_COUNT = 20;       // observations before a prototype can crystallize
+const LM_VARIANCE_THRESHOLD = 0.25;    // max normalized variance for crystallization
+const LM_SURPRISE_SIGMA = 3.0;         // Mahalanobis distance threshold for surprise
+const LM_VOTE_CONFIRM_WEIGHT = 1.0;    // evidence weight for confirming votes
+const LM_VOTE_CONTRADICT_WEIGHT = 0.3; // evidence weight for contradicting votes (asymmetric)
+const LM_BUFFER_SIZE = 50;             // rolling observation buffer per shrub
+
+// ═══════════════════════════════════════════════════════════════════
+// ShrubLM — Per-Shrub Reference Frame Learning Module
+// Slot-space as reference frame: N numeric slots → N-dimensional space.
+// Talks are displacement vectors. :min/:max normalization = scale invariance.
+// Prototype graph learned via Welford running mean/variance.
+// Surprise = Mahalanobis distance > 3σ from prototype.
+// ═══════════════════════════════════════════════════════════════════
+
+class ShrubLM {
+  constructor(shrubName, slotNames, slotRanges) {
+    this.shrubName = shrubName;
+    this.slotNames = slotNames;         // string[] — ordered numeric slot names (reference frame axes)
+    this.slotRanges = slotRanges;       // Map<slotName, {min, max}> — from schema or observed
+    this.dim = slotNames.length;
+
+    // Prototype graph: talkName → displacement prototype
+    // Each node: {mean: Float64Array, m2: Float64Array, count, rejectCount, crystallized, lastSeen}
+    this.prototypes = new Map();
+
+    // Short-term memory: rolling window of recent observations
+    this.buffer = [];
+
+    // Evidence state for current inference cycle
+    this.evidence = new Map();          // talkName → accumulated evidence
+
+    // Pending votes from lateral connections
+    this.pendingVotes = [];
+
+    // Overall LM state
+    this.confidence = 0;
+    this.ready = false;                 // all prototypes crystallized
+    this.totalObservations = 0;
+  }
+
+  // Normalize a slot delta into [0,1] range using schema/observed ranges
+  _normalizeDisplacement(slotDeltas) {
+    const disp = new Float64Array(this.dim);
+    for (let i = 0; i < this.dim; i++) {
+      const name = this.slotNames[i];
+      const delta = slotDeltas.get(name) || 0;
+      const range = this.slotRanges.get(name);
+      if (range && range.max > range.min) {
+        disp[i] = delta / (range.max - range.min);
+      } else {
+        disp[i] = delta; // no range info yet — use raw delta
+      }
+    }
+    return disp;
+  }
+
+  // Normalize current slot values into [0,1] reference frame coordinates
+  _normalizePosition(slots) {
+    const pos = new Float64Array(this.dim);
+    for (let i = 0; i < this.dim; i++) {
+      const name = this.slotNames[i];
+      const val = slots.get(name);
+      if (val === undefined || typeof val !== 'number') continue;
+      const range = this.slotRanges.get(name);
+      if (range && range.max > range.min) {
+        pos[i] = (val - range.min) / (range.max - range.min);
+      } else {
+        pos[i] = val;
+      }
+    }
+    return pos;
+  }
+
+  // Observe a talk event — update prototype graph, detect surprise
+  // Returns: {surprise: number, prototype: object|null}
+  observe(talkName, slotDeltas, slots, timestamp) {
+    if (this.dim === 0 || slotDeltas.size === 0) return { surprise: 0, prototype: null };
+
+    const disp = this._normalizeDisplacement(slotDeltas);
+    this.totalObservations++;
+
+    // Update observed ranges from actual slot values
+    for (const [name, val] of slots) {
+      if (typeof val !== 'number') continue;
+      const range = this.slotRanges.get(name);
+      if (range) {
+        if (range._observed) {
+          range._observed.min = Math.min(range._observed.min, val);
+          range._observed.max = Math.max(range._observed.max, val);
+        } else {
+          range._observed = { min: val, max: val };
+        }
+        // If no schema range, use observed
+        if (range.min === undefined || range.max === undefined) {
+          range.min = range._observed.min;
+          range.max = range._observed.max;
+        }
+      }
+    }
+
+    // Buffer the observation
+    this.buffer.push({ talk: talkName, disp, timestamp });
+    if (this.buffer.length > LM_BUFFER_SIZE) this.buffer.shift();
+
+    // Normalize current slot positions for pre-state tracking
+    const pos = this._normalizePosition(slots);
+
+    // Get or create prototype node
+    let proto = this.prototypes.get(talkName);
+    if (!proto) {
+      proto = {
+        mean: new Float64Array(this.dim),
+        m2: new Float64Array(this.dim),        // sum of squared differences (Welford) — displacement
+        preState: {                            // pre-state: slot positions at talk invocation
+          mean: new Float64Array(this.dim),
+          m2: new Float64Array(this.dim),
+        },
+        count: 0,
+        rejectCount: 0,
+        crystallized: false,
+        _notified: false,                      // true once crystallization event has been emitted
+        lastSeen: timestamp,
+      };
+      this.prototypes.set(talkName, proto);
+    }
+
+    // Compute surprise BEFORE updating (compare against current model)
+    let surprise = 0;
+    if (proto.count >= 3) {
+      surprise = this._mahalanobis(disp, proto);
+    }
+
+    // Welford online update: displacement mean and variance
+    const wasCrystallized = proto.crystallized;
+    proto.count++;
+    proto.lastSeen = timestamp;
+    for (let i = 0; i < this.dim; i++) {
+      // Displacement prototype
+      const delta1 = disp[i] - proto.mean[i];
+      proto.mean[i] += delta1 / proto.count;
+      const delta2 = disp[i] - proto.mean[i];
+      proto.m2[i] += delta1 * delta2;
+      // Pre-state position prototype (same Welford, on absolute position)
+      const pd1 = pos[i] - proto.preState.mean[i];
+      proto.preState.mean[i] += pd1 / proto.count;
+      const pd2 = pos[i] - proto.preState.mean[i];
+      proto.preState.m2[i] += pd1 * pd2;
+    }
+
+    // Check crystallization for this prototype
+    if (!proto.crystallized && proto.count >= LM_CRYSTALLIZE_COUNT) {
+      let allLowVariance = true;
+      for (let i = 0; i < this.dim; i++) {
+        const variance = proto.m2[i] / proto.count;
+        if (variance > LM_VARIANCE_THRESHOLD) { allLowVariance = false; break; }
+      }
+      if (allLowVariance) proto.crystallized = true;
+    }
+
+    // Update overall LM confidence and ready state
+    this._updateConfidence();
+
+    // Signal first-time crystallization (for rule synthesis)
+    const justCrystallized = proto.crystallized && !wasCrystallized;
+
+    return { surprise, prototype: proto, justCrystallized };
+  }
+
+  // Record a guard rejection for a talk pattern
+  recordReject(talkName) {
+    const proto = this.prototypes.get(talkName);
+    if (proto) proto.rejectCount++;
+  }
+
+  // Mahalanobis distance from observation to prototype
+  _mahalanobis(disp, proto) {
+    if (proto.count < 2) return 0;
+    let sum = 0;
+    for (let i = 0; i < this.dim; i++) {
+      const variance = proto.m2[i] / (proto.count - 1);
+      if (variance < 1e-10) continue; // skip zero-variance dimensions
+      const diff = disp[i] - proto.mean[i];
+      sum += (diff * diff) / variance;
+    }
+    return Math.sqrt(sum);
+  }
+
+  // Check if a talk + current state is prototypical (within 2σ, never rejected)
+  isPrototypical(talkName, slotDeltas) {
+    const proto = this.prototypes.get(talkName);
+    if (!proto || !proto.crystallized || proto.rejectCount > 0) return false;
+    if (slotDeltas.size === 0) return proto.crystallized; // no-delta talk, just check crystallization
+
+    const disp = this._normalizeDisplacement(slotDeltas);
+    const dist = this._mahalanobis(disp, proto);
+    return dist < 2.0; // within 2σ
+  }
+
+  // Process a lateral vote from another ShrubLM
+  receiveVote(vote) {
+    this.pendingVotes.push(vote);
+  }
+
+  // Process all pending votes — update evidence for matching prototypes
+  processVotes() {
+    if (this.pendingVotes.length === 0) return;
+
+    for (const vote of this.pendingVotes) {
+      // Find prototypes whose displacement direction matches the vote
+      for (const [talkName, proto] of this.prototypes) {
+        if (proto.count < 3) continue;
+        const similarity = this._cosineSimilarity(vote.displacement, proto.mean);
+        const prevEvidence = this.evidence.get(talkName) || 0;
+
+        if (similarity > 0.5) {
+          // Confirming vote — displacement directions align
+          this.evidence.set(talkName, prevEvidence + vote.confidence * similarity * LM_VOTE_CONFIRM_WEIGHT);
+        } else if (similarity < -0.3) {
+          // Contradicting vote — opposite directions
+          this.evidence.set(talkName, prevEvidence - vote.confidence * Math.abs(similarity) * LM_VOTE_CONTRADICT_WEIGHT);
+        }
+      }
+    }
+    this.pendingVotes = [];
+  }
+
+  _cosineSimilarity(a, b) {
+    let dot = 0, magA = 0, magB = 0;
+    const len = Math.min(a.length, b.length);
+    for (let i = 0; i < len; i++) {
+      dot += a[i] * b[i];
+      magA += a[i] * a[i];
+      magB += b[i] * b[i];
+    }
+    const denom = Math.sqrt(magA) * Math.sqrt(magB);
+    return denom > 1e-10 ? dot / denom : 0;
+  }
+
+  _updateConfidence() {
+    if (this.prototypes.size === 0) { this.confidence = 0; return; }
+    let crystallizedCount = 0;
+    for (const proto of this.prototypes.values()) {
+      if (proto.crystallized) crystallizedCount++;
+    }
+    this.confidence = crystallizedCount / this.prototypes.size;
+    this.ready = this.confidence >= CRYSTALLIZE_THRESHOLD && this.prototypes.size > 0;
+  }
+
+  // Build a vote record to send to dependent shrubs
+  buildVote(talkName) {
+    const proto = this.prototypes.get(talkName);
+    if (!proto || proto.count < 3) return null;
+    return {
+      sender: this.shrubName,
+      hypothesis: talkName,
+      confidence: this.confidence,
+      displacement: Array.from(proto.mean),
+      evidence: this.evidence.get(talkName) || 0,
+    };
+  }
+
+  // Get per-slot confidence for derive gating
+  getSlotConfidence(slotName) {
+    if (!this.ready) return 1.0; // not crystallized yet — trust derives fully
+    // Confidence = average evidence across prototypes that touch this slot
+    let total = 0, count = 0;
+    const idx = this.slotNames.indexOf(slotName);
+    if (idx === -1) return 1.0;
+    for (const [, proto] of this.prototypes) {
+      if (proto.count < 3) continue;
+      if (Math.abs(proto.mean[idx]) > 1e-6) { // this prototype touches this slot
+        total += (this.evidence.get(proto) || 0.5);
+        count++;
+      }
+    }
+    return count > 0 ? Math.max(0, Math.min(1, total / count)) : 1.0;
+  }
+
+  // Find the talk whose mean displacement best moves a slot toward a target value.
+  // Used by the recovery policy to select corrective actions.
+  // Returns: {talk, expectedDelta} | null
+  findGoalTalk(slotName, targetValue, currentSlots) {
+    const idx = this.slotNames.indexOf(slotName);
+    if (idx === -1) return null;
+
+    const range = this.slotRanges.get(slotName);
+    let normalizedTarget, normalizedCurrent;
+    const currentVal = currentSlots instanceof Map ? currentSlots.get(slotName)
+      : (currentSlots && currentSlots[slotName]);
+    if (typeof currentVal !== 'number') return null;
+
+    if (range && range.max > range.min) {
+      const span = range.max - range.min;
+      normalizedTarget = (targetValue - range.min) / span;
+      normalizedCurrent = (currentVal - range.min) / span;
+    } else {
+      normalizedTarget = targetValue;
+      normalizedCurrent = currentVal;
+    }
+
+    const desiredDelta = normalizedTarget - normalizedCurrent;
+    if (Math.abs(desiredDelta) < 1e-8) return null; // already at target
+
+    let bestTalk = null;
+    let bestDistance = Infinity;
+
+    for (const [talkName, proto] of this.prototypes) {
+      if (proto.rejectCount > 0 || proto.count < 3) continue;
+      const meanDisp = proto.mean[idx];
+      if (Math.abs(meanDisp) < 1e-6) continue; // talk doesn't move this slot
+      // Direction must match: both positive or both negative
+      if (Math.sign(meanDisp) !== Math.sign(desiredDelta)) continue;
+
+      const distance = Math.abs(desiredDelta - meanDisp);
+      if (distance < bestDistance) {
+        bestDistance = distance;
+        bestTalk = talkName;
+      }
+    }
+
+    if (!bestTalk) return null;
+
+    // Denormalize expected delta back to raw slot units
+    const proto = this.prototypes.get(bestTalk);
+    let expectedDelta = proto.mean[idx];
+    if (range && range.max > range.min) {
+      expectedDelta *= (range.max - range.min);
+    }
+
+    return { talk: bestTalk, expectedDelta };
+  }
+
+  // Synthesize a Rex guard expression from the pre-state statistics of a crystallized prototype.
+  // Only produces a guard when the prototype has been rejected at least once (rejectCount > 0),
+  // meaning the learned bounds actually protect against observed failure patterns.
+  // Returns: string (Rex expression) | null
+  synthesizeGuard(talkName) {
+    const proto = this.prototypes.get(talkName);
+    if (!proto || !proto.crystallized || proto.rejectCount === 0) return null;
+    if (proto.count < 2 || !proto.preState) return null;
+
+    const clauses = [];
+    for (let i = 0; i < this.dim; i++) {
+      const variance = proto.preState.m2[i] / (proto.count - 1);
+      if (variance < 1e-8) continue;        // zero-variance dimension — no useful bound
+      if (Math.abs(proto.mean[i]) < 1e-6) continue; // talk doesn't displace this slot
+
+      const name = this.slotNames[i];
+      const range = this.slotRanges.get(name);
+      const sigma2 = 2 * Math.sqrt(variance);
+
+      // Compute normalized bounds from pre-state mean ± 2σ
+      let lower = proto.preState.mean[i] - sigma2;
+      let upper = proto.preState.mean[i] + sigma2;
+
+      // Denormalize back to raw slot units
+      if (range && range.max > range.min) {
+        const span = range.max - range.min;
+        lower = lower * span + range.min;
+        upper = upper * span + range.min;
+      }
+
+      // Round for readability
+      lower = Math.round(lower * 10000) / 10000;
+      upper = Math.round(upper * 10000) / 10000;
+
+      // Only emit bounds that are tighter than schema range
+      if (range && range.min !== undefined && lower > range.min) {
+        clauses.push(`(gte /${name} ${lower})`);
+      }
+      if (range && range.max !== undefined && upper < range.max) {
+        clauses.push(`(lte /${name} ${upper})`);
+      }
+    }
+
+    if (clauses.length === 0) return null;
+    if (clauses.length === 1) return clauses[0];
+    return `(and ${clauses.join(' ')})`;
+  }
+
+  getStats() {
+    const protos = {};
+    for (const [name, proto] of this.prototypes) {
+      protos[name] = {
+        count: proto.count,
+        crystallized: proto.crystallized,
+        rejectCount: proto.rejectCount,
+        mean: Array.from(proto.mean),
+        variance: proto.count > 1 ? Array.from(proto.m2).map(v => v / (proto.count - 1)) : [],
+        preState: proto.preState ? {
+          mean: Array.from(proto.preState.mean),
+          variance: proto.count > 1 ? Array.from(proto.preState.m2).map(v => v / (proto.count - 1)) : [],
+        } : null,
+      };
+    }
+    return {
+      shrub: this.shrubName,
+      dim: this.dim,
+      slots: this.slotNames,
+      confidence: this.confidence,
+      ready: this.ready,
+      totalObservations: this.totalObservations,
+      prototypes: protos,
+    };
+  }
+}
 
 export class RexPCN {
   constructor(device, log) {
@@ -74,6 +484,13 @@ export class RexPCN {
     // ── Readback ──
     this._readbackBuffer = null;
     this._readbackPending = false;
+
+    // ── ShrubLM layer (Thousand Brains) ──
+    this._shrubLMs = new Map();         // shrubName → ShrubLM
+    this._depGraph = [];                // cached [{from, to, label, path}] for vote routing
+    this._pendingVotes = new Map();     // shrubName → VoteRecord[]
+    this.onSurpriseSignal = null;       // callback(shrub, slot, value, {min,max}) — LM-detected surprise
+    this.onCrystallize = null;          // callback({shrub, talk, guard}) — synthesized rule from crystallization
   }
 
   // ════════════════════════════════════════════════════════════════
@@ -297,6 +714,9 @@ export class RexPCN {
   // ════════════════════════════════════════════════════════════════
 
   transduce(commandEncoder) {
+    // Process ShrubLM lateral votes every cycle (JS-side, no GPU needed)
+    this._processAllVotes();
+
     if (!this._compiled || this._pendingEvents.length === 0) return;
 
     // Process pending events: encode SDRs, upload, dispatch compute
@@ -1205,6 +1625,254 @@ export class RexPCN {
   }
 
   // ════════════════════════════════════════════════════════════════
+  // BEHAVIOUR-FIRST API
+  // ════════════════════════════════════════════════════════════════
+
+  // Register a @shrub as a named PCN agent. Idempotent — safe to call on every compile.
+  registerShrubAgent(shrubName, talkNames) {
+    if (this._agents.has(shrubName)) {
+      this._agents.get(shrubName).affordances = talkNames || [];
+      return this._agents.get(shrubName);
+    }
+    return this.spawnAgent(
+      shrubName,
+      `shrub:${shrubName} talks:[${(talkNames || []).join(',')}]`,
+      talkNames || [],
+      [shrubName],
+    );
+  }
+
+  // Auto-wire cross-shrub dep paths as connectome edges. Idempotent.
+  wireConnectomeFromDeps(edges) {
+    if (!this._wiredEdges) this._wiredEdges = new Set();
+    for (const edge of edges) {
+      const key = `${edge.from}->${edge.to}`;
+      if (this._wiredEdges.has(key)) continue;
+      const fromSlot = this._registry.byPath.get(edge.from);
+      const toSlot   = this._registry.byPath.get(edge.to);
+      if (fromSlot === undefined || toSlot === undefined) continue;
+      this.addConnection(fromSlot, toSlot, 0.5, 0.05, 1.0);
+      this._wiredEdges.add(key);
+      this.log(`pcn: connectome ${edge.from} → ${edge.to} (dep:${edge.label})`, 'ok');
+    }
+  }
+
+  // ════════════════════════════════════════════════════════════════
+  // SHRUB-LM LAYER — Per-shrub reference frame learning modules
+  // ════════════════════════════════════════════════════════════════
+
+  // Register schema info for a shrub so its ShrubLM knows slot ranges.
+  // Called from main.js on recompile.
+  registerShrubSchema(shrubName, schema) {
+    const slotNames = [];
+    const slotRanges = new Map();
+    for (const [key, def] of Object.entries(schema)) {
+      if (key.startsWith('_')) continue; // skip internal
+      const val = def.default !== undefined ? def.default : def;
+      if (typeof val === 'number' || def.type === 'number') {
+        slotNames.push(key);
+        slotRanges.set(key, {
+          min: def.min !== undefined ? def.min : undefined,
+          max: def.max !== undefined ? def.max : undefined,
+        });
+      }
+    }
+    if (slotNames.length === 0) return; // no numeric slots → no reference frame
+    const existing = this._shrubLMs.get(shrubName);
+    if (existing) {
+      // Update ranges but keep learned prototypes
+      existing.slotRanges = slotRanges;
+    } else {
+      this._shrubLMs.set(shrubName, new ShrubLM(shrubName, slotNames, slotRanges));
+    }
+  }
+
+  // Get or create ShrubLM for a shrub (lazy init from observation data).
+  _ensureShrubLM(shrubName, slotDeltas) {
+    let lm = this._shrubLMs.get(shrubName);
+    if (lm) return lm;
+    // No schema was registered — infer slot names from the deltas
+    if (!slotDeltas || slotDeltas.size === 0) return null;
+    const slotNames = [];
+    const slotRanges = new Map();
+    for (const [key, val] of slotDeltas) {
+      if (typeof val === 'number') {
+        slotNames.push(key);
+        slotRanges.set(key, { min: undefined, max: undefined });
+      }
+    }
+    if (slotNames.length === 0) return null;
+    lm = new ShrubLM(shrubName, slotNames, slotRanges);
+    this._shrubLMs.set(shrubName, lm);
+    return lm;
+  }
+
+  // Cache the dep graph for vote routing (called from main.js on recompile).
+  setDepGraph(edges) {
+    this._depGraph = edges || [];
+  }
+
+  // Emit votes from a ShrubLM to all its dependents via the cached dep graph.
+  _emitVotes(shrubName, talkName) {
+    const lm = this._shrubLMs.get(shrubName);
+    if (!lm) return;
+    const vote = lm.buildVote(talkName);
+    if (!vote) return;
+    for (const edge of this._depGraph) {
+      // edge.from = dependent (consumer), edge.to = source (provider)
+      // Vote flows from source → consumer: when source fires, notify consumers
+      if (edge.to === shrubName) {
+        const targetLM = this._shrubLMs.get(edge.from);
+        if (targetLM) targetLM.receiveVote(vote);
+      }
+    }
+  }
+
+  // Process pending votes on all ShrubLMs — call once per transduce cycle.
+  _processAllVotes() {
+    for (const lm of this._shrubLMs.values()) {
+      lm.processVotes();
+    }
+  }
+
+  // Get ShrubLM for external access (behaviour guard bypass, diagnostics).
+  getShrubLM(shrubName) {
+    return this._shrubLMs.get(shrubName) || null;
+  }
+
+  // Synthesize a Rex guard rule from a crystallized prototype.
+  // Validates the expression via Rex.compileExpr before returning.
+  synthesizeRule(shrubName, talkName) {
+    const lm = this._shrubLMs.get(shrubName);
+    if (!lm) return null;
+    const guard = lm.synthesizeGuard(talkName);
+    if (!guard) return null;
+    // Validate: must be parseable Rex
+    try {
+      const compiled = Rex.compileExpr({ expr: guard });
+      if (!compiled) return null;
+    } catch (e) {
+      this.log(`pcn: synthesized guard failed to compile: ${guard} — ${e.message}`, 'err');
+      return null;
+    }
+    this.log(`pcn: synthesized guard for ${shrubName}/${talkName}: ${guard}`, 'ok');
+    return { shrub: shrubName, talk: talkName, guard };
+  }
+
+  // Find the best corrective talk to move a slot toward a target value.
+  // Used by the recovery policy in rex-behaviour.js.
+  findGoalState(shrubName, slotName, targetValue, currentSlots) {
+    const lm = this._shrubLMs.get(shrubName);
+    if (!lm) return null;
+    return lm.findGoalTalk(slotName, targetValue, currentSlots);
+  }
+
+  // Primary intake for rich behaviour events from onTalkFired.
+  pushBehaviourEvent(record) {
+    const ts = record.timestamp || performance.now();
+
+    // ── ShrubLM observation ──
+    const slotDeltas = record.slot_deltas instanceof Map
+      ? record.slot_deltas
+      : new Map(Object.entries(record.slot_deltas || {}));
+    const lm = this._ensureShrubLM(record.shrub, slotDeltas);
+    if (lm) {
+      // Build pre-state slot map (values BEFORE the talk) for position prototype tracking
+      const preSlots = new Map();
+      for (const { path, old_val, new_val } of (record.mutations_fired || [])) {
+        const slotName = path.includes('/') ? path.split('/').pop() : path;
+        const pre = typeof old_val === 'number' ? old_val : (typeof new_val === 'number' ? new_val : null);
+        if (pre !== null) preSlots.set(slotName, pre);
+      }
+      const { surprise, justCrystallized } = lm.observe(record.talk, slotDeltas, preSlots, ts);
+
+      // LM-detected surprise → fire surprise signal
+      if (surprise > LM_SURPRISE_SIGMA && this.onSurpriseSignal) {
+        this.onSurpriseSignal(record.shrub, record.talk, surprise, {
+          threshold: LM_SURPRISE_SIGMA, mahalanobis: surprise,
+        });
+      }
+
+      // Guard rejection → record in prototype
+      if (!record.guard_result) lm.recordReject(record.talk);
+
+      // First-time crystallization with rejections → synthesize rule
+      if (justCrystallized && this.onCrystallize) {
+        const rule = this.synthesizeRule(record.shrub, record.talk);
+        if (rule) this.onCrystallize(rule);
+      }
+
+      // Emit votes to dependent shrubs
+      this._emitVotes(record.shrub, record.talk);
+    }
+
+    // ── Existing Hebbian matrix integration ──
+    // Main episode for the Hebbian matrix
+    this.pushEpisode({ source: 'talk', shrub: record.shrub, path: record.talk,
+      talk: record.talk, mode: 'talk', timestamp: ts });
+
+    // Per-slot mutation episodes — matrix learns slot-action co-occurrence
+    for (const { path } of (record.mutations_fired || [])) {
+      this.pushEpisode({ source: 'mutation', shrub: record.shrub, path,
+        talk: record.talk, mode: 'dif', timestamp: ts });
+    }
+
+    // Guard rejection — inhibitory signal
+    if (!record.guard_result) {
+      this.pushEpisode({ source: 'guard-reject', shrub: record.shrub, path: record.talk,
+        talk: record.talk, mode: 'inhibit', timestamp: ts });
+    }
+
+    // Track observed value ranges per agent for feedback constraint generation
+    const agentEntry = this._agents.get(record.shrub);
+    if (agentEntry) {
+      for (const { path, new_val } of (record.mutations_fired || [])) {
+        if (typeof new_val !== 'number') continue;
+        if (!agentEntry._observedRanges) agentEntry._observedRanges = new Map();
+        const r = agentEntry._observedRanges.get(path);
+        if (!r) {
+          agentEntry._observedRanges.set(path, { min: new_val, max: new_val, count: 1 });
+        } else {
+          r.min = Math.min(r.min, new_val);
+          r.max = Math.max(r.max, new_val);
+          r.count++;
+        }
+      }
+    }
+  }
+
+  // Called when a @derive value exits schema-declared range — high-surprise signal.
+  pushSurpriseSignal(shrubName, slotName, value, schemaRange) {
+    // Boost agent energy on GPU to strengthen learning signal
+    const agentEntry = this._agents.get(shrubName);
+    if (agentEntry && this.device && this._agentBuffer) {
+      const stride = (4 + EMBED_DIM);
+      const energyBoost = new Float32Array([2.0]);
+      this.device.queue.writeBuffer(this._agentBuffer, agentEntry.slot * stride * 4, energyBoost);
+    }
+    // Hebbian episode for the surprise event
+    this.pushEpisode({ source: 'surprise', shrub: shrubName, path: slotName,
+      talk: null, mode: 'surprise', timestamp: performance.now() });
+  }
+
+  // Return crystallized behavioural constraints derived from observed slot ranges.
+  // [{shrub, slot, suggestedMin, suggestedMax, confidence}]
+  getFeedbackConstraints() {
+    const constraints = [];
+    for (const [name, agent] of this._agents) {
+      if (agent.confidence <= CRYSTALLIZE_THRESHOLD || !agent._observedRanges) continue;
+      for (const [slot, range] of agent._observedRanges) {
+        if (range.count >= CRYSTALLIZE_MIN_COUNT) {
+          constraints.push({ shrub: name, slot,
+            suggestedMin: range.min, suggestedMax: range.max,
+            confidence: agent.confidence });
+        }
+      }
+    }
+    return constraints;
+  }
+
+  // ════════════════════════════════════════════════════════════════
   // CRYSTALLIZATION SIGNAL PROCESSING — JS-side
   // ════════════════════════════════════════════════════════════════
 
@@ -1240,12 +1908,17 @@ export class RexPCN {
   // ════════════════════════════════════════════════════════════════
 
   getStats() {
+    const shrubLMs = {};
+    for (const [name, lm] of this._shrubLMs) {
+      shrubLMs[name] = lm.getStats();
+    }
     return {
       episodes: this._episodeCount,
       agents: this._registry.bySlot.size,
       connections: this._connectionCount || 0,
       freeSlots: this._registry.freeSlots.length,
       shrubPeriods: Object.fromEntries(this._shrubPeriods),
+      shrubLMs,
     };
   }
 

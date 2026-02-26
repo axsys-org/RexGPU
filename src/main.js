@@ -12,7 +12,7 @@ import { PLANBridge } from './plan-bridge.js';
 import { TabManager } from './tab-manager.js';
 import { callClaude } from './claude-api.js';
 
-(async()=>{
+(async()=>{ try {
   const canvas  = document.getElementById('gpu-canvas');
   const editor  = document.getElementById('rex-src');
   const logView = document.getElementById('log-view');
@@ -88,8 +88,10 @@ import { callClaude } from './claude-api.js';
   // ── PCN transducer ──
   let pcn = null;
   if (gpuOk) {
-    pcn = new RexPCN(gpu.device, log);
-    await pcn.init();
+    try {
+      pcn = new RexPCN(gpu.device, log);
+      await pcn.init();
+    } catch(e) { log(`pcn init failed: ${e.message}`, 'err'); pcn = null; }
   }
 
   // ── Form transducer ──
@@ -101,13 +103,8 @@ import { callClaude } from './claude-api.js';
     behaviour.pushFormValue(name,val);
     // Bridge: form change → PLAN event log
     if(bridge) bridge.logFormChange(name, val, prev);
-    // Bridge: form interaction → PCN episode (batched per frame)
-    if(pcn){
-      pendingEpisodes.push({
-        source:'user-action', shrub:'form', path:name,
-        mode:'dif', timestamp:performance.now(),
-      });
-    }
+    // Bridge: form field → PCN directly (no batch needed)
+    if(pcn) pcn.bridgeFormEvent(name, val);
   };
   window._currentForm = form;
 
@@ -120,17 +117,15 @@ import { callClaude } from './claude-api.js';
       gpu.setFormField(slot, numVal);
       form.state[slot] = numVal;
     }
-    // Bridge: behaviour slot changes → PCN episodes (batched per frame)
-    if (pcn) {
-      pendingEpisodes.push({
-        source: 'dep',
-        shrub: shrub,
-        path: slot,
-        mode: 'dif',
-        timestamp: performance.now(),
-      });
-    }
   };
+  // Bridge: rich causal talk record → PCN
+  behaviour.onTalkFired = (record) => { if(pcn) pcn.pushBehaviourEvent(record); };
+  // Bridge: out-of-range derive → PCN surprise signal
+  behaviour.onSurpriseSignal = (shrub, slot, value, range) => { if(pcn) pcn.pushSurpriseSignal(shrub, slot, value, range); };
+  // Bridge: ShrubLM access for model-free guard bypass
+  behaviour.getShrubLM = (shrubName) => pcn ? pcn.getShrubLM(shrubName) : null;
+  // Bridge: goal-state generator for self-healing recovery
+  behaviour.getGoalState = (shrub, slot, target, slots) => pcn ? pcn.findGoalState(shrub, slot, target, slots) : null;
   // ── Channel bridge: behaviour → GPU heap ──
   behaviour.onChannelPush = (buffer, field, value) => {
     gpu.setChannelValue(buffer, field, value);
@@ -191,7 +186,6 @@ import { callClaude } from './claude-api.js';
   let currentTree=null, lastSrc='', parseTimer=null;
   let interactAttrs=null;  // Phase 5A: cached @interact node
   let surfaceDirty=false;  // Phase 3C: deferred surface recompile
-  let pendingEpisodes=[];  // Phase 4C: batched PCN episodes
   function parseSource(){
     const src=editor.value; if(src===lastSrc&&currentTree)return; lastSrc=src;
     try{
@@ -203,6 +197,17 @@ import { callClaude } from './claude-api.js';
       interactAttrs=Rex.find(currentTree,'interact')?.attrs||null;
       form.transduce(currentTree);
       behaviour.transduce(currentTree, true);
+      // PCN: register each @shrub as agent + ShrubLM, wire connectome + dep graph
+      if(pcn){
+        const depEdges = behaviour.getCrossShrubDeps();
+        for(const sn of behaviour.getShrubNames()){
+          pcn.registerShrubAgent(sn, behaviour.getTalkNames(sn));
+          const schema = behaviour.getShrubSchema(sn);
+          if(schema) pcn.registerShrubSchema(sn, schema);
+        }
+        pcn.wireConnectomeFromDeps(depEdges);
+        pcn.setDepGraph(depEdges);
+      }
       if(surface) surface.compile(currentTree, canvas.width, canvas.height);
       gpu._structureChanged=true;
       bridge.snapshotForm(form.state);
@@ -210,7 +215,94 @@ import { callClaude } from './claude-api.js';
       setOverlay('Compiling\u2026');
     }catch(e){ ncEl.textContent=`\u2717 ${e.message}`; log(`parse: ${e.message}`,'err'); }
   }
-  editor.addEventListener('input',()=>{clearTimeout(parseTimer);parseTimer=setTimeout(parseSource,180);});
+  // ── Source amendment: ShrubLM-synthesized rules ──
+  const _userAmendedTalks = new Set();         // "shrub/talk" keys user has manually edited
+  const _lastSynthesizedGuards = new Map();    // "shrub/talk" → guard string
+
+  function _escRegex(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+
+  function _amendSource(rule) {
+    const key = `${rule.shrub}/${rule.talk}`;
+    if (_userAmendedTalks.has(key)) {
+      log(`source-amend: skipping "${key}" — user-amended`, 'warn');
+      return;
+    }
+
+    const src = editor.value;
+    // Match @talk with :shrub and :name attrs (either order)
+    const esc = (s) => _escRegex(s);
+    const pat = new RegExp(
+      `(@talk\\s+(?:${esc(rule.talk)}\\s+)?(?::shrub\\s+${esc(rule.shrub)}\\s+:name\\s+${esc(rule.talk)}|:name\\s+${esc(rule.talk)}\\s+:shrub\\s+${esc(rule.shrub)}|:shrub\\s+${esc(rule.shrub)}\\s+${esc(rule.talk)}))`,
+      'm'
+    );
+    const talkMatch = src.match(pat);
+    if (!talkMatch) {
+      log(`source-amend: @talk "${key}" not found in source`, 'warn');
+      return;
+    }
+
+    const talkEnd = talkMatch.index + talkMatch[0].length;
+    const afterTalk = src.slice(talkEnd);
+    const comment = ' ; [learned by ShrubLM]';
+    let newSrc;
+
+    // Check for existing @guard on next indented line
+    const guardPat = /\n([ \t]+)@guard\s+(.+?)(?:\s*;.*)?$/m;
+    const guardMatch = afterTalk.match(guardPat);
+
+    // Only look for guard within the talk's block (before next @talk or unindented line)
+    const nextBlockPat = /\n(?=\S)/;
+    const nextBlock = afterTalk.search(nextBlockPat);
+    const inBlock = guardMatch && (nextBlock === -1 || guardMatch.index < nextBlock);
+
+    if (inBlock && guardMatch) {
+      // Guard exists — merge with AND
+      const guardLineStart = talkEnd + guardMatch.index;
+      const fullGuardLine = guardMatch[0];
+      const indent = guardMatch[1] || '  ';
+      const existingExpr = guardMatch[2].trim();
+      const merged = `(and ${existingExpr} ${rule.guard})`;
+      newSrc = src.slice(0, guardLineStart) +
+               `\n${indent}@guard ${merged}${comment}` +
+               src.slice(guardLineStart + fullGuardLine.length);
+    } else {
+      // No guard — insert after @talk line
+      const nextChildPat = /\n([ \t]+)@/;
+      const childMatch = afterTalk.match(nextChildPat);
+      if (childMatch && (nextBlock === -1 || childMatch.index < nextBlock)) {
+        const insertPos = talkEnd + childMatch.index;
+        newSrc = src.slice(0, insertPos) + `\n  @guard ${rule.guard}${comment}` + src.slice(insertPos);
+      } else {
+        // No children at all — append guard after talk line
+        newSrc = src.slice(0, talkEnd) + `\n  @guard ${rule.guard}${comment}` + src.slice(talkEnd);
+      }
+    }
+
+    editor.value = newSrc;
+    lastSrc = '';
+    parseSource();
+    _lastSynthesizedGuards.set(key, rule.guard);
+    log(`source-amend: injected guard for "${key}": ${rule.guard}`, 'ok');
+  }
+
+  // Wire crystallization → source amendment
+  if (pcn) {
+    pcn.onCrystallize = (rule) => {
+      try { _amendSource(rule); }
+      catch (e) { log(`source-amend: ${e.message}`, 'err'); }
+    };
+  }
+
+  editor.addEventListener('input',()=>{
+    // Check for user override of synthesized guards
+    for (const [key, guard] of _lastSynthesizedGuards) {
+      if (!editor.value.includes(guard)) {
+        _userAmendedTalks.add(key);
+        _lastSynthesizedGuards.delete(key);
+      }
+    }
+    clearTimeout(parseTimer);parseTimer=setTimeout(parseSource,180);
+  });
 
   // ── Canvas drag → @interact ──
   let dragging=false,lastX=0,lastY=0;
@@ -351,10 +443,20 @@ import { callClaude } from './claude-api.js';
             surface.execute();
           }catch(e3){log(`surface: ${e3.message}`,'err');}
         }
-        // Flush batched PCN episodes once per frame (Phase 4C)
-        if(pcn&&pendingEpisodes.length>0){
-          for(const ep of pendingEpisodes) pcn.pushEpisode(ep);
-          pendingEpisodes=[];
+        // PCN feedback: apply crystallized constraints to behaviour as advisory slot hints (~5s)
+        if(pcn && tick%300===0){
+          try{
+            const constraints=pcn.getFeedbackConstraints();
+            for(const c of constraints){
+              if(c.confidence>0.9){
+                const shrub=behaviour._shrubs.get(c.shrub);
+                if(shrub){
+                  shrub.slots.set(`__pcn_min_${c.slot}`,c.suggestedMin);
+                  shrub.slots.set(`__pcn_max_${c.slot}`,c.suggestedMax);
+                }
+              }
+            }
+          }catch(e6){/* feedback errors non-fatal */}
         }
       }catch(e){log(`frame: ${e.message}`,'err');}
     }
@@ -485,6 +587,56 @@ import { callClaude } from './claude-api.js';
   applyBreakpoint();
   resizeCanvas();
 
+  // ── Default demo: load a starter Rex program so the page isn't blank ──
+  if (!editor.value.trim()) {
+    editor.value = `@struct Params
+  @field resolution :type f32x2
+  @field time :type f32
+  @field speed :type f32
+
+@shader plasma
+  #import Params
+  struct VSOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
+  @group(0) @binding(0) var<uniform> u: Params;
+  @vertex fn vs_main(@builtin(vertex_index) vi: u32) -> VSOut {
+    var p = array<vec2f,6>(vec2f(-1,-1),vec2f(1,-1),vec2f(-1,1),vec2f(-1,1),vec2f(1,-1),vec2f(1,1));
+    var o: VSOut; o.pos = vec4f(p[vi],0,1); o.uv = vec2f(p[vi].x*0.5+0.5, 0.5-p[vi].y*0.5); return o;
+  }
+  @fragment fn fs_main(v: VSOut) -> @location(0) vec4f {
+    let t = u.time * u.speed;
+    let p = v.uv * 6.0 - 3.0;
+    var c = 0.0;
+    c += sin(p.x + t);
+    c += sin(p.y * 1.5 + t * 0.7);
+    c += sin(p.x * 0.8 + p.y * 1.2 + t * 1.3);
+    c += sin(length(p) * 1.5 - t);
+    c = c * 0.25 + 0.5;
+    let r = sin(c * 3.14159) * 0.5 + 0.5;
+    let g = sin(c * 3.14159 + 2.094) * 0.5 + 0.5;
+    let b = sin(c * 3.14159 + 4.189) * 0.5 + 0.5;
+    return vec4f(r, g, b, 1.0);
+  }
+
+@buffer params :struct Params :usage [uniform]
+  @data
+    resolution = (canvas-size)
+    time = (elapsed)
+    speed = (form/speed)
+
+@pipeline main :vertex plasma :fragment plasma :format canvas :topology triangle-list
+
+@pass main :clear [0 0 0 1]
+  @draw :pipeline main :vertices 6
+    @bind 0 :buffer params
+
+@form controls :title "Plasma"
+  @field speed :type range :label "Speed" :min 0.1 :max 3 :step 0.1 :default 1
+
+@interact :scroll speed :scroll-scale 0.01`;
+    parseSource();
+  }
+
   log('RexGPU ready \u00b7 type a prompt to generate Rex notation','ok');
   flushLog();
+} catch(fatal) { console.error('RexGPU init failed:', fatal); document.getElementById('gpu-overlay').textContent = 'Init error: ' + fatal.message; }
 })();

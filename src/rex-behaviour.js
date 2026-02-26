@@ -17,7 +17,14 @@ export class RexBehaviour {
     this._compiled = false;
     this.onSlotChange = null;    // callback(shrubName, slotName, value)
     this.onChannelPush = null;   // callback(buffer, field, value) → GPU heap write
+    this.onTalkFired = null;     // callback(record) — rich causal record per talk invocation
+    this.onSurpriseSignal = null;// callback(shrub, slot, value, schemaRange) — out-of-range derives
     this.formState = null;       // external form state for expression resolution
+    this.getShrubLM = null;      // callback(shrubName) → ShrubLM|null — set by main.js for model-free path
+    this.getGoalState = null;    // callback(shrub, slot, target, slots) → {talk, expectedDelta}|null
+
+    // ── Self-healing state ──
+    this._recoveryState = new Map();  // shrubName → {attempts, cooldownUntil}
 
     // ── Extension hooks ──
     this._schemaHandlers = new Map();
@@ -49,30 +56,9 @@ export class RexBehaviour {
   // Check if a @def exists
   hasDef(name) { return this._defs.has(name); }
 
-  // Fire a @talk action externally (e.g. from surface click)
+  // Fire a @talk action externally (e.g. from surface click) — delegates to invoke
   fireTalk(shrubName, actionName, params) {
-    const key = `${shrubName}/${actionName}`;
-    const talk = this._talks.get(key);
-    if (!talk) return;
-    const ctx = this._makeTalkContext(shrubName, params);
-    if (talk.guard) {
-      const pass = this._evalExpr(talk.guard, ctx);
-      if (!pass) return;
-    }
-    for (const mut of talk.mutations) this._executeMutation(mut, ctx);
-    this._recomputeDerives();
-    this._pushChannels();
-  }
-
-  _makeTalkContext(shrubName, params) {
-    const self = this;
-    return {
-      shrub: shrubName,
-      resolve(op, key, args) {
-        if (op === 'ident' && params && params[key] !== undefined) return params[key];
-        return self._makeBehaviourContext({shrub: shrubName}).resolve(op, key, args);
-      }
-    };
+    this.invoke(shrubName, actionName, params || {});
   }
 
   transduce(tree, structureChanged) {
@@ -157,7 +143,9 @@ export class RexBehaviour {
           const slotName = child.name;
           const type = child.attrs.type || 'string';
           const def = child.attrs.default;
-          schema.slots.set(slotName, { type, default: def });
+          const min = child.attrs.min !== undefined ? +child.attrs.min : undefined;
+          const max = child.attrs.max !== undefined ? +child.attrs.max : undefined;
+          schema.slots.set(slotName, { type, default: def, min, max });
           if (def !== undefined) slots.set(slotName, this._coerce(def, type));
           break;
         }
@@ -379,6 +367,16 @@ export class RexBehaviour {
   // ════════════════════════════════════════════════════════════════
 
   _recomputeDerives() {
+    // Write ShrubLM confidence/ready shadow slots before derive pass
+    if (this.getShrubLM) {
+      for (const [shrubName, shrub] of this._shrubs) {
+        const lm = this.getShrubLM(shrubName);
+        if (!lm) continue;
+        shrub.slots.set(`__lm_ready_${shrubName}`, lm.ready ? 1 : 0);
+        shrub.slots.set(`__lm_confidence_${shrubName}`, lm.confidence);
+      }
+    }
+
     for (const d of this._derives) {
       const shrub = this._shrubs.get(d.shrub);
       if (!shrub) continue;
@@ -387,8 +385,71 @@ export class RexBehaviour {
       if (val !== undefined) {
         const prev = shrub.slots.get(d.slot);
         shrub.slots.set(d.slot, val);
-        if (val !== prev && this.onSlotChange) {
-          this.onSlotChange(d.shrub, d.slot, val);
+        if (val !== prev) {
+          if (this.onSlotChange) this.onSlotChange(d.shrub, d.slot, val);
+          // Surprise: emit if value outside schema-declared range
+          if (this.onSurpriseSignal && typeof val === 'number') {
+            const slotSchema = shrub.schema.slots.get(d.slot);
+            if (slotSchema) {
+              const { min, max } = slotSchema;
+              if ((min !== undefined && val < min) || (max !== undefined && val > max)) {
+                this.onSurpriseSignal(d.shrub, d.slot, val, { min, max });
+                // Self-healing: attempt recovery via goal-state generator
+                try { this._attemptRecovery(d.shrub, d.slot, val, { min, max }); }
+                catch (e) { this.log(`behaviour: recovery error: ${e.message}`, 'err'); }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // Self-healing: attempt to invoke a corrective talk when a derive exits schema range.
+  // The goal-state generator (PCN) finds which talk's displacement can push the slot back.
+  // Cooldown prevents infinite surprise→recovery→surprise loops.
+  _attemptRecovery(shrubName, slotName, value, schemaRange) {
+    if (!this.getGoalState) return;
+
+    const now = performance.now();
+    let state = this._recoveryState.get(shrubName);
+    if (!state) {
+      state = { attempts: 0, cooldownUntil: 0 };
+      this._recoveryState.set(shrubName, state);
+    }
+
+    // Cooldown: prevent loops
+    if (now < state.cooldownUntil) return;
+    if (state.attempts >= 3) {
+      state.cooldownUntil = now + 5000; // 5s cooldown
+      state.attempts = 0;
+      this.log(`behaviour: recovery cooldown for "${shrubName}" (5s)`, 'warn');
+      return;
+    }
+
+    // Target: clamp back to nearest schema boundary
+    const target = (schemaRange.min !== undefined && value < schemaRange.min) ? schemaRange.min
+                 : (schemaRange.max !== undefined && value > schemaRange.max) ? schemaRange.max
+                 : value;
+
+    const shrub = this._shrubs.get(shrubName);
+    if (!shrub) return;
+
+    const goal = this.getGoalState(shrubName, slotName, target, shrub.slots);
+    if (!goal) return;
+
+    state.attempts++;
+    this.log(`behaviour: recovery ${state.attempts}/3 for "${shrubName}/${slotName}" via "${goal.talk}"`, 'ok');
+
+    const success = this.invoke(shrubName, goal.talk, {});
+    if (success) {
+      const newVal = shrub.slots.get(slotName);
+      if (typeof newVal === 'number') {
+        const inRange = (schemaRange.min === undefined || newVal >= schemaRange.min) &&
+                        (schemaRange.max === undefined || newVal <= schemaRange.max);
+        if (inRange) {
+          state.attempts = 0;
+          this.log(`behaviour: recovery succeeded for "${shrubName}/${slotName}" → ${newVal}`, 'ok');
         }
       }
     }
@@ -454,11 +515,42 @@ export class RexBehaviour {
       deps: shrub.schema.deps, inputs, src: null, now: Date.now(),
     };
 
-    // Guard check
+    const t0 = performance.now();
+
+    // Guard check — model-free bypass when ShrubLM says this is prototypical
     if (talk.guard) {
-      const guardResult = this._evalExpr(talk.guard, ctx);
-      if (!guardResult) { this.log(`behaviour: guard rejected for "${key}"`, 'warn'); return false; }
+      let bypassed = false;
+      if (this.getShrubLM) {
+        const lm = this.getShrubLM(shrubName);
+        if (lm && lm.ready) {
+          // Build prospective deltas from inputs for prototype check
+          const prospective = new Map();
+          for (const [k, v] of Object.entries(inputs)) {
+            if (typeof v === 'number') prospective.set(k, v);
+          }
+          if (lm.isPrototypical(actionName, prospective)) {
+            bypassed = true;
+            // Write bypass signal slot for surface/form rendering
+            shrub.slots.set(`__lm_bypass_${actionName}`, 1);
+          }
+        }
+      }
+      if (!bypassed) {
+        const guardResult = this._evalExpr(talk.guard, ctx);
+        if (!guardResult) {
+          this.log(`behaviour: guard rejected for "${key}"`, 'warn');
+          shrub.slots.set(`__lm_bypass_${actionName}`, 0);
+          if (this.onTalkFired) {
+            this.onTalkFired({ shrub: shrubName, talk: actionName, guard_result: false,
+              mutations_fired: [], slot_deltas: new Map(), surprise: 0, timestamp: t0 });
+          }
+          return false;
+        }
+      }
     }
+
+    // Snapshot pre-mutation slots
+    const preSnapshot = new Map(shrub.slots);
 
     // Execute mutations atomically
     for (const mut of talk.mutations) {
@@ -467,6 +559,25 @@ export class RexBehaviour {
 
     // Recompute derives after mutations
     this._recomputeDerives();
+    this._pushChannels();
+
+    // Build causal record and emit
+    if (this.onTalkFired) {
+      const mutations_fired = [];
+      const slot_deltas = new Map();
+      for (const [slotName, newVal] of shrub.slots) {
+        const oldVal = preSnapshot.get(slotName);
+        if (newVal !== oldVal) {
+          mutations_fired.push({ path: slotName, old_val: oldVal, new_val: newVal });
+          if (typeof newVal === 'number') {
+            slot_deltas.set(slotName, newVal - (typeof oldVal === 'number' ? oldVal : 0));
+          }
+        }
+      }
+      this.onTalkFired({ shrub: shrubName, talk: actionName, guard_result: true,
+        mutations_fired, slot_deltas, surprise: 0, timestamp: t0 });
+    }
+
     return true;
   }
 
@@ -891,5 +1002,25 @@ export class RexBehaviour {
   getTalkNames(shrubName) {
     const prefix = `${shrubName}/`;
     return [...this._talks.keys()].filter(k => k.startsWith(prefix)).map(k => k.slice(prefix.length));
+  }
+
+  // Return schema slot definitions for a shrub (for ShrubLM reference frame init)
+  getShrubSchema(shrubName) {
+    const shrub = this._shrubs.get(shrubName);
+    return shrub ? Object.fromEntries(shrub.schema.slots) : null;
+  }
+
+  // Return all cross-shrub dep edges for PCN connectome auto-wiring
+  getCrossShrubDeps() {
+    const edges = [];
+    for (const [shrubName, shrub] of this._shrubs) {
+      for (const [label, depDef] of shrub.schema.deps) {
+        const parts = depDef.path.split('/').filter(Boolean);
+        if (parts.length >= 1 && parts[0] !== shrubName) {
+          edges.push({ from: shrubName, to: parts[0], label, path: depDef.path });
+        }
+      }
+    }
+    return edges;
   }
 }
