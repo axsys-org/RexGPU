@@ -705,13 +705,13 @@ import { callClaude } from './claude-api.js';
     }
     if (i == 128) { return vec4f(0.0, 0.0, 0.0, 1.0); }
     let fi = f32(i) - log2(log2(dot(z,z))) + 4.0;
-    let fn_ = fi / 128.0;
+    let fn0 = fi / 128.0;
     // Bands of colour cycling with time
-    let h1 = fract(fn_*3.0 + u.hue + t*0.4);
-    let h2 = fract(fn_*7.0 + u.hue*1.7 + t*0.2);
-    let bright = pow(fn_, 0.45);
+    let h1 = fract(fn0*3.0 + u.hue + t*0.4);
+    let h2 = fract(fn0*7.0 + u.hue*1.7 + t*0.2);
+    let bright = pow(fn0, 0.45);
     let col = hsv(h1, 0.95, bright)*0.7 + hsv(h2, 0.6, bright*0.5)*0.3;
-    let edgeGlow = exp(-fn_*6.0)*1.5;
+    let edgeGlow = exp(-fn0*6.0)*1.5;
     return vec4f(col + hsv(fract(u.hue+0.33), 1.0, edgeGlow)*0.5, 1.0);
   }
 
@@ -778,7 +778,7 @@ import { callClaude } from './claude-api.js';
     return vec4f(edgeCol + fillCol + glowCol, 1.0);
   }
 
-@shader void
+@shader warp
   #import Params
   struct VSOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f }
   @group(0) @binding(0) var<uniform> u: Params;
@@ -887,14 +887,14 @@ import { callClaude } from './claude-api.js';
 @pipeline frac :vertex fractal    :fragment fractal    :format canvas :topology triangle-list
 @pipeline mand :vertex mandelbrot :fragment mandelbrot :format canvas :topology triangle-list
 @pipeline tun  :vertex tunnel     :fragment tunnel     :format canvas :topology triangle-list
-@pipeline void :vertex void       :fragment void       :format canvas :topology triangle-list
+@pipeline warp :vertex warp       :fragment warp       :format canvas :topology triangle-list
 
 @pass main :clear [0.01 0.01 0.02 1]
   @draw :pipeline (form/mode) :vertices 6
     @bind 0 :buffer params
 
 @form controls :title "Hypnosis Engine"
-  @field mode  :type select :label "Mode"  :options [frac mand tun void] :default frac
+  @field mode  :type select :label "Mode"  :options [frac mand tun warp] :default frac
   @field speed :type range  :label "Speed"  :min 0.05 :max 4    :step 0.01  :default 0.8
   @field zoom  :type range  :label "Zoom"   :min 0.3  :max 8    :step 0.01  :default 1.0
   @field twist :type range  :label "Twist"  :min -3.14 :max 3.14 :step 0.01 :default 0.0
