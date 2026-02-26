@@ -1081,12 +1081,13 @@ struct VSOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
           if (child.type === 'draw') {
             const draw = {
               pipelineKey: child.attrs.pipeline,
-              vertices: this._resolveDrawValue(child.attrs.vertices)||3,
-              instances: this._resolveDrawValue(child.attrs.instances)||1,
+              // Store raw attr values for dynamic fields — resolved at execute time via _resolveDynamic
+              vertices: child.attrs.vertices ?? 3,
+              instances: child.attrs.instances ?? 1,
               binds: [],
               vertexBuffer: child.attrs['vertex-buffer'] || null,
               indexBuffer: child.attrs['index-buffer'] || null,
-              indexCount: this._resolveDrawValue(child.attrs['index-count']) || 0,
+              indexCount: child.attrs['index-count'] ?? 0,
               indirect: child.attrs.indirect === true,
               indirectBuffer: child.attrs['indirect-buffer'] || null,
               indirectOffset: this._resolveDrawValue(child.attrs['indirect-offset']) || 0,
@@ -1124,7 +1125,8 @@ struct VSOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
         const dispCmd = {
           type: 'dispatch',
           pipelineKey: node.attrs.pipeline,
-          grid: [this._resolveDrawValue(grid[0])||1, this._resolveDrawValue(grid[1])||1, this._resolveDrawValue(grid[2])||1],
+          // Store raw grid values for dynamic resolution at execute time
+          grid: Array.isArray(grid) ? [...grid] : [grid, 1, 1],
           binds: [],
           indirect: node.attrs.indirect === true,
           indirectBuffer: node.attrs['indirect-buffer'] || null,
@@ -1637,8 +1639,15 @@ struct VSOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
         if (cmd.stencilRef) pass.setStencilReference(cmd.stencilRef);
 
         for (const draw of cmd.draws) {
-          const pe = this.pipelines.get(draw.pipelineKey);
-          if (!pe) { this.log(`draw: pipeline "${draw.pipelineKey}" not found`,'err'); continue; }
+          // pipelineKey may be an expression object {expr:'form/key'} for dynamic pipeline selection
+          let resolvedKey = draw.pipelineKey;
+          if (resolvedKey && typeof resolvedKey === 'object' && resolvedKey.expr) {
+            const expr = resolvedKey.expr;
+            if (expr.startsWith('form/')) resolvedKey = this.formState[expr.slice(5)] ?? resolvedKey;
+            else resolvedKey = String(resolvedKey);
+          }
+          const pe = this.pipelines.get(resolvedKey);
+          if (!pe) { this.log(`draw: pipeline "${resolvedKey}" not found`,'err'); continue; }
           pass.setPipeline(pe.pipeline);
           // Auto-set resource scope bind group at group 0 if pipeline uses one
           if (pe.resourceScope && this._resourceScopes?.has(pe.resourceScope)) {
@@ -1661,11 +1670,16 @@ struct VSOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
 
           if (useOcclusion) pass.beginOcclusionQuery(draw.occlusionIndex);
 
+          // Resolve dynamic draw counts from form state
+          const dverts = this._resolveDynamic(draw.vertices, 3);
+          const dinst  = this._resolveDynamic(draw.instances, 1);
+          const didx   = this._resolveDynamic(draw.indexCount, 0);
+
           // Indirect draw
           if (draw.indirect && draw.indirectBuffer) {
             const indBuf = this._storageBuffers.get(draw.indirectBuffer);
             if (!indBuf) { this.log(`draw: indirect buffer "${draw.indirectBuffer}" not found`,'err'); if (useOcclusion) pass.endOcclusionQuery(); continue; }
-            if (draw.indexBuffer && draw.indexCount > 0) {
+            if (draw.indexBuffer && didx > 0) {
               const ib = this._indexBuffers.get(draw.indexBuffer);
               if (ib) { pass.setIndexBuffer(ib, 'uint32'); pass.drawIndexedIndirect(indBuf, draw.indirectOffset); }
             } else {
@@ -1673,23 +1687,30 @@ struct VSOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
             }
           }
           // Index buffer (direct)
-          else if (draw.indexBuffer && draw.indexCount > 0) {
+          else if (draw.indexBuffer && didx > 0) {
             const ib = this._indexBuffers.get(draw.indexBuffer);
             if (ib) {
               pass.setIndexBuffer(ib, 'uint32');
-              pass.drawIndexed(draw.indexCount, draw.instances, 0, 0, 0);
+              pass.drawIndexed(didx, dinst, 0, 0, 0);
             } else {
-              pass.draw(draw.vertices, draw.instances, 0, 0);
+              pass.draw(dverts, dinst, 0, 0);
             }
           } else {
-            pass.draw(draw.vertices, draw.instances, 0, 0);
+            pass.draw(dverts, dinst, 0, 0);
           }
 
           if (useOcclusion) pass.endOcclusionQuery();
         }
         pass.end();
       } else if (cmd.type === 'dispatch') {
-        const pe = this.pipelines.get(cmd.pipelineKey);
+        // Resolve dynamic dispatch pipelineKey
+        let dispKey = cmd.pipelineKey;
+        if (dispKey && typeof dispKey === 'object' && dispKey.expr) {
+          const expr = dispKey.expr;
+          if (expr.startsWith('form/')) dispKey = this.formState[expr.slice(5)] ?? dispKey;
+          else dispKey = String(dispKey);
+        }
+        const pe = this.pipelines.get(dispKey);
         if (!pe || pe.type !== 'compute') continue;
         const cpDesc = {};
         // Timestamp queries for compute
@@ -1718,7 +1739,12 @@ struct VSOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
           if (indBuf) cp.dispatchWorkgroupsIndirect(indBuf, cmd.indirectOffset);
           else this.log(`dispatch: indirect buffer "${cmd.indirectBuffer}" not found`,'err');
         } else {
-          cp.dispatchWorkgroups(cmd.grid[0], cmd.grid[1], cmd.grid[2]);
+          const g = this._resolveDynamic(cmd.grid, [1,1,1]);
+          cp.dispatchWorkgroups(
+            Math.max(1, this._resolveDynamic(g[0], 1)),
+            Math.max(1, this._resolveDynamic(g[1], 1)),
+            Math.max(1, this._resolveDynamic(g[2], 1))
+          );
         }
         cp.end();
       } else {
@@ -1932,6 +1958,23 @@ struct VSOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
     if (typeof val==='number') return val;
     if (Array.isArray(val)) return val.map(v=>this._resolveDrawValue(v));
     return Number(val)||0;
+  }
+
+  // Runtime resolver — handles {expr:'form/key'} objects against live formState.
+  // Used for draw counts, grid sizes, and other per-frame dynamic values.
+  _resolveDynamic(val, fallback) {
+    if (val===undefined||val===null) return fallback;
+    if (typeof val==='number') return val;
+    if (typeof val==='object' && val.expr) {
+      const expr = val.expr;
+      if (expr.startsWith('form/')) {
+        const v = this.formState[expr.slice(5)];
+        return v !== undefined ? Math.max(0, Math.floor(+v)) : fallback;
+      }
+      return fallback;
+    }
+    if (Array.isArray(val)) return val.map((v,i) => this._resolveDynamic(v, Array.isArray(fallback)?fallback[i]:fallback));
+    return Number(val) || fallback;
   }
 
   _buildHeapInfo() {
