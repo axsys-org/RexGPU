@@ -23,11 +23,13 @@
 ::  Rex path:
 ::    SSE stream → parse-sse → buf tape → scan-rex-top-blocks → (list cord)
 ::    (each cord = one complete top-level Rex block)
-::    → JS: Rex.parse(cord) → Rex.toShrub() → JSON → sent as rex_shrub SSE lines
-::    → Hoon: parse-rex-chunks extracts rex_shrub JSON objects
-::    → decode-rex.shrub(json) → rex-shrub noun
+::    → JS: Rex.parse(cord) → Rex.toShrub() → JSON → sent as SSE lines:
+::         data: {"rex_shrub": <shrub-json>, "rex_src": "<raw-block-cord>"}
+::    → Hoon: parse-rex-chunks extracts [(list [cord json]) tape]
+::            each pair = (rex_src cord, rex_shrub json)
+::    → decode-rex.decode-shrub(json, src) → rex-shrub noun (src stored in .src)
 ::    → forge-rex.run-rex(list rex-shrub) → forge-cards-rex → kook vase
-::    → LLM sees: /shrub/NAME/rex/SUB (stored cord rendered back as Rex source)
+::    → LLM sees: /shrub/NAME/rex/SUB (stored src.nod cord, raw Rex source)
 ::
 ::  PCN/ShrubLM feedback loop:
 ::    behaviour.onTalkFired → pcn.bridgeBehaviourEvent → ShrubLM.observe
@@ -68,7 +70,9 @@
 ::
 ::  rex-shrub: Shrub node from JS Rex.toShrub()
 ::    {type:cord, name:(unit cord), attrs:(map cord *),
-::     children:(list rex-shrub), content:(unit cord)}
+::     children:(list rex-shrub), content:(unit cord), src=cord}
+::  src is the raw Rex block cord. Populated for top-level blocks from rex_src
+::  in the JS bridge envelope. Children have src=''. Stored at /shrub/NAME/rex/SUB.
 ::
 ::  forge-result: output of run-rex
 ::    [%kook shrub=cord spec=spec:n sub=cord hon=hoon src=cord]
@@ -184,12 +188,15 @@
   ::
   ::  Returns: [(list json) tape]  (completed rex_shrubs, remainder tape)
   ++  parse-rex-chunks
+    ::  Returns (list [rex_src=cord shrub-json=json]) pairs.
+    ::  The JS bridge emits: data: {"rex_shrub": <shrub>, "rex_src": "<cord>"}
+    ::  rex_src is the raw Rex block cord for storage at /shrub/NAME/rex/SUB.
     |=  buf=tape
-    ^-  [(list json) tape]
-    =|  acc=(list json)
+    ^-  [(list [cord json]) tape]
+    =|  acc=(list [cord json])
     =|  rem=tape
     =/  lines=(list tape)  (split-lines buf)
-    |-  ^-  [(list json) tape]
+    |-  ^-  [(list [cord json]) tape]
     ?~  lines
       [(flop acc) rem]
     =/  line=tape  i.lines
@@ -205,7 +212,11 @@
       $(lines t.lines)
     ?~  shrub-val=(~(get by p.u.jon) 'rex_shrub')
       $(lines t.lines)
-    $(lines t.lines, acc [u.shrub-val acc])
+    =/  src-cord=cord
+      ?~  src-val=(~(get by p.u.jon) 'rex_src')  ''
+      ?.  ?=([%s *] u.src-val)  ''
+      p.u.src-val
+    $(lines t.lines, acc [[src-cord u.shrub-val] acc])
 
   --  :: seam-rex
 
@@ -233,6 +244,7 @@
         attrs=(map cord *)
         children=(list rex-shrub)
         content=(unit cord)
+        src=cord
     ==
 
   ++  decode-node
@@ -272,10 +284,13 @@
   where
     so  =|  j=json  |.(so:dejs:format j)
 
+  ::  decode-shrub: JSON → rex-shrub
+  ::  src is the raw Rex source cord for the top-level block.
+  ::  Children are decoded recursively with src='' (sub-nodes, not top-level).
   ++  decode-shrub
-    |=  j=json
+    |=  [j=json src=cord]
     ^-  rex-shrub
-    ?.  ?=([%o *] j)  ['' ~ ~ ~ ~]
+    ?.  ?=([%o *] j)  ['' ~ ~ ~ ~ '']
     =/  typ=cord
       ?~  v=(~(get by p.j) 'type')  ''
       (so:dejs:format u.v)
@@ -300,13 +315,13 @@
     =/  kids=(list rex-shrub)
       ?~  v=(~(get by p.j) 'children')  ~
       ?.  ?=([%a *] u.v)  ~
-      (turn p.u.v decode-shrub)
+      (turn p.u.v |=(c=json (decode-shrub c '')))
     =/  ctn=(unit cord)
       ?~  v=(~(get by p.j) 'content')  ~
       ?.  ?=([%s *] u.v)  ~
       ?:  =('' p.u.v)  ~
       `p.u.v
-    [typ nam attrs kids ctn]
+    [typ nam attrs kids ctn src]
 
   ++  get-attr
     |=  [s=rex-shrub k=cord]
@@ -971,8 +986,9 @@
       ?:  =(typ 'derive')  (get-attr-cord:decode-rex nod 'slot' typ)
       typ
     =/  =spec:n  (forge-rex-spec nod)
+    ::  src.nod: raw Rex block cord stored at /shrub/NAME/rex/SUB so LLM can read it back
     =/  results=(list forge-result)
-      ~[[%kook shrub-cord spec sub u.hon '']]
+      ~[[%kook shrub-cord spec sub u.hon src.nod]]
     =?  results  =(typ 'dep')
       =/  pax  (get-attr-cord:decode-rex nod 'path' '')
       (snoc results [%dep shrub-cord sub pax])
@@ -1010,9 +1026,38 @@
 ::    - normalises displacement (postSlots - preSlots) into [0,1] space
 ::    - Welford update on prototype.mean / prototype.m2
 ::    - Welford update on prototype.preState.mean / .m2
+::      (preState = N-dim slot position at talk invocation — used by backward pass)
 ::    - check Mahalanobis distance for surprise (> 3σ → onSurpriseSignal)
-::    - check crystallization (count ≥ 20, variance < 0.25, time ≥ 3×naturalPeriod)
+::    - check local crystallization threshold:
+::        count ≥ 20, variance < 0.25, time ≥ 3×naturalPeriod
+::    - if LM has NO known CMP ports → crystallize immediately
+::    - if LM HAS CMP ports → enter pendingCrystallizations, await lateral vote
+::      (30s timeout: crystallize solo if no lateral confirmation arrives)
 ::    - on crystallization with rejectCount > 0 → synthesizeGuard()
+::
+::  ── 2b. Dep transitive closure ────────────────────────────────────────
+::
+::  rex-behaviour._buildDepClosure() runs at compile time (step 8 in _compile).
+::  Walks all schema @dep declarations + their @set mutation write sets.
+::  Computes transitive closure: if A watches B, and B writes slot S, and
+::  C watches A/S, then C is added as a downstream reaction of B automatically.
+::  Stored as _depTriggers: "sourceShrub/slot" → [{shrub, label}].
+::  rex-behaviour.invoke() calls _fireDepReactions() after mutations, which
+::  walks _depTriggers and fires reactions transitively (depth-limited to 8).
+::
+::  Hoon impact: NONE. forge-rex-dep still emits [%dep shrub name path] as
+::  before. The transitive closure is a JS-side compile-time optimisation.
+::
+::  ── 2c. CMP port weights and discovery ────────────────────────────────
+::
+::  ShrubLM.portWeights: Map<neighborShrub, 0..1>
+::    - Known dep edges seeded at 0.5 when setDepGraph() is called
+::    - Co-firing discovery (two shrubs fire within 50ms): new port at 0.1
+::    - Confirming vote: weight += 0.1 (Hebbian strengthening)
+::    - Contradicting vote: weight -= 0.2 (anti-Hebbian weakening)
+::    - Ports below 0.05 are pruned
+::  Votes are now weighted: vote.confidence × portWeight before delivery.
+::  _emitVotes() routes to both dep-graph neighbors AND co-firing ports.
 ::
 ::  ── 3. synthesizeGuard() → Rex expression cord ───────────────────────
 ::
