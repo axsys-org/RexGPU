@@ -170,16 +170,18 @@ export class RexGPU {
     this._inputKeys = new Set(['KeyW','KeyA','KeyS','KeyD','KeyQ','KeyE',
       'ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Space','ShiftLeft','ShiftRight']);
     this._keyBindings = new Map(); // code → {axis, value} for custom movement mappings
-    c.addEventListener('keydown', e => {
+    document.addEventListener('keydown', e => {
+      // Only consume game keys when canvas is focused or pointer-locked
+      if (document.pointerLockElement !== c && document.activeElement !== c) return;
       this.inputState.keys.add(e.code);
       if (this._inputKeys.has(e.code)) e.preventDefault();
     });
-    c.addEventListener('keyup', e => {
+    document.addEventListener('keyup', e => {
       this.inputState.keys.delete(e.code);
     });
 
-    // Mouse move (works with or without pointer lock)
-    c.addEventListener('mousemove', e => {
+    // Mouse move — pointer-locked events fire on document, unlocked on canvas
+    const onMouseMove = e => {
       if (document.pointerLockElement === c) {
         this.inputState.mouseDX += e.movementX;
         this.inputState.mouseDY += e.movementY;
@@ -190,6 +192,10 @@ export class RexGPU {
         this.inputState.mouseDX += e.movementX;
         this.inputState.mouseDY += e.movementY;
       }
+    };
+    c.addEventListener('mousemove', onMouseMove);
+    document.addEventListener('mousemove', e => {
+      if (document.pointerLockElement === c) onMouseMove(e);
     });
 
     c.addEventListener('mousedown', e => {
@@ -198,7 +204,7 @@ export class RexGPU {
       c.focus();
     });
     c.addEventListener('mouseup', e => { this.inputState.mouseButtons = e.buttons; });
-    c.addEventListener('dblclick', () => {
+    c.addEventListener('click', () => {
       if (!document.pointerLockElement) c.requestPointerLock();
     });
     document.addEventListener('pointerlockchange', () => {
@@ -509,8 +515,20 @@ export class RexGPU {
       let code = s.content?.trim();
       if (!code) { this.log(`shader "${key}" has no content`,'warn'); continue; }
       // Resolve #import — structs, libs, or shared shaders
+      // Only the first struct import emits var<uniform> u (binding 0).
+      // Subsequent struct imports just emit the struct body (for use in storage bindings etc).
+      let uniformEmitted = false;
+      // Also skip if the shader manually declares 'var<uniform> u' already
+      const hasManualU = /var\s*<\s*uniform\s*>\s*u\s*:/.test(code);
       code = code.replace(/^[ \t]*#import\s+(\S+).*$/gm, (_, name) => {
-        if (this._wgslStructs.has(name)) return this._wgslStructs.get(name);
+        if (this._wgslStructs.has(name)) {
+          const structWgsl = this._wgslStructs.get(name);
+          if (!uniformEmitted && !hasManualU) {
+            uniformEmitted = true;
+            return `${structWgsl}\n@group(0) @binding(0) var<uniform> u: ${name};`;
+          }
+          return structWgsl; // struct body only — binding declared manually in shader
+        }
         if (this._wgslLibs.has(name)) return this._wgslLibs.get(name);
         this.log(`shader "${key}": #import ${name} not found`,'warn');
         return `// #import ${name} \u2014 NOT FOUND`;
@@ -613,7 +631,7 @@ export class RexGPU {
   _makeGpuEvalContext(builtins) {
     const formState = this.formState;
     return {
-      resolve(op, key) {
+      resolve(op, key, args) {
         if (op === 'ident') return builtins[key] !== undefined ? builtins[key] : Number(key) || 0;
         if (op === 'slot') {
           // /form/key → form state lookup
@@ -621,6 +639,11 @@ export class RexGPU {
           return builtins[key] !== undefined ? builtins[key] : 0;
         }
         if (op === 'dep') return builtins[key] !== undefined ? builtins[key] : 0;
+        // Zero-arg call: treat as ident (handles `(move-x)`, `(elapsed)`, etc.)
+        if (op === 'call' && (!args || args.length === 0)) {
+          if (key.startsWith('form/')) return formState[key.slice(5)] ?? 0;
+          return builtins[key] !== undefined ? builtins[key] : 0;
+        }
         return undefined;
       }
     };
@@ -654,6 +677,17 @@ export class RexGPU {
       if (usage.includes('indirect')) gpuUsage |= GPUBufferUsage.INDIRECT;
       const gpuBuf = this.device.createBuffer({ size, usage: gpuUsage });
       this._storageBuffers.set(b.name, gpuBuf);
+      // Write initial f32 values from @data :f0 v :f1 v ... (byte offset = index*4)
+      const dataNode = b.children.find(c => c.type === 'data');
+      if (dataNode) {
+        const initBuf = new Float32Array(size / 4);
+        const keys = Object.keys(dataNode.attrs);
+        for (let ki = 0; ki < keys.length; ki++) {
+          const v = Rex.evalExpr(Rex.compileExpr(dataNode.attrs[keys[ki]]), {});
+          if (typeof v === 'number') initBuf[ki] = v;
+        }
+        this.device.queue.writeBuffer(gpuBuf, 0, initBuf);
+      }
       this.log(`storage buffer: "${b.name}" ${size}B${usage.includes('indirect')?' [indirect]':''}`,'ok');
     }
   }
@@ -1430,6 +1464,9 @@ struct VSOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
   _execute() {
     if (!this.device || !this.context) return;
     const now = performance.now()/1000, time = now - this.startTime;
+    const dt = this._prevExecTime !== undefined ? Math.min(now - this._prevExecTime, 0.1) : 0.016;
+    this._prevExecTime = now;
+    this._frameDT = dt;
     this._updateInputBuiltins();
     this._applyBuiltins(time);
 
@@ -1840,6 +1877,7 @@ struct VSOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
     let gpuCtx = null; // lazily created for Rex.evalExpr
     b['elapsed'] = time; b['time'] = time;
     b['frame'] = this.frameCount;
+    b['frame-dt'] = this._frameDT || 0.016;
     b['canvas-w'] = this.canvas.width; b['canvas-h'] = this.canvas.height;
     b['mouse-x'] = inp.mouseX; b['mouse-y'] = inp.mouseY;
     b['mouse-dx'] = inp.mouseDX; b['mouse-dy'] = inp.mouseDY;

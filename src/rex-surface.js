@@ -599,8 +599,15 @@ export class RexSurface {
           if (self.formState && self.formState[key] !== undefined) return self.formState[key];
           return 0;
         }
-        if (op === 'call' && self.behaviour && self.behaviour.hasDef(key)) {
-          return self.behaviour.callDef(key, args);
+        if (op === 'call') {
+          if (self.behaviour && self.behaviour.hasDef(key)) return self.behaviour.callDef(key, args);
+          // Zero-arg call: treat as ident/slot (handles `(form/x)`, `(canvas-width)`, etc.)
+          if (!args || args.length === 0) {
+            if (key.startsWith('form/') && self.formState) return self.formState[key.slice(5)] ?? 0;
+            if (key === 'canvas-width' || key === 'width') return self._width;
+            if (key === 'canvas-height' || key === 'height') return self._height;
+            if (self.formState && self.formState[key] !== undefined) return self.formState[key];
+          }
         }
         return undefined;
       }

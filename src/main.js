@@ -366,6 +366,19 @@ import { callClaude } from './claude-api.js';
     }
   },{passive:false});
 
+  // ── Pointer-lock menu bridge: when lock releases, set menuopen=1 if field exists ──
+  document.addEventListener('pointerlockchange', () => {
+    const locked = document.pointerLockElement === canvas;
+    if (!locked && form && 'menuopen' in form.state) {
+      form.setExternal('menuopen', 1);
+      gpu.setFormField('menuopen', 1);
+    }
+    if (locked && form && 'menuopen' in form.state) {
+      form.setExternal('menuopen', 0);
+      gpu.setFormField('menuopen', 0);
+    }
+  });
+
   // ── Generate ──
   function addMsg(text,cls){const d=document.createElement('div');d.className=`msg msg-${cls}`;d.textContent=text;messages.appendChild(d);messages.scrollTop=messages.scrollHeight;return d;}
 

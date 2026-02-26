@@ -45,6 +45,7 @@ Paths: /slot  %dep  $binding  — used in behaviour expressions
     :fieldname (expr)
   ;; Builtins (write directly to @struct fields):
   ;;   elapsed       → f32    (seconds since start)
+  ;;   frame-dt      → f32    (delta time seconds, clamped 0..0.1 — use for physics)
   ;;   canvas-size   → f32x2  (width, height in pixels)
   ;;   frame         → f32    (frame counter)
   ;;   mouse-pos     → f32x2  (0..1 normalized)
