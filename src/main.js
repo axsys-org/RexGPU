@@ -616,20 +616,21 @@ import { callClaude } from './claude-api.js';
   }
   fn fbm(p: vec2f) -> f32 {
     var v = 0.0; var a = 0.5; var q = p;
-    for (var i=0; i<6; i++) {
+    for (var i=0; i<6; i=i+1) {
       v += a * (sin(q.x*7.3+u.time*0.3)*sin(q.y*5.1+u.time*0.2) + hash(q)*0.15);
       q = q * 2.1 + vec2f(1.7, 0.9); a *= 0.48;
     }
     return v;
   }
   fn julia(c: vec2f, seed: vec2f) -> vec2f {
-    var z = c; var i = 0;
-    for (; i<96; i++) {
+    var z = c; var ji = 0;
+    for (var i = 0; i < 96; i = i + 1) {
       z = vec2f(z.x*z.x - z.y*z.y, 2.0*z.x*z.y) + seed;
+      ji = i;
       if (dot(z,z) > 256.0) { break; }
     }
     // Smooth iteration count via continuous escape (Hubbard-Douady potential)
-    let fi = f32(i) - log2(log2(dot(z,z))) + 4.0;
+    let fi = f32(ji) - log2(log2(dot(z,z))) + 4.0;
     return vec2f(fi / 96.0, dot(z,z));
   }
   fn hsv(h: f32, s: f32, v: f32) -> vec3f {
@@ -698,13 +699,14 @@ import { callClaude } from './claude-api.js';
     let ang = u.twist;
     c = vec2f(c.x*cos(ang)-c.y*sin(ang), c.x*sin(ang)+c.y*cos(ang));
     var z = vec2f(0.0);
-    var i = 0;
-    for (; i<128; i++) {
+    var escaped = false;
+    var iesc = 128;
+    for (var i = 0; i < 128; i = i + 1) {
       z = vec2f(z.x*z.x-z.y*z.y, 2.0*z.x*z.y) + c;
-      if (dot(z,z) > 256.0) { break; }
+      if (dot(z,z) > 256.0) { escaped = true; iesc = i; break; }
     }
-    if (i == 128) { return vec4f(0.0, 0.0, 0.0, 1.0); }
-    let fi = f32(i) - log2(log2(dot(z,z))) + 4.0;
+    if (!escaped) { return vec4f(0.0, 0.0, 0.0, 1.0); }
+    let fi = f32(iesc) - log2(log2(dot(z,z))) + 4.0;
     let fn0 = fi / 128.0;
     // Bands of colour cycling with time
     let h1 = fract(fn0*3.0 + u.hue + t*0.4);
@@ -736,8 +738,8 @@ import { callClaude } from './claude-api.js';
     let s = vec2f(1.732051, 1.0) * scale;
     var gid = round(uv / s);
     var best = 9999.0; var bestId = vec2f(0.0);
-    for (var dx = -1; dx <= 1; dx++) {
-      for (var dy = -1; dy <= 1; dy++) {
+    for (var dx = -1; dx <= 1; dx = dx + 1) {
+      for (var dy = -1; dy <= 1; dy = dy + 1) {
         let id = gid + vec2f(f32(dx), f32(dy));
         let ctr = id * s;
         let d = hexDist((uv - ctr) / scale);
@@ -835,12 +837,12 @@ import { callClaude } from './claude-api.js';
     let rd = normalize(v.uv.x*vec2f(asp,1.0).x*right + v.uv.y*up + fwd*1.5);
     // Raymarch
     var d = 0.0; var hit = false; var steps = 0;
-    for (var i=0; i<96; i++) {
-      let p = ro + rd * d;
-      let sd = scene(p, t) * u.seed;
+    for (var i = 0; i < 96; i = i + 1) {
+      let rp = ro + rd * d;
+      let sd = scene(rp, t) * u.seed;
       if (sd < 0.001) { hit = true; steps = i; break; }
-      if (d > 12.0) { break; }
-      d += sd;
+      if (d > 12.0) { steps = i; break; }
+      d = d + sd;
       steps = i;
     }
     if (!hit) {
@@ -851,8 +853,8 @@ import { callClaude } from './claude-api.js';
       let bg = hsv(bgH, 0.7, 0.04) + vec3f(stars*0.6);
       return vec4f(bg, 1.0);
     }
-    let p = ro + rd * d;
-    let n = getNormal(p, t);
+    let hp = ro + rd * d;
+    let n = getNormal(hp, t);
     // Lighting: two coloured lights + rim
     let l1 = normalize(vec3f(cos(t*0.5), 0.8, sin(t*0.5)));
     let l2 = normalize(vec3f(-cos(t*0.3+1.0), -0.5, -sin(t*0.3+1.0)));
