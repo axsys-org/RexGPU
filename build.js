@@ -53,7 +53,8 @@ function build() {
     jsChunks.push(`// ── ${name} ──\n${code}`);
   }
   const js = jsChunks.join('\n\n');
-  html = html.replace('/* __JS__ */', js);
+  // Use replacer fn to avoid $' / $& / $` special replacement patterns in js string content
+  html = html.replace('/* __JS__ */', () => js);
 
   if (!fs.existsSync(DIST)) fs.mkdirSync(DIST, { recursive: true });
   const outPath = path.join(DIST, 'rexgpu.html');

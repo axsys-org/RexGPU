@@ -1,0 +1,2028 @@
+{\rtf1\ansi\ansicpg1252\cocoartf2868
+\cocoatextscaling0\cocoaplatform0{\fonttbl\f0\fnil\fcharset0 .SFNS-Regular;}
+{\colortbl;\red255\green255\blue255;}
+{\*\expandedcolortbl;;}
+\margl1440\margr1440\vieww11520\viewh8400\viewkind0
+\pard\tx560\tx1120\tx1680\tx2240\tx2800\tx3360\tx3920\tx4480\tx5040\tx5600\tx6160\tx6720\pardirnatural\partightenfactor0
+
+\f0\fs34 \cf0 @#  author\
+|?\
+@>  llm-config;\
+--\
+@#  %kids\
+|#\
++/  \
++/  /markdown\
+  |?  @>  noun;\
+  --\
++/  /shrub/[name=@t]/xml/[name=@ud]\
+  |?  @>  noun; :: LLM RECIEVES THIS XML \
+  --\
++/  /shrub/[name=@t]/failed/[name=@t]\
+  |?  @>  noun; \
+  --\
++/  /shrub/[name=@t]/kook/[id=@ud]\
+  |?  @>  vase;\
+  --\
++/  /shrub/[id=@t]\
+  |?  @>  state; :: LLM RECIEVES THIS EVENTUALLY IN REX \
+      @>  kids;\
+      @>  pokes;\
+  --\
++/  /read\
+  |?  @>  noun;\
+  --\
++/  /compiled\
+  |?  @>  noun;\
+  --\
++/  /buffer\
+  |?  @>  noun;\
+  --\
++/  /prompt\
+  |?  @>  noun;\
+  --\
++/  /req\
+  |?  @>  iris-req;\
+      @>  iris-res;\
+  --\
+--\
+@#  %deps\
+|<\
++<  %iris  y\
+  |#\
+  +/  /[id=@da]\
+    |?  @>  iris-req;\
+        @>  iris-res;\
+    --\
+  --\
+--\
+^-  form:n\
+=<\
+|_  [=bowl:n =saga:t]\
+\
+\
++*  this  .\
+    main  ~(. +> [bowl saga])\
+\
+++  take\
+  |=  =gift:n\
+  ^-  (quip card:n tale:t)\
+  :_  q.saga\
+  %+  weld  (handle-kook:main (~(dip of gift) /kook))\
+  (handle-input:main (~(dip of gift) /prompt))\
+\
+++  hear\
+  |=  =rely:n\
+  ^-  (quip card:n tale:t)\
+  :_  q.saga\
+  (handle-response:main rely)\
+\
+++  goof  goof:def:n\
+++  talk  talk:def:n\
+++  dead  dead:def:n\
+++  init  init:def:n\
+--\
+|_  [=bowl:n =saga:t]\
+\
+++  handle-kook\
+  |=  =gift:n\
+  ^-  (list card:n)\
+  ::  gift is dipped to /kook \'97 kid keys are shrub names\
+  ::  each shrub subtree has kook ids as kids\
+  %-  zing\
+  %+  turn  ~(tap by kid.gift)\
+  |=  [shrub=iota shrub-gift=gift:n]\
+  ^-  (list card:n)\
+  ?.  ?=([%tas @] shrub)  ~\
+  =/  name=cord  p.shrub\
+  ::  collect new kook piths from added kids\
+  =/  new-piths=(list pith:t)\
+    %+  murn  ~(tap by kid.shrub-gift)\
+    |=  [id=iota *]\
+    `(welp here.bowl #/shrub/[shrub]/kook/[id])\
+  ?~  new-piths  ~\
+  ::  read existing kook list from target shrub, append\
+  =/  existing=(list pith:t)\
+    ?~  s=(~(get of kids.bowl) #/shrub/[ta/name])  ~\
+    ~(kook sug u.s)\
+  :~  [(welp here.bowl #/shrub/[ta/name]) %poke (~(put by *tale:t) kook:slot:t piths/!>((weld existing new-piths)))]\
+  ==\
+++  handle-context\
+++  handle-input\
+  |=  =gift:n\
+  ^-  (list card:n)\
+  ?~  fil.gift  ~\
+  ?~  prompt=(~(get of kids.bowl) #/prompt)  ~\
+  ?~  content=~(content sug u.prompt)  ~\
+  =+  ;;(user-prompt=@t q.q.u.content)\
+  =/  cancel=(list card:n)\
+    ^-  (list card:n)\
+    :~  [(welp here.bowl #/buffer) %cull ~]\
+        [(welp here.bowl #/read) %cull ~]\
+        [(welp here.bowl #/req) %cull ~]\
+    ==\
+  =/  msgs=(list message:ai)\
+    :~\
+      ['system' system-prompt]\
+      ['user' user-prompt]  \
+    ==\
+  (welp cancel (make-request:orc msgs & ~))\
+\
+++  handle-response\
+  |=  =rely:n\
+  ^-  (list card:n)\
+  ?~  got=(get-response:orc rely)  ~\
+  =/  raw  +.u.got\
+  =/  cat=cord\
+    ?-  -.u.got\
+      %progress  \
+      =/  cat   (parse-sse:seam raw)\
+      ?:  =(cat '')  ~\
+      (handle-chunk cat (met 3 raw))\
+     \
+      %finished  \
+        =/  total=@ud  (met 3 raw)\
+        =/  read=@ud  get-bytes-read\
+        ?:  (gte read total)  ''\
+        (parse-sse:seam (cut 3 [read (sub total read)] raw))\
+    ==\
+  ?:  =(cat '')  ~\
+  (handle-chunk cat (met 3 raw))\
+\
+++  read-kid\
+  |*  [pax=pith:t typ=mold]\
+  ^-  typ\
+  ?~  c=(~(get of kids.bowl) pax)  *typ\
+  ?~  c=~(content sug u.c)  *typ\
+  !<(typ q.u.c)\
+\
+++  put-kid\
+  |=  [pax=pith:t val=vase:t]\
+  ^-  card:n\
+  [(welp here.bowl pax) %make (~(put by *tale:t) content:slot:t noun/val)]\
+\
+++  get-bytes-read\
+  ^-  @ud\
+  (read-kid #/read @ud)\
+\
+++  forge-cards\
+  |=  results=(list forge-result:forge)\
+  ^-  (list card:n)\
+  ::  first pass: collect deps per shrub\
+  =/  dep-map=(map cord crew:n)\
+    %+  roll  results\
+    |=  [res=forge-result:forge acc=(map cord crew:n)]\
+    ?.  ?=(%dep -.res)  acc\
+    ?~  pax=path.res  acc\
+    =/  dep-pith=pith:t\
+      %+  turn  (slag 1 (stab pax))\
+      |=(k=knot `iota:t`k)\
+    =/  existing=crew:n  (~(gut by acc) shrub.res *crew:n)\
+    (~(put by acc) shrub.res (~(put by existing) name.res dep-pith))\
+  ::  second pass: emit kook/def cards + batched crew pokes\
+  =/  cards=(list card:n)\
+    %-  zing\
+    %+  turn  results\
+    |=  res=forge-result:forge\
+    ^-  (list card:n)\
+    ?-  -.res\
+        %dep  ~\
+        %def\
+      :~  (put-kid #/def/[ta/name.res] !>(hon.res))\
+      ==\
+        %kook\
+      =/  vas  (mule |.((slap !>(.) hon.res)))\
+      ?:  ?=(%.n -.vas)\
+        ~&  [%compile-failed shrub.res sub.res]\
+        :~  (put-kid #/shrub/[ta/shrub.res]/failed/[ta/sub.res] !>([nod.res]))\
+        ==\
+      ::  slop spec with compiled form to make kook vase\
+      =/  kook-vase  (slop !>(spec.res) p.vas)\
+      =/  next-id  (read-next #/shrub/[ta/shrub.res]/kook)\
+      :~  (put-kid #/shrub/[ta/shrub.res]/kook/[ud/next-id] kook-vase)\
+          [(welp here.bowl #/shrub/[ta/name]/xml) %make (~(put by *tale:t) content:slot:t manx/!>(nod.res))]\
+      ==\
+    ==\
+  ::  append one crew poke per shrub with all deps merged\
+  %+  weld  cards\
+  %+  turn  ~(tap by dep-map)\
+  |=  [shrub=cord =crew:n]\
+  ^-  card:n\
+  =/  shrub-pith  (welp here.bowl #/shrub/[ta/shrub])\
+  [shrub-pith %poke (~(put by *tale:t) crew:slot:t crew/!>(crew))]\
+  \
+\
+++  handle-chunk\
+  |=  [new=cord len=@ud]\
+  ^-  (list card:n)\
+  =/  [parsed=(list manx) buf=tape]\
+    (process-chunk:seam (weld (read-kid #/buffer tape) (trip new)))\
+\
+  =/  read  (add get-bytes-read len)\
+\
+  %+  weld  (forge-cards (run:forge parsed))\
+  :~  (put-kid #/buffer !>(buf))\
+      (put-kid #/read !>(read))\
+  ==\
+\
+++  system-prompt\
+  ^-  cord\
+  '''\
+  You are a shrub compiler. You emit XML that defines shrubs in a reactive namespace.\
+  Emit only XML. No prose, no markdown, no explanation.\
+\
+  ============================================================\
+  STRUCTURE\
+  ============================================================\
+\
+  A shrub document has two layers:\
+\
+  SCHEMA \'97 one <shrub> block per entity, containing the full\
+  interface: slots, kids collections, and dependency subscriptions.\
+  The schema is the portable contract. Any behavioral kook that\
+  targets a matching schema can attach to it.\
+\
+  BEHAVIOR \'97 flat, independent blocks. Each block compiles to one\
+  kook (a self-contained compilation unit installed at a namespace\
+  pith). Blocks are top-level, order-independent, and independently\
+  replaceable.\
+\
+  Block types:\
+\
+    <shrub>   Schema: slots, kids, and dep subscriptions\
+    <dep>     Reaction: side effects when a dep changes + dead handler\
+    <derive>  Computed: always-recomputed value for one slot\
+    <talk>    Action: named entry point for state mutation\
+    <def>     Function: pure gate bound in document scope\
+\
+  The <shrub> block must appear before any behavioral blocks.\
+  Behavioral blocks should appear in this order:\
+    <def> \uc0\u8594  <dep> \u8594  <derive> \u8594  <talk>\
+  Defs first, so they are available to everything that follows.\
+\
+  ============================================================\
+  SCHEMA\
+  ============================================================\
+\
+  <shrub name="NAME">\
+    <slot name="NAME" type="TYPE"/>\
+    <slot name="NAME" type="TYPE" value="DEFAULT"/>\
+    <kids path="PATH/[AURA]">\
+      <slot name="NAME" type="TYPE"/>\
+    </kids>\
+    <dep name="LABEL" path="PITH"/>\
+  </shrub>\
+\
+  The <shrub> block is the complete interface definition for an\
+  entity. One <shrub> per entity. The name must be unique.\
+\
+  ---- SLOTS ----\
+\
+  <slot name="NAME" type="TYPE"/>\
+  <slot name="NAME" type="TYPE" value="DEFAULT"/>\
+\
+  Types: string, number, boolean, date\
+  Slot with value="X": default value. Without: starts empty.\
+\
+  ---- KIDS ----\
+\
+  <kids path="PATH/[AURA]">\
+    <slot name="NAME" type="TYPE"/>\
+  </kids>\
+\
+  Dynamic collection keyed by aura. Like a database table with rows.\
+    [ud]=number, [p]=ship, [ta]=text, [da]=date, [t]=text\
+\
+  Kids are dumb data rows \'97 no behavior of their own.\
+  If an entity needs behavior, make it a separate shrub.\
+\
+  Kids can be nested to form graph structures:\
+\
+  <shrub name="org">\
+    <slot name="name" type="string"/>\
+    <kids path="departments/[ta]">\
+      <slot name="name" type="string"/>\
+    </kids>\
+    <kids path="departments/[ta]/teams/[ta]">\
+      <slot name="name" type="string"/>\
+    </kids>\
+    <kids path="departments/[ta]/teams/[ta]/members/[p]">\
+      <slot name="name" type="string"/>\
+    </kids>\
+  </shrub>\
+\
+  ---- DEP (schema level) ----\
+\
+  <dep name="LABEL" path="PITH"/>\
+\
+  Declares that this shrub subscribes to external data.\
+  The subscription is global \'97 every kook in this shrub can read\
+  %LABEL in expressions. The path maps an external namespace\
+  location to a local label.\
+\
+  Dep path resolution:\
+    /store/products        \uc0\u8594  shrub "store", kids at /products\
+    /employees/people      \uc0\u8594  shrub "employees", kids at /people\
+    /dashboard/total-value \uc0\u8594  shrub "dashboard", slot /total-value\
+  First segment is shrub name. Rest is internal path.\
+\
+  Care (x vs y) is inferred by the compiler:\
+  - If %LABEL is read anywhere \uc0\u8594  care=x (need value)\
+  - If %LABEL is never read \uc0\u8594  care=y (revision only, event trigger)\
+\
+  ---- SCHEMA AS CONTRACT ----\
+\
+  The <shrub> block defines everything a kook needs to know:\
+  - What slots exist (state shape)\
+  - What kids collections exist (data shape)\
+  - What deps are available (external data)\
+\
+  Behavioral kooks (talk, derive, dep reaction) can attach to any\
+  shrub whose schema provides the slots, kids, and deps they need.\
+  The schema is the interface. Kooks are the implementation.\
+\
+  ============================================================\
+  MULTI-SHRUB SYSTEMS\
+  ============================================================\
+\
+  Most apps are multiple shrubs that communicate.\
+\
+  - Each shrub owns its own state. No shrub mutates another directly.\
+  - Shrubs READ from others via <dep> (declared in schema).\
+  - Shrubs REACT to changes via <dep> blocks (behavioral reaction).\
+  - Same owner, same lifecycle, tightly related \uc0\u8594  one shrub.\
+  - Different owner, different concerns \uc0\u8594  separate shrubs with deps.\
+\
+  SPLITTING RULE: if one kids collection needs to reactively cause\
+  changes in another kids collection, they belong in separate shrubs\
+  connected by a dep. A single shrub's <derive> is pure computation\
+  only \'97 no side effects. This constraint naturally prevents shrubs\
+  from becoming too large and keeps reactive relationships visible\
+  in the dep graph.\
+\
+  ============================================================\
+  DEP REACTION\
+  ============================================================\
+\
+  A behavioral <dep> block adds side effects when a schema-level\
+  dep changes. The subscription is already declared in <shrub>.\
+  The behavioral block only needs the shrub and dep name.\
+\
+  With reaction body:\
+  <dep shrub="NAME" name="LABEL">\
+    MUTATIONS...\
+  </dep>\
+\
+  With dead handler only:\
+  <dep shrub="NAME" name="LABEL">\
+    <dead>\
+      MUTATIONS...\
+    </dead>\
+  </dep>\
+\
+  With both:\
+  <dep shrub="NAME" name="LABEL">\
+    <dead>\
+      MUTATIONS...\
+    </dead>\
+    MUTATIONS...\
+  </dep>\
+\
+  No path attribute \'97 the path is already in the schema.\
+  The dep name must match a <dep> declared in the <shrub>.\
+\
+  When the dep data changes:\
+  1. If a behavioral <dep> block exists: run its mutations first\
+  2. Then recompute all <derive> blocks\
+\
+  If no behavioral <dep> block exists for a dep, changes only\
+  trigger derive recomputation.\
+\
+  <dead> fires when the dependency shrub dies.\
+\
+  DEP REACTION RULES:\
+  - Can read: / slots, %kids, %dep data, %now, %src\
+  - Cannot read: %inputs\
+  - Can mutate: <set>, <create>, <update>, <remove>, <each>, <when>\
+  - No <input>, no <guard>\
+\
+  ============================================================\
+  DERIVE\
+  ============================================================\
+\
+  <derive shrub="NAME" slot="SLOT">\
+    EXPR\
+  </derive>\
+\
+  Defines a formula for a single slot. Not assignment \'97 definition.\
+  The slot's value is ALWAYS the result of the expression.\
+  Recomputes after every arm (talk, dep reaction, dead) completes.\
+\
+  Each <derive> targets exactly one slot declared in the <shrub>.\
+  One derive per slot.\
+\
+  Multiple derives resolve by dependency order, not document order.\
+  Must not form cycles.\
+\
+  DERIVE RULES:\
+  - Can read: / slots, %kids, %dep data, %now\
+  - Cannot read: %src, %inputs\
+  - Cannot mutate: no <set>, <create>, <update>, <remove>, <each>\
+\
+  ============================================================\
+  TALK\
+  ============================================================\
+\
+  <talk shrub="NAME" name="ACTION-NAME">\
+    <input FIELD="TYPE" .../>\
+    <guard>EXPR</guard>\
+    MUTATIONS...\
+  </talk>\
+\
+  Named entry point for state mutation. Fires when poked by a user\
+  or the system.\
+\
+  Each <talk> is identified by shrub + name. Names must be unique\
+  within a shrub.\
+\
+  <input>: named typed inputs. Available as %FIELD in expressions.\
+    A talk can have at most one <input>.\
+  <guard>: optional. Must return boolean. Evaluated before any\
+    mutations. If false, entire talk is rejected. At most one per talk.\
+\
+  TALK RULES:\
+  - Can read: / slots, %kids, %dep data, %now, %src, %inputs\
+  - Can mutate: <set>, <create>, <update>, <remove>, <each>, <when>\
+  - All mutations in one talk execute atomically\
+  - <guard> runs before any mutations\
+\
+  ============================================================\
+  MUTATIONS\
+  ============================================================\
+\
+  Mutations are the only way to change state. They are allowed\
+  inside <talk>, <dep> body, <dead>, <each>, and <when>.\
+\
+  <set> vs <update>:\
+  - <set path="/..."> mutates a top-level slot declared in <shrub>.\
+    Only for the shrub's own root-level state.\
+  - <update path="/..."> modifies an existing kid's slots.\
+    For any kid data, always use <update>.\
+\
+  <slot> has two meanings by context:\
+  - In schema blocks (<shrub>, <kids>): declaration (name, type, default).\
+  - Inside <create>/<update>: value assignment for a kid's field.\
+\
+  ---- SET ----\
+\
+  <set path="/PATH">EXPR</set>\
+\
+  Mutates a top-level slot declared in <shrub>. Cannot target kid\
+  slots (use <update> for those). Cannot target <derive> slots.\
+\
+  ---- CREATE ----\
+\
+  <create path="/PATH/[auto]">\
+    <slot name="NAME">EXPR</slot>\
+  </create>\
+  <create path="/PATH/%input">\
+    <slot name="NAME">EXPR</slot>\
+  </create>\
+\
+  Creates a new kid.\
+    [auto]: next available key.\
+    %input: uses an action input as key.\
+\
+  ---- UPDATE ----\
+\
+  <update path="/PATH/%id">\
+    <slot name="NAME">EXPR</slot>\
+  </update>\
+  <update path="$item">\
+    <slot name="NAME">EXPR</slot>\
+  </update>\
+\
+  Partial update to kid slots. Only listed slots change.\
+  Works both with a known path and inside <each> with $item.\
+\
+  ---- REMOVE ----\
+\
+  <remove path="/PATH/%id"/>\
+  <remove path="$item"/>\
+\
+  Delete a kid by path.\
+  Works both with a known path and inside <each> with $item.\
+\
+  ---- EACH ----\
+\
+  <each over="PATH">\
+    <where>EXPR</where>\
+    MUTATIONS...\
+  </each>\
+\
+  Iterate a kids collection with side effects.\
+    over: path to collection.\
+    <where>: optional filter. Only items where expression returns\
+      true receive mutations.\
+    $item = current element. $key = current element's key.\
+    Can contain: <where>, <set>, <create>, <update>, <remove>, <when>.\
+\
+  Collections ONLY appear as <each over=""> and <fold over="">\
+  targets. They are never passed as arguments to functions.\
+\
+  ---- WHEN ----\
+\
+  <when>\
+    <test>EXPR</test>\
+    MUTATIONS...\
+  </when>\
+\
+  Conditional side effects. <test> must return boolean.\
+  If true, mutations execute. If false, they are skipped.\
+  Can contain any mutation: <set>, <create>, <update>, <remove>, <each>.\
+  Can appear inside <talk>, <dep> body, <dead>, and <each>.\
+\
+  ============================================================\
+  PATHS\
+  ============================================================\
+\
+  Three prefixes. Each means a different source.\
+\
+  /  = this shrub's state\
+     /title                    own slot\
+     /tasks/3/done             kid's slot\
+     /path/%input              interpolated (action input fills in)\
+\
+  %  = runtime environment\
+     %kids/PATH                kids collection (only in each/fold over)\
+     %src                      ship that sent the action (talk/dep only)\
+     %now                      current time\
+     %FIELD                    action input (talk only)\
+     %LABEL                    dependency data (from schema <dep>)\
+     %LABEL/PATH               dep collection (only in each/fold over)\
+\
+  $  = local binding\
+     $item              current element in fold/each\
+     $item.field        read a slot from current element\
+     $item/path         navigate into current element (only in each/fold over)\
+     $key               current element's key in each\
+     $acc               accumulator in fold\
+     $ARG               argument in <def>\
+\
+  PATH INTERPOLATION:\
+  /products/%sku/quantity means:\
+    resolve %sku (an action input), use as key, read quantity slot.\
+  Only inside <talk> where %inputs exist.\
+\
+  ============================================================\
+  EXPRESSION LANGUAGE\
+  ============================================================\
+\
+  Every expression produces a value. No side effects.\
+  All expression values are vases (typed values).\
+  Collections are NOT values \'97 they only appear in\
+  <each over=""> and <fold over=""> attributes.\
+\
+  ---- ref ----\
+  <ref name="PATH"/>\
+    Read a value using prefix rules above.\
+\
+  ---- fn ----\
+  <fn name="NAME">EXPR*</fn>\
+    Call a stdlib function or a named top-level <def>.\
+    Zero or more argument expressions.\
+\
+  ---- if ----\
+  <if>\
+    <test>EXPR</test>\
+    <then>EXPR</then>\
+    <else>EXPR</else>\
+  </if>\
+    Pure value expression. All three required.\
+    NEVER wrap mutations in <if>. Use <when> for conditional\
+    side effects.\
+\
+  ---- fold ----\
+  <fold over="PATH" acc="INITIAL">EXPR</fold>\
+    Reduce collection to single value.\
+    $item = current element. $acc = running accumulator.\
+    acc is a literal value: "0", "true", "hello".\
+    The body expression is evaluated per item.\
+    The result replaces $acc each iteration.\
+    Inherits read capabilities of enclosing context,\
+    plus $item and $acc.\
+\
+    fold replaces all aggregation functions:\
+      count \uc0\u8594  fold with acc="0", add 1 per item\
+      sum   \uc0\u8594  fold with acc="0", add field per item\
+\
+  ---- def ----\
+  <def name="NAME" args="a b c">EXPR</def>\
+    Pure function. Top-level only. Never inline.\
+    Can ONLY read $args. No / slots, no % bindings.\
+    This is what makes it pure.\
+\
+    Compiles to a gate vase stored at a namespace pith.\
+    Any kook can call it by name via <fn>.\
+\
+    <def> is NOT an expression. It can only appear as a\
+    top-level block. Cannot appear inside <fn>, <if>,\
+    <fold>, or any other expression.\
+\
+  ---- literal ----\
+  <literal value="hello"/>       text\
+  <literal value="42"/>          number\
+  <literal value="true"/>        boolean\
+  <literal value="false"/>       boolean\
+\
+  Compiler infers type from content:\
+    "true"/"false" \uc0\u8594  boolean\
+    all digits \uc0\u8594  number\
+    otherwise \uc0\u8594  string\
+  No negative numbers. Use <fn name="sub"><literal value="0"/><literal value="7"/></fn>\
+\
+  ============================================================\
+  STANDARD LIBRARY\
+  ============================================================\
+\
+  All functions take and return vases (typed values).\
+  No collection functions \'97 use <fold> and <each> instead.\
+\
+  ---- Arithmetic ----\
+  add: (number, number) \uc0\u8594  number\
+  sub: (number, number) \uc0\u8594  number\
+  mul: (number, number) \uc0\u8594  number\
+  div: (number, number) \uc0\u8594  number\
+\
+  ---- Comparison ----\
+  eq:  (any, any) \uc0\u8594  boolean\
+  neq: (any, any) \uc0\u8594  boolean\
+  gt:  (number, number) \uc0\u8594  boolean\
+  lt:  (number, number) \uc0\u8594  boolean\
+  gte: (number, number) \uc0\u8594  boolean\
+  lte: (number, number) \uc0\u8594  boolean\
+\
+  ---- Logic ----\
+  and: (boolean, boolean) \uc0\u8594  boolean\
+  or:  (boolean, boolean) \uc0\u8594  boolean\
+  not: (boolean) \uc0\u8594  boolean\
+\
+  ---- String ----\
+  concat: (string, string) \uc0\u8594  string\
+  fmt:    (template, ...values) \uc0\u8594  string\
+    \{\} placeholders filled positionally.\
+    <fn name="fmt">\
+      <literal value="\{\} has \{\} items"/>\
+      <ref name="/title"/>\
+      <ref name="/count"/>\
+    </fn>\
+\
+  ---- Null ----\
+  has:      (ref) \uc0\u8594  boolean\
+    True if the path exists and has a value.\
+    <fn name="has"><ref name="/tasks/%id"/></fn>\
+  or-else:  (value, fallback) \uc0\u8594  value\
+    First arg if it exists, otherwise fallback.\
+    <fn name="or-else">\
+      <ref name="/tasks/%id/title"/>\
+      <literal value="untitled"/>\
+    </fn>\
+\
+  ============================================================\
+  COMPILATION MODEL\
+  ============================================================\
+\
+  Each block compiles to one kook \'97 a self-contained compilation\
+  unit installed at a namespace pith. The runtime routes events\
+  to kooks via a dispatch table.\
+\
+  Namespace layout per shrub:\
+\
+    /NAME/spec              \uc0\u8592  compiled from <shrub> (tale structure)\
+    /NAME/def/DEFNAME       \uc0\u8592  compiled from <def> (gate vase)\
+    /NAME/dep/LABEL         \uc0\u8592  compiled from <dep> (reaction kook)\
+    /NAME/derive/SLOT       \uc0\u8592  compiled from <derive> (recompute kook)\
+    /NAME/talk/ACTION       \uc0\u8592  compiled from <talk> (action kook)\
+\
+  Event routing:\
+\
+    poke with stud %X      \uc0\u8594  /NAME/talk/X\
+    dep %LABEL changed      \uc0\u8594  /NAME/dep/LABEL (if exists), then all derives\
+    kid changed             \uc0\u8594  all derives\
+    dep died                \uc0\u8594  /NAME/dep/LABEL (dead handler)\
+\
+  Each kook is independently:\
+  - Compilable  (one block = one tiny hoon file = fast ford build)\
+  - Replaceable (hot-swap one kook, nothing else recompiles)\
+  - Readable    (LLM sees one block, understands one pattern)\
+  - Portable    (attach to any shrub with a matching schema)\
+\
+  ============================================================\
+  CONTEXT SUMMARY\
+  ============================================================\
+\
+              / slots  %kids  %dep   %now  %src  %input  $item  $key  mutations\
+  <derive>      yes     yes    yes    yes    NO     NO      -      -     NO\
+  <dep body>    yes     yes    yes    yes   yes     NO      -      -    yes\
+  <dead>        yes     yes    yes    yes   yes     NO      -      -    yes\
+  <talk>        yes     yes    yes    yes   yes    yes      -      -    yes\
+  <each>        yes     yes    yes    yes   yes    yes    yes    yes    yes\
+  <when>       (inherits enclosing context)\
+  <def>          NO      NO     NO     NO    NO     NO   $args    NO     NO\
+  <fold>       (inherits enclosing read context, plus $item/$acc)\
+\
+  %kids and %dep collections appear ONLY in each/fold over="".\
+  They are never arguments to <fn>.\
+\
+  ============================================================\
+  ERRORS\
+  ============================================================\
+\
+  Compile-time (rejected):\
+  - <set> targeting a <derive> slot\
+  - <set> targeting a kid slot (use <update>)\
+  - %src or %inputs in <derive>\
+  - / or % in <def>\
+  - Any mutation in <derive>\
+  - <guard> outside <talk>\
+  - <input> outside <talk>\
+  - <where> outside <each>\
+  - Mutations inside <if> or <fold>\
+  - <def> inside any expression (top-level only)\
+  - <shrub name="X"> duplicated\
+  - <talk> with duplicate name within same shrub\
+  - Behavioral <dep> name not declared in <shrub> schema\
+  - <derive> targeting a slot not declared in <shrub>\
+  - <derive> targeting same slot twice\
+  - <if> missing <test>, <then>, or <else>\
+  - <fold> missing over or acc\
+  - Cycle in derive dependencies\
+  - Path interpolation (%input) used outside <talk>\
+  - Behavioral block before <shrub> block\
+  - Collection passed as argument to <fn>\
+\
+  Runtime (silently ignored):\
+  - <ref> to nonexistent path \uc0\u8594  null\
+  - Division by zero \uc0\u8594  null\
+  - <remove> nonexistent kid \uc0\u8594  no-op\
+  - <guard> returns non-boolean \uc0\u8594  treated as false\
+\
+  ============================================================\
+  GRAMMAR\
+  ============================================================\
+\
+  document    ::= shrub behavior-block*\
+\
+  shrub       ::= '<shrub' name '>' (slot | kids | schema-dep)* '</shrub>'\
+  slot        ::= '<slot' name type value? '/>'\
+  kids        ::= '<kids' path '>' slot* '</kids>'\
+  schema-dep  ::= '<dep' name path '/>'\
+\
+  behavior-block ::= dep | derive | talk | def\
+\
+  dep         ::= '<dep' shrub-attr name '>' (dead | mutation)+ '</dep>'\
+  dead        ::= '<dead>' mutation+ '</dead>'\
+  derive      ::= '<derive' shrub-attr slot-attr '>' expr '</derive>'\
+  talk        ::= '<talk' shrub-attr name '>' input? guard? mutation+ '</talk>'\
+  def         ::= '<def' name args '>' expr '</def>'\
+\
+  input       ::= '<input' field+ '/>'\
+  guard       ::= '<guard>' expr '</guard>'\
+\
+  mutation    ::= set | create | update | remove | each | when\
+  set         ::= '<set' path '>' expr '</set>'\
+  create      ::= '<create' path '>' slot-expr+ '</create>'\
+  update      ::= '<update' path '>' slot-expr+ '</update>'\
+  remove      ::= '<remove' path '/>'\
+  each        ::= '<each' over '>' where? mutation+ '</each>'\
+  when        ::= '<when><test>' expr '</test>' mutation+ '</when>'\
+  where       ::= '<where>' expr '</where>'\
+  slot-expr   ::= '<slot' name '>' expr '</slot>'\
+\
+  expr        ::= ref | fn | if | fold | literal\
+  ref         ::= '<ref' name '/>'\
+  fn          ::= '<fn' name '>' expr* '</fn>'\
+  if          ::= '<if><test>' expr '</test><then>' expr '</then><else>' expr '</else></if>'\
+  fold        ::= '<fold' over acc '>' expr '</fold>'\
+  literal     ::= '<literal' value '/>'\
+\
+  name        ::= 'name="' ident '"'\
+  type        ::= 'type="' ('string'|'number'|'boolean'|'date') '"'\
+  value       ::= 'value="' text '"'\
+  path        ::= 'path="' pathexpr '"'\
+  slot-attr   ::= 'slot="' ident '"'\
+  shrub-attr  ::= 'shrub="' ident '"'\
+  over        ::= 'over="' pathexpr '"'\
+  acc         ::= 'acc="' text '"'\
+  args        ::= 'args="' ident+ '"'\
+  field       ::= ident '="' type '"'\
+\
+  ============================================================\
+  LLM EDIT PROTOCOL\
+  ============================================================\
+\
+  Every block has a unique address formed by its attributes.\
+  The address maps directly to a namespace pith.\
+  To modify a shrub document, propose one of three operations:\
+\
+  ---- ADD ----\
+\
+  Append a new block. Compiles one kook, installs at one pith.\
+\
+  ADD <talk shrub="store" name="bulk-restock">\
+    <input amount="number"/>\
+    <each over="%kids/products">\
+      <update path="$item">\
+        <slot name="quantity">\
+          <fn name="add">\
+            <ref name="$item.quantity"/>\
+            <ref name="%amount"/>\
+          </fn>\
+        </slot>\
+      </update>\
+    </each>\
+  </talk>\
+\
+  ---- REPLACE ----\
+\
+  Replace an existing block. Recompiles one kook, hot-swaps at pith.\
+\
+  REPLACE <derive shrub="store" slot="total-value">\
+    <fold over="%kids/products" acc="0">\
+      <fn name="add">\
+        <ref name="$acc"/>\
+        <fn name="mul">\
+          <ref name="$item.price"/>\
+          <ref name="$item.quantity"/>\
+        </fn>\
+      </fn>\
+    </fold>\
+  </derive>\
+\
+  ---- DELETE ----\
+\
+  Remove a block. Removes one kook from one pith.\
+\
+  DELETE <dep shrub="payroll" name="people"/>\
+\
+  Each edit is self-contained. One edit = one kook = one compilation.\
+  The LLM does not need to understand or reproduce the full document.\
+\
+  ============================================================\
+  EXAMPLES\
+  ============================================================\
+\
+  ---- Todo App (single shrub) ----\
+\
+  User: "todo app with tasks that have titles and due dates"\
+\
+  <shrub name="todo">\
+    <slot name="title" type="string" value="My Todos"/>\
+    <slot name="count" type="number"/>\
+    <slot name="remaining" type="number"/>\
+    <kids path="tasks/[ud]">\
+      <slot name="title" type="string"/>\
+      <slot name="due" type="date"/>\
+      <slot name="done" type="boolean"/>\
+    </kids>\
+  </shrub>\
+\
+  <derive shrub="todo" slot="count">\
+    <fold over="%kids/tasks" acc="0">\
+      <fn name="add"><ref name="$acc"/><literal value="1"/></fn>\
+    </fold>\
+  </derive>\
+\
+  <derive shrub="todo" slot="remaining">\
+    <fold over="%kids/tasks" acc="0">\
+      <if>\
+        <test><fn name="eq"><ref name="$item.done"/><literal value="false"/></fn></test>\
+        <then><fn name="add"><ref name="$acc"/><literal value="1"/></fn></then>\
+        <else><ref name="$acc"/></else>\
+      </if>\
+    </fold>\
+  </derive>\
+\
+  <talk shrub="todo" name="add-task">\
+    <input title="string" due="date"/>\
+    <create path="/tasks/[auto]">\
+      <slot name="title"><ref name="%title"/></slot>\
+      <slot name="due"><ref name="%due"/></slot>\
+      <slot name="done"><literal value="false"/></slot>\
+    </create>\
+  </talk>\
+\
+  <talk shrub="todo" name="complete">\
+    <input id="number"/>\
+    <update path="/tasks/%id">\
+      <slot name="done"><literal value="true"/></slot>\
+    </update>\
+  </talk>\
+\
+  <talk shrub="todo" name="remove-task">\
+    <input id="number"/>\
+    <remove path="/tasks/%id"/>\
+  </talk>\
+\
+  <talk shrub="todo" name="complete-all">\
+    <each over="%kids/tasks">\
+      <update path="$item">\
+        <slot name="done"><literal value="true"/></slot>\
+      </update>\
+    </each>\
+  </talk>\
+\
+  <talk shrub="todo" name="clear-done">\
+    <each over="%kids/tasks">\
+      <where>\
+        <fn name="eq"><ref name="$item.done"/><literal value="true"/></fn>\
+      </where>\
+      <remove path="$item"/>\
+    </each>\
+  </talk>\
+\
+  ---- Store + Dashboard (multi-shrub with dep) ----\
+\
+  User: "product store and dashboard. flag low stock."\
+\
+  <shrub name="store">\
+    <slot name="name" type="string" value="Main Store"/>\
+    <kids path="products/[ta]">\
+      <slot name="name" type="string"/>\
+      <slot name="price" type="number"/>\
+      <slot name="quantity" type="number"/>\
+    </kids>\
+  </shrub>\
+\
+  <shrub name="dashboard">\
+    <slot name="total-products" type="number"/>\
+    <slot name="total-value" type="number"/>\
+    <kids path="alerts/[ud]">\
+      <slot name="product" type="string"/>\
+      <slot name="quantity" type="number"/>\
+      <slot name="timestamp" type="date"/>\
+    </kids>\
+    <dep name="products" path="/store/products"/>\
+  </shrub>\
+\
+  <dep shrub="dashboard" name="products">\
+    <each over="%products">\
+      <where>\
+        <fn name="lt"><ref name="$item.quantity"/><literal value="10"/></fn>\
+      </where>\
+      <create path="/alerts/[auto]">\
+        <slot name="product"><ref name="$item.name"/></slot>\
+        <slot name="quantity"><ref name="$item.quantity"/></slot>\
+        <slot name="timestamp"><ref name="%now"/></slot>\
+      </create>\
+    </each>\
+  </dep>\
+\
+  <derive shrub="dashboard" slot="total-products">\
+    <fold over="%products" acc="0">\
+      <fn name="add"><ref name="$acc"/><literal value="1"/></fn>\
+    </fold>\
+  </derive>\
+\
+  <derive shrub="dashboard" slot="total-value">\
+    <fold over="%products" acc="0">\
+      <fn name="add">\
+        <ref name="$acc"/>\
+        <fn name="mul">\
+          <ref name="$item.quantity"/>\
+          <ref name="$item.price"/>\
+        </fn>\
+      </fn>\
+    </fold>\
+  </derive>\
+\
+  <talk shrub="store" name="add-product">\
+    <input sku="string" name="string" price="number" quantity="number"/>\
+    <create path="/products/%sku">\
+      <slot name="name"><ref name="%name"/></slot>\
+      <slot name="price"><ref name="%price"/></slot>\
+      <slot name="quantity"><ref name="%quantity"/></slot>\
+    </create>\
+  </talk>\
+\
+  <talk shrub="store" name="sell">\
+    <input sku="string" amount="number"/>\
+    <guard>\
+      <fn name="gte">\
+        <ref name="/products/%sku/quantity"/>\
+        <ref name="%amount"/>\
+      </fn>\
+    </guard>\
+    <update path="/products/%sku">\
+      <slot name="quantity">\
+        <fn name="sub">\
+          <ref name="/products/%sku/quantity"/>\
+          <ref name="%amount"/>\
+        </fn>\
+      </slot>\
+    </update>\
+  </talk>\
+\
+  <talk shrub="store" name="restock">\
+    <input sku="string" amount="number"/>\
+    <update path="/products/%sku">\
+      <slot name="quantity">\
+        <fn name="add">\
+          <ref name="/products/%sku/quantity"/>\
+          <ref name="%amount"/>\
+        </fn>\
+      </slot>\
+    </update>\
+  </talk>\
+\
+  <talk shrub="dashboard" name="clear-alerts">\
+    <each over="%kids/alerts">\
+      <remove path="$item"/>\
+    </each>\
+  </talk>\
+\
+  ---- Employee + Payroll (multi-shrub with dep and dead) ----\
+\
+  User: "employee directory with payroll tracking"\
+\
+  <shrub name="employees">\
+    <slot name="headcount" type="number"/>\
+    <kids path="people/[ta]">\
+      <slot name="name" type="string"/>\
+      <slot name="email" type="string"/>\
+      <slot name="dept" type="string"/>\
+      <slot name="role" type="string"/>\
+      <slot name="rate" type="number"/>\
+      <slot name="active" type="boolean"/>\
+    </kids>\
+  </shrub>\
+\
+  <shrub name="payroll">\
+    <slot name="last-run" type="date"/>\
+    <slot name="status" type="string" value="ok"/>\
+    <kids path="records/[ud]">\
+      <slot name="employee" type="string"/>\
+      <slot name="amount" type="number"/>\
+      <slot name="period" type="date"/>\
+      <slot name="status" type="string"/>\
+    </kids>\
+    <dep name="people" path="/employees/people"/>\
+  </shrub>\
+\
+  <def name="is-active" args="p">\
+    <fn name="eq"><ref name="$p.active"/><literal value="true"/></fn>\
+  </def>\
+\
+  <derive shrub="employees" slot="headcount">\
+    <fold over="%kids/people" acc="0">\
+      <if>\
+        <test><fn name="is-active"><ref name="$item"/></fn></test>\
+        <then><fn name="add"><ref name="$acc"/><literal value="1"/></fn></then>\
+        <else><ref name="$acc"/></else>\
+      </if>\
+    </fold>\
+  </derive>\
+\
+  <dep shrub="payroll" name="people">\
+    <dead>\
+      <set path="/status"><literal value="disconnected"/></set>\
+    </dead>\
+    <each over="%people">\
+      <where>\
+        <fn name="is-active"><ref name="$item"/></fn>\
+      </where>\
+      <create path="/records/[auto]">\
+        <slot name="employee"><ref name="$key"/></slot>\
+        <slot name="amount"><literal value="0"/></slot>\
+        <slot name="period"><ref name="%now"/></slot>\
+        <slot name="status"><literal value="active"/></slot>\
+      </create>\
+    </each>\
+  </dep>\
+\
+  <talk shrub="employees" name="hire">\
+    <input id="string" name="string" email="string" dept="string" role="string" rate="number"/>\
+    <create path="/people/%id">\
+      <slot name="name"><ref name="%name"/></slot>\
+      <slot name="email"><ref name="%email"/></slot>\
+      <slot name="dept"><ref name="%dept"/></slot>\
+      <slot name="role"><ref name="%role"/></slot>\
+      <slot name="rate"><ref name="%rate"/></slot>\
+      <slot name="active"><literal value="true"/></slot>\
+    </create>\
+  </talk>\
+\
+  <talk shrub="employees" name="terminate">\
+    <input id="string"/>\
+    <update path="/people/%id">\
+      <slot name="active"><literal value="false"/></slot>\
+    </update>\
+  </talk>\
+\
+  <talk shrub="employees" name="change-dept">\
+    <input id="string" new-dept="string"/>\
+    <update path="/people/%id">\
+      <slot name="dept"><ref name="%new-dept"/></slot>\
+    </update>\
+  </talk>\
+\
+  <talk shrub="payroll" name="run-payroll">\
+    <each over="%kids/records">\
+      <where>\
+        <fn name="eq"><ref name="$item.status"/><literal value="active"/></fn>\
+      </where>\
+      <update path="$item">\
+        <slot name="period"><ref name="%now"/></slot>\
+      </update>\
+    </each>\
+    <set path="/last-run"><ref name="%now"/></set>\
+  </talk>\
+\
+  ---- Common Patterns ----\
+\
+  Counting items:\
+  <fold over="%kids/tasks" acc="0">\
+    <fn name="add"><ref name="$acc"/><literal value="1"/></fn>\
+  </fold>\
+\
+  Conditional counting:\
+  <fold over="%kids/tasks" acc="0">\
+    <if>\
+      <test><fn name="eq"><ref name="$item.done"/><literal value="false"/></fn></test>\
+      <then><fn name="add"><ref name="$acc"/><literal value="1"/></fn></then>\
+      <else><ref name="$acc"/></else>\
+    </if>\
+  </fold>\
+\
+  Summing a field:\
+  <fold over="%kids/products" acc="0">\
+    <fn name="add"><ref name="$acc"/><ref name="$item.price"/></fn>\
+  </fold>\
+\
+  Null handling \'97 safe lookup with fallback:\
+  <fn name="or-else">\
+    <ref name="/tasks/5/title"/>\
+    <literal value="untitled"/>\
+  </fn>\
+\
+  Null handling \'97 existence check:\
+  <if>\
+    <test><fn name="has"><ref name="/tasks/5"/></fn></test>\
+    <then><ref name="/tasks/5/title"/></then>\
+    <else><literal value="not found"/></else>\
+  </if>\
+\
+  String formatting:\
+  <fn name="fmt">\
+    <literal value="Employee \{\} in dept \{\}"/>\
+    <ref name="/people/%id/name"/>\
+    <ref name="/people/%id/dept"/>\
+  </fn>\
+\
+  Conditional mutation (using <when>):\
+  <when>\
+    <test>\
+      <fn name="lt"><ref name="/products/%sku/quantity"/><literal value="10"/></fn>\
+    </test>\
+    <create path="/alerts/[auto]">\
+      <slot name="message">\
+        <fn name="fmt">\
+          <literal value="Low stock: \{\}"/>\
+          <ref name="/products/%sku/name"/>\
+        </fn>\
+      </slot>\
+    </create>\
+  </when>\
+\
+  Iterating with remove:\
+  <each over="%kids/tasks">\
+    <where>\
+      <fn name="eq"><ref name="$item.done"/><literal value="true"/></fn>\
+    </where>\
+    <remove path="$item"/>\
+  </each>\
+\
+  Nested graph traversal:\
+  <derive shrub="org" slot="total-headcount">\
+    <fold over="%kids/departments" acc="0">\
+      <fn name="add">\
+        <ref name="$acc"/>\
+        <fold over="$item/teams" acc="0">\
+          <fn name="add">\
+            <ref name="$acc"/>\
+            <fold over="$item/members" acc="0">\
+              <fn name="add"><ref name="$acc"/><literal value="1"/></fn>\
+            </fold>\
+          </fn>\
+        </fold>\
+      </fn>\
+    </fold>\
+  </derive>\
+\
+  Named def for reuse:\
+  <def name="is-active" args="p">\
+    <fn name="eq"><ref name="$p.active"/><literal value="true"/></fn>\
+  </def>\
+\
+  Using a named def:\
+  <each over="%kids/people">\
+    <where>\
+      <fn name="is-active"><ref name="$item"/></fn>\
+    </where>\
+    <update path="$item">\
+      <slot name="role"><literal value="verified"/></slot>\
+    </update>\
+  </each>\
+  '''\
+\
+\
+\
+::  WILL MOVE TO SEPERATE LIBS \
+\
+++  orc\
+  |%\
+  ++  make-request\
+    |=  [messages=(list message:ai) stream=? tools=(list tool:ai)]\
+    ^-  (list card:n)\
+    =/  iris=pith:t  p:(~(got by deps.bowl) %iris)\
+    =/  url  !<(@t q:(~(got by q.saga) #/url))\
+    =/  model  !<(@t q:(~(got by q.saga) #/model))\
+    =/  =header-list:http\
+      :~  ['content-type' 'application/json']\
+      ==\
+    =.  header-list\
+      ?~  key=(~(get by q.saga) #/key)  header-list\
+      =+  !<(key=@t q.u.key)\
+      %^  set-header:http  'Authorization'\
+        (crip "Bearer \{(trip key)\}")\
+      header-list\
+    =/  body=cord  (en:json:html (request:enjs:ai [messages model stream tools]))\
+    =/  =octs  (as-octs:mimes:html body)\
+    =/  req=tale:t\
+      (~(put by *tale:t) req:slot:t iris-req/!>([%'POST' url header-list `octs]))\
+    =/  stamp=tale:t\
+      (~(put by *tale:t) content:slot:t noun/!>(now.bowl))\
+    :~  [(snoc iris [%da now.bowl]) %make req]\
+        [(snoc here.bowl %req) %make stamp]\
+    ==\
+  ++  get-response\
+    |=  =rely:n\
+    ^-  (unit [tag=?(%finished %progress) cord])\
+    ?~  req=(~(get of kids.bowl) #/req)  ~\
+    ?~  req=~(content sug u.req)  ~\
+    =+  ;;(id=@da q.q.u.req)\
+    ?~  sag=(~(get of q:(~(got by deps.bowl) %iris)) #/[da/id])  ~\
+    ?~  sag=~(res sug q.u.sag)  ~\
+    ?.  =(%iris-res p.u.sag)  ~\
+    =+  ;;(res=client-response:http q.q.u.sag)\
+    ?+  -.res  ~\
+      %finished\
+        ?~  full-file.res  ~\
+        `[%finished ;;(@t q.data.u.full-file.res)]\
+      %progress\
+        ?~  incremental.res  ~\
+        `[%progress ;;(@t q.u.incremental.res)]\
+  ==\
+--\
+\
+++  seam\
+  |%\
+  ++  find-delim\
+    |=  t=tape\
+    ^-  (unit @ud)\
+    =|  pos=@ud\
+    |-  ^-  (unit @ud)\
+    ?~  t  ~\
+    ?:  ?|  =(i.t ' ')\
+            =(i.t '>')\
+            =(i.t '/')\
+            =(i.t '\\0a')\
+            =(i.t '\\09')\
+        ==\
+      `pos\
+    $(t t.t, pos +(pos))\
+    \
+  ++  known-tags\
+    ^-  (set cord)\
+    (silt `(list cord)`~['shrub' 'dep' 'derive' 'talk' 'def'])\
+\
+  ++  extract-elements\
+    |=  buf=tape\
+    ^-  [elem=(unit manx) remainder=tape]\
+    ::  find first '<'\
+    =/  ope=(unit @ud)  (find "<" buf)\
+    ?~  ope  [~ buf]\
+    =.  buf  (slag u.ope buf)\
+    ::  extract tag name after '<'\
+    =/  tag=tape\
+      =/  rest=tape  (slag 1 buf)\
+      (scag (fall (find-delim rest) (lent rest)) rest)\
+    ?~  tag       [~ buf]\
+    ?.  (~(has in known-tags) (crip tag))\
+      ::  not a known tag, skip this '<' and retry\
+      $(buf (slag 1 buf))\
+    ::  look for closing tag\
+    =/  close-tag=tape  "</\{tag\}>"\
+    =/  ct-len=@ud  (lent close-tag)\
+    =/  clos=(unit @ud)  (find close-tag buf)\
+    ?~  clos  [~ buf]\
+    ::  extract complete element and remainder\
+    =/  end=@ud    (add u.clos ct-len)\
+    =/  block=cord  (crip (scag end buf))\
+    ~&  [%ext-block block]\
+    =/  rem=tape    (slag end buf)\
+    ~&  [%now-rem rem]\
+\
+    ?~  xml=(de-xml:html block)\
+      ~&  [%xml-parse-error block]\
+      [~ rem]\
+    ~&  [%xml xml]\
+    [`u.xml rem]\
+\
+  ++  process-chunk\
+    |=  buf=tape\
+    ^-  [(list manx) tape]\
+    =|  acc=(list manx)\
+    ~&  [%bff buf]\
+    |-\
+    =/  [elem=(unit manx) remainder=tape]\
+      (extract-elements buf)\
+    ?~  elem  [(flop acc) remainder]\
+    $(buf remainder, acc [u.elem acc])\
+  ++  parse-sse\
+    |=  raw=cord\
+    ^-  cord\
+    %-  crip\
+    %-  zing\
+    %+  murn  (to-wain:format raw)\
+    |=  line=cord\
+    ^-  (unit tape)\
+    =/  t=tape  (trip line)\
+    ?.  =("data: " (scag 6 t))  ~\
+    =/  json-str=cord  (crip (slag 6 t))\
+    ?:  =('[DONE]' json-str)  ~\
+    =/  jon=(unit json)  (de:json:html json-str)\
+    ?~  jon  ~\
+    =/  chk=chunk:ai  (chunk:dejs:ai u.jon)\
+    ?:  =(content.chk '')  ~\
+    `(trip content.chk)\
+ --\
+\
+\
+++  gas\
+  |=  m=manx\
+  ^-  (map cord cord)\
+  %-  malt\
+  %+  turn  a.g.m\
+  |=  [n=mane v=(list beer:hoot)]\
+  :-  ?>(?=(@ n) n)\
+  (crip (turn v |=(b=beer:hoot ?>(?=(@ b) b))))\
+\
+++  ga\
+  |=  [m=manx k=cord]\
+  ^-  (unit cord)\
+  =/  res\
+    %+  murn  a.g.m\
+      |=  [n=mane v=(list beer:hoot)]\
+      ?.  =(n k)  ~\
+      `(crip (turn v |=(b=beer:hoot ?>(?=(@ b) b))))\
+  ?~  res  ~\
+  `i.res\
+\
+++  gt\
+  |=  m=manx\
+  ^-  cord\
+  ?>(?=(@ n.g.m) n.g.m)\
+\
+ ++  gc\
+    |=  [m=manx tag=cord]\
+    ^-  (list manx)\
+    (skim c.m |=(c=manx =((gt c) tag))) \
+\
+++  forge\
+  |%\
+\
+  ++  wrap-gate\
+    |=  [arm=term body=hoon]\
+    ^-  hoon\
+    =/  sample=spec\
+      ?+  arm  !!\
+        %talk  [%bcts %add [%like ~[%tale %t] ~]]\
+        %hear  [%bcts %rely [%like ~[%rely %n] ~]]\
+        %take  [%bcts %gift [%like ~[%gift %n] ~]]\
+        %dead  [%bcts %slot [%like ~[%slot %t] ~]]\
+      ==\
+    ::  |=(sample =/  cards  ~  body)\
+    [%brts sample [%tsfs %cards [%clsg ~] body]]\
+\
+  ++  form-arms\
+    ^-  (map term tome)\
+    %-  malt\
+    :~  [%goof [~ (my ~[[%goof [%wing ~[%goof %def %n]]]])]]\
+        [%init [~ (my ~[[%init [%wing ~[%init %def %n]]]])]]\
+        [%dead [~ (my ~[[%dead [%wing ~[%dead %def %n]]]])]]\
+        [%talk [~ (my ~[[%talk [%wing ~[%talk %def %n]]]])]]\
+        [%take [~ (my ~[[%take [%wing ~[%take %def %n]]]])]]\
+        [%hear [~ (my ~[[%hear [%wing ~[%hear %def %n]]]])]]\
+    == \
+\
+  ++  wrap-form\
+    |=  [lst=(list [=term =hoon])]\
+    ^-  hoon\
+    ::  ^-  form:n    \
+    ::  |_  [bowl:n saga:t]\
+    ::  <inner gates>\
+    :+  %kthp  [%like ~[%form %n] ~]  \
+    :+  %brcb  \
+      :-  %bccl  \
+      :~\
+          [%like ~[%bowl %n] ~]\
+          [%like ~[%saga %t] ~]\
+      ==\
+    :-  ~\
+    %-  ~(gas by form-arms)  \
+    %+  turn  lst\
+    |=  [=term =hoon]\
+    [term [~ (my ~[[term hoon]])]]     \
+    \
+  ++  build-guards\
+    |=  [guards=(list manx) inner=hoon]\
+    ^-  hoon\
+    |-  \
+    ?~  guards  inner\
+    ?~  expr=c.i.guards  $(guards t.guards)\
+    [%wtdt [%zpgl [%base %f] (build-expr expr)] exit inner]\
+    \
+  ++  exit\
+    ^-  hoon\
+    [%clhp [%rock %n ~] [%wing ~[%q %saga]]]\
+\
+  ++  return\
+    ^-  hoon\
+    [%clhp [%limb %cards] [%wing ~[%q %saga]]]\
+\
+  ++  get-type\
+    |=  typ=cord\
+    ^-  spec\
+    ?:  =(typ 'date')     [%base %da]\
+    ?:  =(typ 'number')   [%base %ud]\
+    ?:  =(typ 'boolean')  [%base %f]\
+    ?:  =(typ 'string')   [%base %t]\
+    !!\
+\
+  ++  build-inputs\
+    |=  [inputs=(list manx) inner=hoon]\
+    ^-  hoon\
+    |-  \
+    ?~  inputs  inner\
+    =/  spec\
+      :-  %bccl\
+      %+  turn  (gas i.inputs)\
+      |=  [k=cord v=cord]\
+      ^-  spec\
+      [%bcts k (get-type v)]\
+    [%tsls [%zpgl spec [%wing ~[%q %pal]]] $(inputs t.inputs)]\
+\
+  ++  build-set\
+    |=  [nod=manx inner=hoon]\
+    ^-  hoon\
+    ?~  pax=(ga nod 'path')  inner\
+    =/  raw  u.pax\
+    =?  raw  =('/' (cut 3 [0 1] raw))  (rsh [3 1] raw)\
+    =/  segs  (rash raw (more fas sym))\
+    :^  %tsdt  ~[%q %saga]\
+      (put-saga (path-lit segs) (wrap-vase %noun (build-expr c.nod)))\
+    inner\
+\
+  \
+  ++  append-card\
+    |=  [pax=hoon typ=term tal=hoon inner=hoon]\
+    ^-  hoon\
+    =/  card  [%clhp pax [%clhp [%rock %tas typ] tal]]\
+    :+  %tsdt  ~[%cards]\
+    [%cnls [%wing ~[%snoc]] [%wing ~[%cards]] card] inner\
+\
+  ++  build-effect\
+    |=  [nod=manx typ=term inner=hoon]\
+    ^-  hoon\
+    ?~  pax=(ga nod 'path')  inner\
+    =/  path  (build-path u.pax)\
+    =/  tal  (build-tale c.nod)\
+    (append-card path typ tal inner)\
+\
+  ++  build-tale\
+    ::  builds tale from <slot name="x">EXPR</slot> children\
+    |=  nods=(list manx)\
+    ^-  hoon\
+    =/  slots=(list manx)\
+      (skim nods |=(m=manx =((gt m) 'slot')))\
+    =/  pairs=(list hoon)\
+      %+  murn  slots\
+      |=  s=manx\
+      ^-  (unit hoon)\
+      ?~  name=(ga s 'name')  ~\
+      =/  expr  (build-expr c.s)\
+      `[%clhp (path-lit ~[u.name]) (wrap-vase %noun expr)]\
+    [%cnhp [%cnsg ~[%gas] [%limb %by] ~[[%rock %n ~]]] [%clsg pairs]]\
+\
+  ++  build-when\
+    |=  [nod=manx inner=hoon]\
+    ^-  hoon\
+    =/  tests  (gc nod 'test')\
+    ?~  tests  inner\
+    =/  test  (build-expr c.i.tests)\
+    =/  muts  (skip c.nod |=(n=manx |((=((gt n) 'test')) =('' n.g.n))))\
+    ?~  muts  inner\
+    [%wtcl [%zpgl [%base %f] test] (build-mutations muts inner) inner]\
+\
+  ++  build-each\
+    |=  [nod=manx inner=hoon]\
+    ^-  hoon\
+    =/  muts   (skip c.nod |=(n=manx |((=((gt n) 'where')) =('' n.g.n))))\
+    =/  next  [%cnts ~[%$] ~[[~[%items] [%wing ~[%t %items]]]]]\
+    =/  body   (build-mutations muts next)\
+    =.  body\
+      ?^  where=(gc nod 'where')\
+        :^  %wtdt  [%zpgl [%base %f] (build-expr c.i.where)]  next  body\
+      body\
+    :^  %tsfs  %items  (build-reference (need (ga nod 'over')))\
+    ::  go over a list of [iota (axal tale)] pairs\
+    :-  %brhp\
+    :^  %wtsg  ~[%items]  inner\
+    :^  %tsfs  %key   [%wing ~[%& %i %items]]   :: -.i.items (iota)\
+    :^  %tsfs  %item  [%wing ~[%| %i %items]]   :: +.i.items (axal tale)\
+    body\
+\
+\
+  ++  build-path  ::  split on / account for [auto] call get next id gate\
+    |=  ref=cord\
+    ^-  hoon\
+    ::  $item \'97 use the key from current each iteration\
+    ?:  =(ref '$item')\
+      [%wing ~[%key]]\
+    ::  strip leading /\
+    =?  ref  =('/' (cut 3 [0 1] ref))  (rsh [3 1] ref)\
+    ::  split on /\
+    =/  raw=(list tape)\
+      %+  rash  ref\
+      %+  more  fas\
+      (plus ;~(pose hep low nud sel ser))\
+    =/  segs=(list cord)  (turn raw crip)\
+    ?~  segs  (pith-lit ~)\
+    ?:  =('[auto]' (rear segs))\
+      =/  pax  (path-lit (snip segs))\
+      [%cnhp [%limb %next-path] [%clhp pax [%wing ~[%kids %bowl]]]]\
+    ::  check for %input interpolation segments (prefix %)\
+    =/  has-interp\
+      %+  lien  segs\
+      |=(s=cord =('%' (cut 3 [0 1] s)))\
+    ?.  has-interp\
+      (pith-lit segs)\
+    ::  build pith with interpolated segments\
+    :-  %clsg\
+    %+  turn  segs\
+    |=  s=cord\
+    ?:  =('%' (cut 3 [0 1] s))\
+      ::  %field \'97 resolve input value as path segment\
+      [%wing ~[(rsh [3 1] s)]]\
+    [%rock %tas s]\
+\
+  ++  build-mutations\
+    |=  [nods=(list manx) inner=hoon]\
+    ^-  hoon\
+    |-  \
+    ?~  nods  inner\
+    =/  tag  (gt i.nods)\
+    ?:  =(tag 'set')  \
+      (build-set i.nods $(nods t.nods))\
+    ?:  =(tag 'create')  \
+      (build-card i.nods %make $(nods t.nods))\
+    ?:  =(tag 'update')\
+      (build-card i.nods %poke $(nods t.nods))\
+    ?:  =(tag 'remove')\
+      (build-remove i.nods %cull $(nods t.nods))\
+    ?:  =(tag 'each')\
+      (build-each i.nods $(nods t.nods))\
+    ?:  =(tag 'when')\
+      (build-when i.nods $(nods t.nods))\
+    $(nods t.nods)\
+\
+  ++  build-if\
+    |=  nod=manx\
+    ^-  hoon\
+    =/  test  (build-expr (gc nod 'test'))\
+    =/  then  (build-expr (gc nod 'then'))\
+    =/  else  (build-expr (gc nod 'else'))\
+    [%wtcl [%zpgl [%base %f] test] then else]\
+\
+  ++  build-slop-chain\
+    |=  args=(list hoon)\
+    ^-  hoon\
+    ?~  args      [%zpgr [%rock %n ~]]\
+    ?~  t.args    i.args\
+    [%cnhp [%limb %slop] [%clhp i.args $(args t.args)]]\
+\
+  ++  build-def\
+    |=  nod=manx\
+    ^-  hoon\
+    =/  args  (rash (need (ga nod 'args')) (more ace sym))\
+    =/  body  (build-expr c.nod)\
+    :-  %brts   \
+    :-  [%bccl (turn args |=(a=@t [%bcts a [%base %noun]]))]\
+    body\
+\
+  ++  build-fn\
+    |=  nod=manx\
+    ^-  hoon\
+    =/  name  (need (ga nod 'name'))\
+    =/  args=(list hoon)\
+      %+  turn  c.nod\
+      |=  m=manx \
+      (build-expr ~[m])\
+    :+  %cnls  [%limb %slam]\
+    :+  %cncl  \
+      [%limb %read-gate]\
+      :~  \
+        [%rock %tas name]\
+        [%wing ~[%kids %bowl]]\
+      ==\
+    (build-slop-chain args)\
+  ::\
+  ++  build-fold\
+    |=  nod=manx\
+    ^-  hoon\
+    =/  over   (need (ga nod 'over'))\
+    =/  acc-v  (need (ga nod 'acc'))\
+    =/  body   (build-expr c.nod)\
+    :^  %tsfs  %acc  (build-literal-from-cord acc-v)\
+    :^  %tsfs  %items  (build-reference over)\
+    :-  %brhp\
+    :^  %wtsg  ~[%items]  [%wing ~[%acc]]\
+    :^  %tsfs  %key   [%wing ~[%& %i %items]]\
+    :^  %tsfs  %item  [%wing ~[%| %i %items]]\
+    :^  %tsdt  ~[%acc]  body\
+    [%cnts ~[%$] ~[[~[%items] [%wing ~[%t %items]]]]]\
+  ::\
+  ++  build-literal-from-cord\
+    |=  lit=cord\
+    ^-  hoon\
+    ::  try as boolean\
+    ?:  =(lit 'true')   [%zpgr [%rock %f 0]]\
+    ?:  =(lit 'false')  [%zpgr [%rock %f 1]]\
+    =/  num  (rush lit dem)\
+    ?^  num  [%zpgr [%sand %ud u.num]]\
+    [%zpgr [%sand %t lit]]\
+  :: \
+  ++  build-literal\
+    |=  nod=manx\
+    ^-  hoon\
+    =/  value  (need (ga nod 'value'))\
+    (build-literal-from-cord value)\
+\
+  ++  build-expr\
+    |=  nods=(list manx)\
+    ^-  hoon\
+    ?~  nods  [%zpzp ~]\
+    =/  nod  i.nods\
+    =/  tag  (gt nod)\
+    ?:  =(tag 'ref')    (build-reference (need (ga nod 'name')))\
+    ?:  =(tag 'literal')  (build-literal nod)\
+    ?:  =(tag 'fn')     (build-fn nod)\
+    ?:  =(tag 'if')     (build-if nod)\
+    ?:  =(tag 'fold')   (build-fold nod)\
+    !!\
+\
+  ::\
+  ++  build-reference\
+    |=  ref=cord\
+    ^-  hoon\
+    =/  segs  (rash ref (more fas sym))\
+    ?~  segs  (pith-lit ~) \
+    =/  first  (cut 3 [0 1] ref)\
+    =/  rest   (rsh [3 1] ref)\
+    ?:  =(i.segs %kids)\
+      :^  %cnsg  ~[%tap]  [%limb %aon]\
+      :~  :+  %tsgl  [%limb %kid]\
+          :+  %cnhp  [%cnsg ~[%dip] [%limb %of] ~[[%wing ~[%kids %bowl]]]]\
+          (path-lit t.segs)\
+      ==\
+    ?:  =(i.segs %now)  [%zpgr [%wing ~[%now %bowl]]]\
+    ?:  =(first '/')\
+      ::  q:(~(got by q.saga) /path) \'97 returns vase from own state\
+      :+  %tsgl  [%limb %q]\
+      [%cnsg ~[%got] [%limb %by] ~[[%wing ~[%q %saga]] (path-lit segs)]]\
+    ?:  =(first '@')\
+      [%wing ~[rest]]\
+    ::  $ bindings: $item, $key, $acc, $item/path, $item.field\
+    ?:  =(first '$')\
+      =/  name  i.segs\
+      ?:  =(name '$key')   [%zpgr [%wing ~[%key]]]\
+      ?:  =(name '$acc')   [%wing ~[%acc]]\
+      ::  $item or $item/path or $item.field\
+      ?~  dot=(find "." (trip rest))\
+        ?:  =(name '$item')\
+          ?~  t.segs\
+            [%wing ~[%item]]\
+          ::  $item/path \'97 dip into bound subtree\
+          :^  %cnsg  ~[%tap]  [%limb %aon]\
+          :~  :+  %tsgl  [%limb %kid]\
+              :+  %cnhp  [%cnsg ~[%dip] [%limb %of] ~[[%limb %item]]]\
+              (path-lit t.segs)\
+          ==\
+        ::  $NAME \'97 generic binding\
+        [%wing ~[name]]\
+      ::  $item.field \'97 returns vase from bound axal tale slot\
+      =/  field  (rsh [3 +(u.dot)] rest)\
+      :+  %tsgl  [%limb %q]\
+      [%cnsg ~[%got] [%limb %by] ~[[%cnhp [%limb %need] [%wing ~[%fil %item]]] (path-lit ~[field])]]\
+    ?:  =(first '%')\
+      =/  dot  (find "." (trip rest))\
+      =/  fas  (find "/" (trip rest))\
+      =/  label=cord\
+        ?^  dot  (end [3 u.dot] rest)\
+        ?^  fas  (end [3 u.fas] rest)\
+        rest\
+      ?~  dot\
+        ::  %label or %label/path \'97 dep subtree lookup\
+        =/  segs  (rash rest (more fas sym))\
+        :^  %cnsg  ~[%tap]  [%limb %aon]\
+        :~  :+  %tsgl  [%limb %kid]\
+            :+  %cnhp\
+              :^  %cnsg  ~[%dip]  [%limb %of]\
+              :~  :-  %tsgl\
+                  [%limb %q]\
+                  :^  %cnsg  ~[%got]  [%limb %by]\
+                  :~\
+                    [%wing ~[%deps %bowl]]\
+                    [%rock %tas label]\
+                  ==\
+              ==\
+            (path-lit t.segs)\
+        ==\
+      ::  %label.field \'97 returns vase from dep saga slot\
+      =/  field  (rsh [3 +(u.dot)] rest)\
+      ::  q:(~(got by q:(need fil:q:(~(got by deps.bowl) %label))) /[field])\
+      :+  %tsgl  [%limb %q]               :: q. pail \uc0\u8594  vase\
+      :^  %cnsg  ~[%got]  [%limb %by]\
+      :~  :+  %tsgl  [%limb %q]           :: q. saga \uc0\u8594  tale\
+          :+  %cnhp  [%limb %need]         :: (need ...)\
+          :+  %tsgl  [%limb %fil]          :: fil. axal \uc0\u8594  (unit saga)\
+          :+  %tsgl  [%limb %q]            :: q. (pair pith epic) \uc0\u8594  epic\
+          :^  %cnsg  ~[%got]  [%limb %by]\
+          :~\
+            [%wing ~[%deps %bowl]]\
+            [%rock %tas label]\
+          ==\
+        ::\
+          (path-lit ~[field])\
+      ==\
+    ::  fallthrough: treat as raw term wing\
+    [%wing ~[i.segs]]\
+  ::\
+  ++  forge-talk\
+    |=  nod=manx\
+    ^-  hoon\
+    =/  inputs  (gc nod 'input')\
+    =/  guards  (gc nod 'guard')\
+    =/  mutations=(list manx)\
+      %+  skip  c.nod\
+      |=  m=manx\
+      ?|  =((gt m) 'input')\
+          =((gt m) 'guard')\
+          =('' n.g.m)\
+      ==\
+    =/  body  (build-mutations mutations return)\
+    =.  body  (build-guards guards body)\
+    =.  body  (build-inputs inputs body)\
+    (wrap-form ~[[%talk (wrap-gate %talk body)]])\
+\
+   ++  forge-dep\
+    |=  nod=manx\
+    ^-  hoon\
+    =/  dead-nods  (gc nod 'dead')\
+    =/  muts  (skip c.nod |=(m=manx |((=((gt m) 'dead')) =('' n.g.m))))\
+    =/  body  (build-mutations muts return)\
+    =/  dead-body=hoon\
+      ?~  dead-nods  return\
+      (build-mutations c.i.dead-nods return)\
+    (wrap-form ~[[%hear (wrap-gate %hear body)] [%dead (wrap-gate %dead dead-body)]])\
+\
+  ++  wrap-vase\
+    ::  inner is already a vase, pair with stud for pail\
+    |=  [mar=term inner=hoon]\
+    ^-  hoon\
+    [%clhp [%rock %tas mar] inner]\
+\
+  ++  path-lit\
+    |=  seg=(list cord)\
+    ^-  hoon\
+    :-  %clsg\
+    %+  turn  seg\
+    |=  c=cord\
+    [%rock %tas c]\
+  ::\
+  ++  build-card\
+    ::  builds a create/update card: append [path typ tale] to cards\
+    |=  [nod=manx typ=term inner=hoon]\
+    ^-  hoon\
+    ?~  pax=(ga nod 'path')  inner\
+    =/  path  (build-path u.pax)\
+    =/  tal  (build-tale c.nod)\
+    (append-card path typ tal inner)\
+  ::\
+  ++  build-remove\
+    ::  builds a remove card: append [path %cull ~] to cards\
+    |=  [nod=manx typ=term inner=hoon]\
+    ^-  hoon\
+    ?~  pax=(ga nod 'path')  inner\
+    =/  path  (build-path u.pax)\
+    (append-card path %cull [%rock %n ~] inner)\
+  ::\
+  ++  put-saga\
+    |=  [path=hoon val=hoon]\
+    ^-  hoon\
+    [%cnsg ~[%put] [%limb %by] [%wing ~[%q %saga]] ~[[%clhp path val]]]\
+\
+  ++  forge-derive\
+    |=  nod=manx\
+    ^-  hoon\
+    =/  expr  (build-expr c.nod)\
+    ?~  slot=(ga nod 'slot')  exit\
+    =/  body=hoon\
+      :^  %tsdt  ~[%q %saga]\
+        (put-saga (path-lit ~[u.slot]) (wrap-vase %noun expr))\
+      return\
+    %-  wrap-form\
+    :~  [%hear (wrap-gate %hear body)]\
+        [%take (wrap-gate %take body)]\
+    ==\
+\
+  ++  forge-def\
+    |=  nod=manx\
+    ^-  forge-result\
+    =/  name  (need (ga nod 'name'))\
+    =/  gate  (build-def nod)\
+    ::  store gate hoon at /def/name \'97 read-gate compiles on demand\
+    [%def name gate]\
+\
+  +$  forge-result\
+    $%  [%kook shrub=cord spec=spec:n sub=cord hon=hoon nod=manx]\
+        [%def name=cord hon=hoon]\
+        [%dep shrub=cord name=cord path=cord]\
+    ==\
+  :: TEMPORARY \
+  ++  forge-spec\
+    |=  nod=manx\
+    ^-  spec:n\
+    =/  tag  (gt nod)\
+    =/  deps=(map term (bill:n fief:n))\
+      ?:  =(tag 'dep')\
+        =/  name=term  (fall (ga nod 'name') tag)\
+        =/  =care:t\
+          =/  c  (fall (ga nod 'care') 'y')\
+          ?:  =(c 'x')  %x\
+          ?:  =(c 'z')  %z\
+          %y\
+        (my ~[[name [~ [deed=[~ &] care soma=*soma:n]]]])\
+      *(map term (bill:n fief:n))\
+    =/  pokes=(set (bill:n stud:t))\
+      ?:  =(tag 'talk')\
+        =/  action=term  (fall (ga nod 'name') tag)\
+        (sy ~[[~ action]])\
+      *(set (bill:n stud:t))\
+    :*  state=[~ [%any ~]]\
+        poke=[~ pokes]\
+        kids=~\
+        deps=[~ deps]\
+    ==\
+\
+  ++  run\
+    |=  [nods=(list manx)]\
+    ^-  (list forge-result)\
+    %+  murn  nods\
+      |=  nod=manx\
+    =/  tag  (gt nod)\
+    ::  ?:  =(tag 'shrub')  `(forge-shrub nod)\
+    ?:  =(tag 'def')  `(forge-def nod)\
+    =/  hter.on=(unit hoon)\
+      ?:  =(tag 'dep')     `(forge-dep nod)\
+      ?:  =(tag 'talk')    `(forge-talk nod)\
+      ?:  =(tag 'derive')  `(forge-derive nod)\
+      ~\
+    ?~  shrub=(ga nod 'shrub')  ~\
+    ?~  hon  ~\
+    =/  sub=cord\
+      ?:  =(tag 'talk')    (fall (ga nod 'name') tag)\
+      ?:  =(tag 'dep')     (fall (ga nod 'name') tag)\
+      ?:  =(tag 'derive')  (fall (ga nod 'slot') tag)\
+      tag\
+    =/  =spec:n  (forge-spec nod)\
+    =/  results=(list forge-result)\
+      :~  [%kook u.shrub spec sub u.hon nod]\
+      ==\
+    =?  results  =(tag 'dep')\
+      =/  pax  (fall (ga nod 'path') '')\
+      (snoc results [%dep u.shrub sub pax])\
+    `results\
+  \
+\
+:: xx: WILL DEPRECATE ANVIL NOT USED ANYMORE\
+\
+++  anvil\
+  |%\
+  +$  schema  (list rule)\
+  +$  rule  [=term msg=cord =pred]\
+  ++  pred\
+    $~  [%h '']\
+    $%  [%h attr=cord]\
+        [%k tag=cord]\
+        [%g tag=cord n=@ud]\
+        [%in ctx=cord]\
+        [%b ref=cord ctx=cord]\
+        [%a p=* q=*]\
+        [%o p=* q=*]\
+        [%n p=*]\
+        [%w tag=cord p=*]\
+        [%x attr=cord sibling=cord sattr=cord]\
+    ==\
+\
+  ++  check\
+    |=  [sch=schema nod=manx state=(list manx)]\
+    ^-  [(list [term cord]) manx]\
+    :-  (walk sch nod state ~)\
+    nod\
+\
+  ++  walk\
+    |=  [rules=(list rule) nod=manx state=(list manx) trail=(list manx)]\
+    ^-  (list [term cord])\
+    =|  acc=(list [term cord])\
+    =|  stack=(list [manx (list manx)])\
+    =.  stack  ~[[nod trail]]\
+    |-  ^-  (list [term cord])\
+    ?~  stack  acc\
+    =/  [cur=manx cur-trail=(list manx)]  i.stack\
+    =/  errs=(list [term cord])\
+      %+  murn  rules\
+      |=  r=rule\
+      ^-  (unit [term cord])\
+      ?.  (ev pred.r cur state cur-trail)  ~\
+      `[term.r msg.r]\
+    =/  kids=(list [manx (list manx)])\
+      %+  turn  c.cur\
+      |=  c=manx\
+      [c (snoc cur-trail cur)]\
+    $(stack (weld kids t.stack), acc (weld acc errs))\
+\
+  ++  ev\
+    |=  [p=pred nod=manx state=(list manx) trail=(list manx)]\
+    ^-  ?\
+    ?-  -.p\
+      %h   !=('' (ga nod attr.p))\
+      %k   (lien c.nod |=(c=manx =((gt c) tag.p)))\
+      %g   =/  kids  ?:(=('' tag.p) c.nod (skim c.nod |=(c=manx =((gt c) tag.p))))\
+           (lth (lent kids) n.p)\
+      %in  (lien trail |=(m=manx =((gt m) ctx.p)))\
+      %b   ?|  !(lien trail |=(m=manx =((gt m) ctx.p)))\
+               !=(ref.p (cut 3 [0 (met 3 ref.p)] (ga nod 'name')))\
+           ==\
+      %a   &((ev ;;(pred p.p) nod state trail) (ev ;;(pred q.p) nod state trail))\
+      %o   |((ev ;;(pred p.p) nod state trail) (ev ;;(pred q.p) nod state trail))\
+      %n   !(ev ;;(pred p.p) nod state trail)\
+      %w   ?.(=((gt nod) tag.p) & (ev ;;(pred p.p) nod state trail))\
+      %x   (lien state |=(m=manx &(=((gt m) sibling.p) =((ga m sattr.p) (ga nod attr.p)))))\
+    ==\
+--\
+\
+++  shrub-schema\
+  ^-  schema:anvil\
+  :~\
+  ::  structure (can't generate without these)\
+  [%no-name 'shrub missing name' [%w 'shrub' [%n [%h 'name']]]]\
+  [%no-shrub 'orphan behavior' [%w 'behavior' [%n [%x 'shrub' 'shrub' 'name']]]]\
+  ::\
+  ::  required children (codegen needs these nodes)\
+  [%no-test 'if needs test' [%w 'if' [%n [%k 'test']]]]\
+  [%no-then 'if needs then' [%w 'if' [%n [%k 'then']]]]\
+  [%no-else 'if needs else' [%w 'if' [%n [%k 'else']]]]\
+  [%no-otherwise 'match needs otherwise' [%w 'match' [%n [%k 'otherwise']]]]\
+  [%no-over 'fold missing over' [%w 'fold' [%n [%h 'over']]]]\
+  [%no-acc 'fold missing acc' [%w 'fold' [%n [%h 'acc']]]]\
+  ::\
+  ::  required attrs (can't generate gate/ref without name)\
+  [%no-ref 'ref missing name' [%w 'ref' [%n [%h 'name']]]]\
+  [%no-fn 'fn missing name' [%w 'fn' [%n [%h 'name']]]]\
+  [%no-action-name 'action missing name' [%w 'action' [%n [%h 'name']]]]\
+  ::\
+  ::  context (generates wrong code if violated)\
+  [%src-in-compute '%src in compute' [%w 'ref' [%a [%in 'compute'] [%a [%n [%in 'action']] [%b '%src' 'compute']]]]]\
+  [%input-in-compute '%input in compute' [%w 'ref' [%a [%in 'compute'] [%a [%n [%in 'action']] [%b '%' 'compute']]]]]\
+  [%create-in-compute 'create inside compute' [%w 'create' [%in 'compute']]]\
+  ::\
+  ::  def purity (generated gate would close over wrong scope)\
+  [%def-slot 'def reads / path' [%w 'ref' [%a [%in 'def'] [%b '/' 'def']]]]\
+  [%def-env 'def reads % binding' [%w 'ref' [%a [%in 'def'] [%b '%' 'def']]]]\
+  ::\
+  ::  pipe (can't chain less than 2)\
+  [%short-pipe 'pipe needs 2+ children' [%w 'pipe' [%g '' 2]]]\
+==\
+--}

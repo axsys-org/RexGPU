@@ -1638,7 +1638,7 @@ struct VSOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
 
         for (const draw of cmd.draws) {
           const pe = this.pipelines.get(draw.pipelineKey);
-          if (!pe) continue;
+          if (!pe) { this.log(`draw: pipeline "${draw.pipelineKey}" not found`,'err'); continue; }
           pass.setPipeline(pe.pipeline);
           // Auto-set resource scope bind group at group 0 if pipeline uses one
           if (pe.resourceScope && this._resourceScopes?.has(pe.resourceScope)) {
@@ -1763,7 +1763,7 @@ struct VSOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
       // Fall back to legacy heap-only bind
       if (bindDef.buffer) {
         const hl = this._heapLayout.get(bindDef.buffer);
-        if (!hl || !this._heapBuffer) return;
+        if (!hl || !this._heapBuffer) { this.log(`bind: buffer "${bindDef.buffer}" not in heap`,'err'); return; }
         const bgKey = `${group}_${bindDef.buffer}`;
         let bg = this._bindGroups.get(bgKey);
         if (!bg) {
@@ -1773,7 +1773,7 @@ struct VSOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
               entries: [{ binding: 0, resource: { buffer: this._heapBuffer, offset: hl.offset, size: hl.size } }]
             });
             this._bindGroups.set(bgKey, bg);
-          } catch(e) { return; }
+          } catch(e) { this.log(`bind group ${group}: ${e.message}`,'err'); return; }
         }
         pass.setBindGroup(group, bg);
       }

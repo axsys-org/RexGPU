@@ -46,7 +46,7 @@ import { callClaude } from './claude-api.js';
   });
 
   // ── Canvas resize ──
-  let gpu;
+  let gpu, surface;
   const overlay = document.getElementById('gpu-overlay');
   function setOverlay(msg) { if(overlay) overlay.textContent = msg||''; }
 
@@ -57,7 +57,11 @@ import { callClaude } from './claude-api.js';
     canvas.height=Math.floor(rect.height*dpr);
     canvas.style.width=rect.width+'px';
     canvas.style.height=(rect.height-30)+'px';
-    if(gpu)gpu.invalidate();
+    if(gpu){
+      // Canvas resize invalidates the WebGPU context — must reconfigure before next frame
+      if(gpu.context&&gpu.device) gpu.context.configure({device:gpu.device,format:gpu.format,alphaMode:'premultiplied'});
+      gpu.invalidate();
+    }
     if(surface)surface.invalidate();
   }
 
@@ -67,7 +71,8 @@ import { callClaude } from './claude-api.js';
   function flushLog(){logView.innerHTML=logs.map(e=>`<div class="le ${e.cls}">${esc(e.msg)}</div>`).join('');logView.scrollTop=logView.scrollHeight;}
 
   // ── GPU init ──
-  resizeCanvas();
+  // Note: resizeCanvas() must run after applyBreakpoint() sets up the grid,
+  // so defer the first resize — the GPU context is configured after init below.
   gpu = new RexGPU(canvas, log);
   setOverlay('Initializing WebGPU\u2026');
   const gpuOk = await gpu.init();
@@ -80,7 +85,6 @@ import { callClaude } from './claude-api.js';
   }
 
   // ── Surface transducer ──
-  let surface = null;
   if (gpuOk) {
     surface = new RexSurface(gpu.device, gpu.context, gpu.format, log);
   }
@@ -596,7 +600,7 @@ import { callClaude } from './claude-api.js';
 
 @shader plasma
   #import Params
-  struct VSOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
+  struct VSOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f }
   @group(0) @binding(0) var<uniform> u: Params;
   @vertex fn vs_main(@builtin(vertex_index) vi: u32) -> VSOut {
     var p = array<vec2f,6>(vec2f(-1,-1),vec2f(1,-1),vec2f(-1,1),vec2f(-1,1),vec2f(1,-1),vec2f(1,1));
@@ -619,9 +623,9 @@ import { callClaude } from './claude-api.js';
 
 @buffer params :struct Params :usage [uniform]
   @data
-    resolution = (canvas-size)
-    time = (elapsed)
-    speed = (form/speed)
+    :resolution (canvas-size)
+    :time (elapsed)
+    :speed (form/speed)
 
 @pipeline main :vertex plasma :fragment plasma :format canvas :topology triangle-list
 

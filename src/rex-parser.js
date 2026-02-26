@@ -785,9 +785,15 @@ export const Rex = {
       const raw = lines[i], s = raw.trimEnd(), t = s.trimStart(), ind = s.length > 0 ? s.search(/\S/) : 0;
       if (cap) {
         if (s.length > 0 && ind <= ci) {
-          const pad = ci + 2; out.push(' '.repeat(pad)+"''"); lineIndents.push(pad);
-          for (const l of cl) { out.push(' '.repeat(pad)+l); lineIndents.push(pad); }
-          out.push(' '.repeat(pad)+"''"); lineIndents.push(pad); cl=[]; cap=false;
+          // Flush: embed all captured content inline on the @node line using '' ugly string.
+          // Content is embedded directly — NOT pushed as separate lines — so nonBlankIndents
+          // stays in sync with flatShrubs (one entry per canonical parse node).
+          const lastIdx = out.length - 1;
+          const content = cl.join('\n');
+          // Replace trailing newlines in content if any
+          out[lastIdx] = out[lastIdx] + " ''\n" + content + "\n''";
+          lineIndents[lastIdx] = ind; // keep indent of @node line
+          cl=[]; cap=false;
         } else { cl.push(s.length===0 ? '' : raw.slice(Math.min(ind, ci+2))); continue; }
       }
       if (t.startsWith('@')) {
@@ -801,7 +807,7 @@ export const Rex = {
       }
       out.push(raw); lineIndents.push(ind);
     }
-    if (cap && cl.length) { const pad=ci+2; out.push(' '.repeat(pad)+"''"); lineIndents.push(pad); for(const l of cl){out.push(' '.repeat(pad)+l);lineIndents.push(pad);} out.push(' '.repeat(pad)+"''"); lineIndents.push(pad); }
+    if (cap && cl.length) { const lastIdx=out.length-1; out[lastIdx]=out[lastIdx]+" ''\n"+cl.join('\n')+"\n''"; }
 
     // Strip ;; line comments before canonical parse (canonical Rex uses ') '] '} for comments)
     const preprocessed = out.map(l => {
@@ -818,18 +824,13 @@ export const Rex = {
     const flatShrubs = [];
     for (const n of nodes) flatShrubs.push(...toShrub(n, 0));
 
-    // Compute indentation for each Shrub node by scanning preprocessed source
-    // Each canonical node corresponds to a non-blank line in the source
-    const ppLines = preprocessed.split('\n');
-    const nonBlankIndents = [];
-    for (let i = 0; i < ppLines.length; i++) {
-      const s = ppLines[i].trimEnd();
-      if (s.length > 0) nonBlankIndents.push(s.search(/\S/));
-    }
+    // Compute indentation for each Shrub node using lineIndents[] from preprocessor.
+    // lineIndents has one entry per out[] element (not per expanded line), so it stays
+    // in sync with flatShrubs even when ugly strings embed multi-line content.
+    // Filter out blank-line entries (lineIndents entries where out[i] is blank/empty).
+    const nonBlankIndents = lineIndents.filter((_, i) => out[i].trim().length > 0);
 
     // Assign indentation to each flat Shrub — map by order
-    // The canonical parser produces one node per non-blank source "expression"
-    // which may span multiple lines. Indentation = first line of that expression.
     for (let i = 0; i < flatShrubs.length; i++) {
       flatShrubs[i]._indent = i < nonBlankIndents.length ? nonBlankIndents[i] : 0;
     }
