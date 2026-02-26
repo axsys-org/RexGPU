@@ -65,6 +65,14 @@ class ShrubLM {
     // Pending votes from lateral connections
     this.pendingVotes = [];
 
+    // CMP port weights: neighborShrub → weight (0..1)
+    // Learned via vote accuracy. Ports below 0.05 are pruned.
+    this.portWeights = new Map();
+
+    // Pending crystallizations: passed local threshold, awaiting lateral confirmation.
+    // talkName → {proto, timestamp}
+    this.pendingCrystallizations = new Map();
+
     // Overall LM state
     this.confidence = 0;
     this.ready = false;                 // all prototypes crystallized
@@ -194,7 +202,15 @@ class ShrubLM {
           const variance = proto.m2[i] / proto.count;
           if (variance > LM_VARIANCE_THRESHOLD) { allLowVariance = false; break; }
         }
-        if (allLowVariance) proto.crystallized = true;
+        if (allLowVariance && !this.pendingCrystallizations.has(talkName)) {
+          // Enter pending state — requires lateral confirmation before fully crystallizing.
+          // If this LM has no known lateral ports, crystallize immediately (isolated shrub).
+          if (this.portWeights.size === 0) {
+            proto.crystallized = true;
+          } else {
+            this.pendingCrystallizations.set(talkName, { proto, timestamp });
+          }
+        }
       }
     }
 
@@ -242,27 +258,73 @@ class ShrubLM {
     this.pendingVotes.push(vote);
   }
 
-  // Process all pending votes — update evidence for matching prototypes
+  // Process all pending votes — update evidence, port weights, and confirm crystallizations.
+  // Returns array of talkNames that just got laterally confirmed (for RexPCN to emit).
   processVotes() {
-    if (this.pendingVotes.length === 0) return;
+    const confirmed = [];
+    if (this.pendingVotes.length === 0) return confirmed;
 
     for (const vote of this.pendingVotes) {
-      // Find prototypes whose displacement direction matches the vote
+      let anyConfirm = false;
+      let anyContradict = false;
+
+      // Evidence update + detect confirmation for pending crystallizations
       for (const [talkName, proto] of this.prototypes) {
         if (proto.count < 3) continue;
         const similarity = this._cosineSimilarity(vote.displacement, proto.mean);
         const prevEvidence = this.evidence.get(talkName) || 0;
+        const weight = this.portWeights.get(vote.sender) || 0.5;
 
         if (similarity > 0.5) {
-          // Confirming vote — displacement directions align
-          this.evidence.set(talkName, prevEvidence + vote.confidence * similarity * LM_VOTE_CONFIRM_WEIGHT);
+          this.evidence.set(talkName, prevEvidence + vote.confidence * similarity * weight * LM_VOTE_CONFIRM_WEIGHT);
+          anyConfirm = true;
+          // Lateral confirmation: promote pending crystallization
+          if (this.pendingCrystallizations.has(talkName)) {
+            const { proto: pendingProto } = this.pendingCrystallizations.get(talkName);
+            pendingProto.crystallized = true;
+            this.pendingCrystallizations.delete(talkName);
+            confirmed.push(talkName);
+          }
         } else if (similarity < -0.3) {
-          // Contradicting vote — opposite directions
-          this.evidence.set(talkName, prevEvidence - vote.confidence * Math.abs(similarity) * LM_VOTE_CONTRADICT_WEIGHT);
+          this.evidence.set(talkName, prevEvidence - vote.confidence * Math.abs(similarity) * weight * LM_VOTE_CONTRADICT_WEIGHT);
+          anyContradict = true;
+        }
+      }
+
+      // Update port weight for this sender based on vote accuracy
+      const prev = this.portWeights.get(vote.sender) || 0.5;
+      if (anyConfirm && !anyContradict) {
+        this.portWeights.set(vote.sender, Math.min(1.0, prev + 0.1));
+      } else if (anyContradict && !anyConfirm) {
+        const next = prev - 0.2;
+        if (next < 0.05) {
+          this.portWeights.delete(vote.sender); // prune dead port
+        } else {
+          this.portWeights.set(vote.sender, next);
         }
       }
     }
     this.pendingVotes = [];
+
+    // Expire pending crystallizations older than 30s (no lateral ever came — go solo)
+    const now = performance.now();
+    for (const [talkName, { proto, timestamp }] of this.pendingCrystallizations) {
+      if (now - timestamp > 30000) {
+        proto.crystallized = true;
+        this.pendingCrystallizations.delete(talkName);
+        confirmed.push(talkName);
+      }
+    }
+
+    return confirmed;
+  }
+
+  // Called by RexPCN when a new lateral neighbor is discovered (co-firing detection).
+  // Initializes port weight if not already known.
+  addPort(neighborShrub) {
+    if (!this.portWeights.has(neighborShrub)) {
+      this.portWeights.set(neighborShrub, 0.1); // tentative — must earn its weight
+    }
   }
 
   _cosineSimilarity(a, b) {
@@ -469,6 +531,8 @@ class ShrubLM {
       ready: this.ready,
       totalObservations: this.totalObservations,
       prototypes: protos,
+      portWeights: Object.fromEntries(this.portWeights),
+      pendingCrystallizations: [...this.pendingCrystallizations.keys()],
     };
   }
 }
@@ -524,6 +588,8 @@ export class RexPCN {
     this._shrubLMs = new Map();         // shrubName → ShrubLM
     this._depGraph = [];                // cached [{from, to, label, path}] for vote routing
     this._pendingVotes = new Map();     // shrubName → VoteRecord[]
+    this._recentFirings = new Map();    // shrubName → timestamp — for co-firing port discovery
+    this._coFiringWindow = 50;          // ms — two shrubs firing within this window → candidate port
     this.onSurpriseSignal = null;       // callback(shrub, slot, value, {min,max}) — LM-detected surprise
     this.onCrystallize = null;          // callback({shrub, talk, guard}) — synthesized rule from crystallization
   }
@@ -1743,30 +1809,95 @@ export class RexPCN {
   }
 
   // Cache the dep graph for vote routing (called from main.js on recompile).
+  // Known dep edges are seeded at port weight 0.5 (trusted, not tentative).
   setDepGraph(edges) {
     this._depGraph = edges || [];
+    for (const edge of this._depGraph) {
+      const fromLM = this._shrubLMs.get(edge.from);
+      const toLM = this._shrubLMs.get(edge.to);
+      // Seed both directions at 0.5 only if no existing weight (preserve learned weights)
+      if (fromLM && !fromLM.portWeights.has(edge.to)) fromLM.portWeights.set(edge.to, 0.5);
+      if (toLM && !toLM.portWeights.has(edge.from)) toLM.portWeights.set(edge.from, 0.5);
+    }
   }
 
-  // Emit votes from a ShrubLM to all its dependents via the cached dep graph.
+  // Emit votes from a ShrubLM to all lateral neighbors.
+  // Routes along dep graph edges AND discovered co-firing ports.
+  // Vote confidence is scaled by the sender's port weight toward each recipient.
   _emitVotes(shrubName, talkName) {
     const lm = this._shrubLMs.get(shrubName);
     if (!lm) return;
     const vote = lm.buildVote(talkName);
     if (!vote) return;
+
+    // Collect all target LMs: dep graph edges + LMs that have this shrub as a port
+    const targets = new Set();
     for (const edge of this._depGraph) {
-      // edge.from = dependent (consumer), edge.to = source (provider)
-      // Vote flows from source → consumer: when source fires, notify consumers
-      if (edge.to === shrubName) {
-        const targetLM = this._shrubLMs.get(edge.from);
-        if (targetLM) targetLM.receiveVote(vote);
+      if (edge.to === shrubName) targets.add(edge.from);
+      if (edge.from === shrubName) targets.add(edge.to);
+    }
+    // Also include any LM that has a port weight for this shrub
+    for (const [name, targetLM] of this._shrubLMs) {
+      if (name !== shrubName && targetLM.portWeights.has(shrubName)) {
+        targets.add(name);
+      }
+    }
+
+    for (const targetName of targets) {
+      const targetLM = this._shrubLMs.get(targetName);
+      if (!targetLM) continue;
+      // Scale vote confidence by the target's port weight toward this sender
+      const portWeight = targetLM.portWeights.get(shrubName) || 0.5;
+      if (portWeight < 0.05) continue; // pruned port — skip
+      const weightedVote = { ...vote, confidence: vote.confidence * portWeight };
+      targetLM.receiveVote(weightedVote);
+    }
+  }
+
+  // Detect co-firing between shrubs and create tentative CMP ports.
+  // Two shrubs firing within _coFiringWindow ms → add each other as candidate neighbors.
+  // New ports start at weight 0.1 and must earn weight through vote accuracy.
+  _discoverPorts(shrubName, timestamp) {
+    const lm = this._shrubLMs.get(shrubName);
+    if (!lm) return;
+
+    // Check all other recently-fired shrubs
+    for (const [otherName, otherTs] of this._recentFirings) {
+      if (otherName === shrubName) continue;
+      if (Math.abs(timestamp - otherTs) <= this._coFiringWindow) {
+        const otherLM = this._shrubLMs.get(otherName);
+        if (!otherLM) continue;
+        // Add port in both directions if not already known
+        const isNew = !lm.portWeights.has(otherName);
+        lm.addPort(otherName);
+        otherLM.addPort(shrubName);
+        if (isNew) {
+          this.log(`pcn: discovered CMP port ${shrubName} ↔ ${otherName} (co-firing)`, 'ok');
+        }
+      }
+    }
+
+    // Record this firing (prune stale entries older than window)
+    this._recentFirings.set(shrubName, timestamp);
+    if (this._recentFirings.size > 64) {
+      // Evict entries older than 2x the window
+      for (const [name, ts] of this._recentFirings) {
+        if (timestamp - ts > this._coFiringWindow * 2) this._recentFirings.delete(name);
       }
     }
   }
 
   // Process pending votes on all ShrubLMs — call once per transduce cycle.
+  // Collects laterally-confirmed crystallizations and emits onCrystallize.
   _processAllVotes() {
-    for (const lm of this._shrubLMs.values()) {
-      lm.processVotes();
+    for (const [shrubName, lm] of this._shrubLMs) {
+      const confirmed = lm.processVotes();
+      if (confirmed.length > 0 && this.onCrystallize) {
+        for (const talkName of confirmed) {
+          const rule = this.synthesizeRule(shrubName, talkName);
+          if (rule) this.onCrystallize(rule);
+        }
+      }
     }
   }
 
@@ -1841,8 +1972,11 @@ export class RexPCN {
         if (rule) this.onCrystallize(rule);
       }
 
-      // Emit votes to dependent shrubs
+      // Emit votes to lateral neighbors
       this._emitVotes(record.shrub, record.talk);
+
+      // Port discovery: detect co-firing within window → tentative new port
+      this._discoverPorts(record.shrub, ts);
     }
 
     // ── Existing Hebbian matrix integration ──
