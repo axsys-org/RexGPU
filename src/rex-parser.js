@@ -810,10 +810,11 @@ export const Rex = {
     if (cap && cl.length) { const lastIdx=out.length-1; out[lastIdx]=out[lastIdx]+" ''\n"+cl.join('\n')+"\n''"; }
 
     // Strip ;; line comments before canonical parse (canonical Rex uses ') '] '} for comments)
-    const preprocessed = out.map(l => {
+    const stripped = out.map(l => {
       const ci = l.indexOf(';;');
       return ci >= 0 ? l.slice(0, ci) : l;
-    }).join('\n');
+    });
+    const preprocessed = stripped.join('\n');
     const {nodes, errors: parseErrors} = rexParse(preprocessed);
     // Surface parse errors (don't swallow them)
     if (parseErrors.length > 0) {
@@ -827,8 +828,9 @@ export const Rex = {
     // Compute indentation for each Shrub node using lineIndents[] from preprocessor.
     // lineIndents has one entry per out[] element (not per expanded line), so it stays
     // in sync with flatShrubs even when ugly strings embed multi-line content.
-    // Filter out blank-line entries (lineIndents entries where out[i] is blank/empty).
-    const nonBlankIndents = lineIndents.filter((_, i) => out[i].trim().length > 0);
+    // Filter out lines that are blank OR become blank after ;; comment stripping —
+    // those produce no Shrub nodes so must not be counted in the indent mapping.
+    const nonBlankIndents = lineIndents.filter((_, i) => stripped[i].trim().length > 0);
 
     // Assign indentation to each flat Shrub — map by order
     for (let i = 0; i < flatShrubs.length; i++) {

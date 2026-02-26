@@ -22,25 +22,46 @@ Paths: /slot  %dep  $binding  — used in behaviour expressions
 
 @struct Name
   @field fname :type f32|f32x2|f32x3|f32x4|u32|i32|f32x4x4
-  ;; pad to 16B: add @field _pad :type f32 before any f32x3
-  ;; f32x3 at misaligned offset = GPU crash — always pad or use f32x4
+  ;; ALIGNMENT: f32x3 requires 16B alignment — always use f32x4 instead, or pad before it
+  ;; NEVER put f32x3 after an f32 or f32x2 — GPU crash. Use f32x4 for all vec3 data.
 
 @lib name          ;; shared WGSL functions — #import libname inside @shader
 
 @shader name       ;; WGSL source as indented content block
-  #import StructName   ;; inlines struct + @group(0)@binding(0) var<uniform>
-  #import libname      ;; inlines @lib code
+  #import StructName   ;; inlines struct + @group(0)@binding(0) var<uniform> u: StructName
+  #import libname      ;; inlines @lib code inline
   struct VSOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
   @vertex fn vs_main(@builtin(vertex_index) vi: u32) -> VSOut { ... }
   @fragment fn fs_main(v: VSOut) -> @location(0) vec4f { ... }
   ;; Entry points MUST be vs_main / fs_main — never fn main()
+  ;; NEVER shadow these names in any fn: u (uniform binding), step, abs, select, textureSample
+  ;; Avoid single-letter locals i f t s p — use descriptive names to prevent shadowing
+  ;; DO NOT define structs inside @shader blocks. Only VSOut is allowed inline.
+  ;; For custom return types from helper fns, use vec4f/vec2f packing instead of structs.
+  ;; Uniform access: u.fieldname (imported struct is bound as 'u')
 
 @buffer name :struct Name :usage [uniform]
   @data
     :fieldname (expr)
-  ;; Builtins: elapsed canvas-size frame mouse-pos mouse-delta mouse-buttons mouse-wheel
-  ;;           move-dir move-x move-y move-z key-w key-a key-s key-d key-q key-e key-space key-shift pointer-locked
-  ;; Form: (form/fieldname)   Vec: (vec3 x y z)
+  ;; Builtins (write directly to @struct fields):
+  ;;   elapsed       → f32    (seconds since start)
+  ;;   canvas-size   → f32x2  (width, height in pixels)
+  ;;   frame         → f32    (frame counter)
+  ;;   mouse-pos     → f32x2  (0..1 normalized)
+  ;;   mouse-delta   → f32x2  (pixel delta this frame, resets each frame)
+  ;;   mouse-dx      → f32    (x component of mouse-delta)
+  ;;   mouse-dy      → f32    (y component of mouse-delta)
+  ;;   mouse-buttons → f32    (bitmask)
+  ;;   mouse-wheel   → f32    (accumulated scroll)
+  ;;   move-dir      → f32x3  (WASD+QE movement vector, -1/0/1 per axis)
+  ;;   move-x        → f32    (strafe: A=-1 D=+1)
+  ;;   move-y        → f32    (vertical: Q=+1 E=-1... Space=+1 Shift=-1)
+  ;;   move-z        → f32    (forward: W=-1 S=+1)
+  ;;   key-w key-a key-s key-d key-q key-e key-space key-shift → f32 (0 or 1)
+  ;;   pointer-locked → f32   (1 if mouse locked, 0 otherwise)
+  ;; move-dir is f32x3 — store in f32x4 field, ignore .w:
+  ;;   @field move :type f32x4   :move (vec4 (move-x) (move-y) (move-z) 0)
+  ;; Form: (form/fieldname)   Vec: (vec4 x y z w)
   ;; :usage MUST be in brackets. Field names must exactly match @struct.
 
 @buffer name :usage [storage] :size N   ;; GPU-side read-write storage buffer
@@ -55,8 +76,8 @@ Paths: /slot  %dep  $binding  — used in behaviour expressions
 @pipeline name :vertex S :fragment S :format canvas :topology triangle-list
   ;; All attrs on ONE line. Additional: :cull none|back|front  :blend alpha|additive|multiply|screen|premultiplied
   ;; :depth true  :depth-compare less  :depth-format depth24plus  :msaa 4
-  ;; :vertex-entry vs_main  :fragment-entry fs_main
-  ;; For vertex buffers: child @vertex-layout :stride N :step vertex|instance > @attribute :location N :offset N :format float32x3
+  ;; For vertex buffers: child @vertex-layout :stride N :step vertex|instance
+  ;;   @attribute :location N :offset N :format float32x3
 
 @pass name :clear [r g b a]
   ;; :target texname (render to texture)   :depth true   :load clear|load
@@ -74,8 +95,9 @@ FULLSCREEN QUAD (6 verts, triangle-list):
     var o: VSOut; o.pos=vec4f(p[vi],0,1); o.uv=vec2f(p[vi].x*.5+.5,.5-p[vi].y*.5); return o;
   }
 
-INPUT fields in @struct: mouse f32x2=(mouse-pos), move f32x3=(move-dir), time f32=(elapsed), res f32x2=(canvas-size)
-Double-click canvas = pointer lock (FPS). key-w/a/s/d/q/e/space/shift = 0 or 1.
+CLICK TO LOCK MOUSE (FPS): double-click canvas → pointer lock → mouse-delta accumulates.
+WASD = horizontal move, Q/E or Space/Shift = vertical. All keys give 0 or 1 scalar.
+For FPS camera: store yaw/pitch as @field in @form, use @interact :drag-x/:drag-y to update them.
 
 ── SURFACE TRANSDUCER (2D — auto-composites over GPU, no wiring needed) ──
 
@@ -175,6 +197,7 @@ export async function callClaude(prompt, onToken) {
     method:'POST', headers,
     body: JSON.stringify({
       model:'claude-opus-4-6', max_tokens:4096,
+      stream: true,
       system: SYSTEM,
       messages:[{role:'user',content:`Generate a Rex Projection Engine tree for: ${prompt}\nOutput ONLY raw Rex notation.`}]
     })
@@ -184,8 +207,30 @@ export async function callClaude(prompt, onToken) {
     try{const j=await res.json();msg+=': '+(j.error?.message||JSON.stringify(j));}catch{}
     throw new Error(msg);
   }
-  const j = await res.json();
-  const full = j.content?.map(b=>b.text||'').join('') || '';
-  onToken(full);
+
+  // SSE streaming
+  const reader = res.body.getReader();
+  const dec = new TextDecoder();
+  let full = '';
+  let buf = '';
+  while (true) {
+    const {done, value} = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, {stream: true});
+    const lines = buf.split('\n');
+    buf = lines.pop(); // keep incomplete line
+    for (const line of lines) {
+      if (!line.startsWith('data: ')) continue;
+      const data = line.slice(6).trim();
+      if (data === '[DONE]') continue;
+      try {
+        const ev = JSON.parse(data);
+        if (ev.type === 'content_block_delta' && ev.delta?.type === 'text_delta') {
+          full += ev.delta.text;
+          onToken(full);
+        }
+      } catch {}
+    }
+  }
   return full;
 }
