@@ -560,7 +560,7 @@ export class RexSurface {
     if (v === undefined || v === null) return fallback;
     if (typeof v === 'object' && v.expr !== undefined) {
       // Expression object — compile on first use, then evaluate
-      if (!v._compiled) v._compiled = Rex.compileExpr(v);
+      if (v._compiled === undefined) v._compiled = Rex.compileExpr(v) ?? false;
       if (!this._surfaceCtx) this._surfaceCtx = this._makeSurfaceEvalContext();
       const result = Rex.evalExpr(v._compiled, this._surfaceCtx);
       return result !== undefined ? result : fallback;
@@ -722,83 +722,363 @@ export class RexSurface {
     }
   }
 
+  // ── Dimension evaluation (supports px numbers, "50%" strings, "auto") ──
+  _evalDim(node, key, fallback, total) {
+    const raw = node.attrs[key];
+    if (raw === undefined || raw === null) return fallback;
+    // Expression object
+    if (typeof raw === 'object' && raw.expr !== undefined) {
+      if (raw._compiled === undefined) raw._compiled = Rex.compileExpr(raw) ?? false;
+      if (!this._surfaceCtx) this._surfaceCtx = this._makeSurfaceEvalContext();
+      const result = Rex.evalExpr(raw._compiled, this._surfaceCtx);
+      return result !== undefined ? result : fallback;
+    }
+    if (typeof raw === 'number') return raw;
+    if (typeof raw === 'string') {
+      if (raw === 'auto') return null; // null = auto
+      if (raw.endsWith('%')) {
+        const pct = parseFloat(raw) / 100;
+        return total != null ? total * pct : fallback;
+      }
+      const n = parseFloat(raw);
+      return Number.isFinite(n) ? n : fallback;
+    }
+    return fallback;
+  }
+
+  // ── Per-side padding: :padding N or :padding-top/:padding-right/:padding-bottom/:padding-left ──
+  _getPadding(node) {
+    const p = this._numAttr(node, 'padding', 0);
+    return {
+      top:    this._numAttr(node, 'padding-top', p),
+      right:  this._numAttr(node, 'padding-right', p),
+      bottom: this._numAttr(node, 'padding-bottom', p),
+      left:   this._numAttr(node, 'padding-left', p),
+    };
+  }
+
+  // ── Per-side margin ──
+  _getMargin(node) {
+    const m = this._numAttr(node, 'margin', 0);
+    return {
+      top:    this._numAttr(node, 'margin-top', m),
+      right:  this._numAttr(node, 'margin-right', m),
+      bottom: this._numAttr(node, 'margin-bottom', m),
+      left:   this._numAttr(node, 'margin-left', m),
+    };
+  }
+
+  // ── Breakpoint resolution: :breakpoints [[768 column] [1024 row]] ──
+  // Returns the layout direction based on canvas width
+  _resolveBreakpoint(node, defaultDir) {
+    const bp = this._attr(node, 'breakpoints', null);
+    if (!bp || !Array.isArray(bp)) return defaultDir;
+    // bp = [[width1, layout1], [width2, layout2], ...] sorted ascending
+    // Walk from smallest to largest; last one that matches (canvasWidth >= threshold) wins
+    let resolved = defaultDir;
+    for (const entry of bp) {
+      if (Array.isArray(entry) && entry.length >= 2) {
+        const threshold = +entry[0];
+        if (this._width >= threshold) resolved = entry[1];
+      }
+    }
+    return resolved;
+  }
+
+  // ── Full flexbox _collectPanel ──
+  // Supports: layout row/column, gap, padding (per-side), align, justify, align-self,
+  //   flex-grow, flex-shrink, flex-basis, flex-wrap, min-width/max-width/min-height/max-height,
+  //   position absolute, z-index, breakpoints, percentage dimensions, overflow, scroll, margin
   _collectPanel(node, offsetX, offsetY, parentClip) {
     const x = this._numAttr(node, 'x', 0) + offsetX;
     const y = this._numAttr(node, 'y', 0) + offsetY;
-    const padding = this._numAttr(node, 'padding', 0);
+    const pad = this._getPadding(node);
     const gap = this._numAttr(node, 'gap', 0);
-    const dir = this._attr(node, 'layout', 'column');
+    const rawDir = this._attr(node, 'layout', 'column');
+    const dir = this._resolveBreakpoint(node, rawDir);
     const align = this._attr(node, 'align', 'start');     // start, center, end, stretch
-    const justify = this._attr(node, 'justify', 'start');  // start, center, end, space-between, space-around
+    const justify = this._attr(node, 'justify', 'start');  // start, center, end, space-between, space-around, space-evenly
     const fill = this._attr(node, 'fill', undefined);
-    const overflow = this._attr(node, 'overflow', 'visible'); // visible, hidden, scroll
+    const overflow = this._attr(node, 'overflow', 'visible');
     const scrollY = this._numAttr(node, 'scroll-y', 0);
+    const wrap = this._attr(node, 'flex-wrap', this._attr(node, 'wrap', 'nowrap')); // nowrap, wrap, wrap-reverse
+    const alignContent = this._attr(node, 'align-content', 'stretch'); // stretch, start, center, end, space-between, space-around
 
-    const children = node.children.filter(c => this._surfaceTypeSet.has(c.type));
-    const measures = children.map(c => this._measureElement(c));
-
-    // Compute content extent (natural size along main axis)
     const isRow = dir === 'row';
-    const contentMain = measures.reduce((s, m) => s + (isRow ? m.w : m.h), 0) + Math.max(0, measures.length - 1) * gap;
-    const maxCross = measures.length > 0 ? Math.max(...measures.map(m => isRow ? m.h : m.w)) : 0;
+    const isWrap = wrap === 'wrap' || wrap === 'wrap-reverse';
+    const isWrapReverse = wrap === 'wrap-reverse';
 
-    // Panel size: explicit or auto
-    const panelW = this._numAttr(node, 'w', 0) || (isRow ? contentMain + padding * 2 : maxCross + padding * 2);
-    const panelH = this._numAttr(node, 'h', 0) || (isRow ? maxCross + padding * 2 : contentMain + padding * 2);
+    // Separate flow children from absolute-positioned children
+    const allChildren = node.children.filter(c => this._surfaceTypeSet.has(c.type));
+    const flowChildren = [];
+    const absChildren = [];
+    for (const c of allChildren) {
+      if (this._attr(c, 'position', '') === 'absolute') absChildren.push(c);
+      else flowChildren.push(c);
+    }
 
-    const innerW = panelW - padding * 2;
-    const innerH = panelH - padding * 2;
+    // Panel size (may be explicit, percentage, or auto)
+    const explicitW = this._evalDim(node, 'w', 0, this._width);
+    const explicitH = this._evalDim(node, 'h', 0, this._height);
+
+    // Measure flow children (intrinsic sizes)
+    const measures = flowChildren.map(c => this._measureElement(c));
+    const padH = pad.left + pad.right;
+    const padV = pad.top + pad.bottom;
+
+    // Flex basis, grow, shrink per child
+    const N = flowChildren.length;
+    const basis = new Float64Array(N);
+    const grow  = new Float64Array(N);
+    const shrink = new Float64Array(N);
+    const minMain = new Float64Array(N);
+    const maxMain = new Float64Array(N);
+    const minCross = new Float64Array(N);
+    const maxCross = new Float64Array(N);
+
+    for (let i = 0; i < N; i++) {
+      const c = flowChildren[i];
+      const m = measures[i];
+      const fb = this._attr(c, 'flex-basis', null);
+      basis[i] = fb != null ? +fb : (isRow ? m.w : m.h);
+      grow[i]  = this._numAttr(c, 'flex-grow', this._numAttr(c, 'grow', 0));
+      shrink[i] = this._numAttr(c, 'flex-shrink', this._numAttr(c, 'shrink', 1));
+      minMain[i] = this._numAttr(c, isRow ? 'min-width' : 'min-height', 0);
+      maxMain[i] = this._numAttr(c, isRow ? 'max-width' : 'max-height', Infinity);
+      minCross[i] = this._numAttr(c, isRow ? 'min-height' : 'min-width', 0);
+      maxCross[i] = this._numAttr(c, isRow ? 'max-height' : 'max-width', Infinity);
+    }
+
+    // Compute natural content extent for auto-sizing
+    const contentMain = basis.reduce((s, b) => s + b, 0) + Math.max(0, N - 1) * gap;
+    const contentCross = N > 0 ? Math.max(...measures.map(m => isRow ? m.h : m.w)) : 0;
+
+    // Resolve panel dimensions
+    const panelW = explicitW || (isRow ? contentMain + padH : contentCross + padH);
+    const panelH = explicitH || (isRow ? contentCross + padV : contentMain + padV);
+    const innerW = panelW - padH;
+    const innerH = panelH - padV;
     const innerMain = isRow ? innerW : innerH;
     const innerCross = isRow ? innerH : innerW;
 
-    // Main-axis distribution (justify)
-    let mainStart = 0;
-    let mainGap = gap;
-    const freeMain = innerMain - contentMain + (measures.length - 1) * gap; // total free space before gap adjustment
-    switch (justify) {
-      case 'center': mainStart = freeMain / 2; break;
-      case 'end': mainStart = freeMain; break;
-      case 'space-between':
-        mainGap = measures.length > 1 ? (innerMain - measures.reduce((s, m) => s + (isRow ? m.w : m.h), 0)) / (measures.length - 1) : gap;
-        break;
-      case 'space-around': {
-        const around = measures.length > 0 ? (innerMain - measures.reduce((s, m) => s + (isRow ? m.w : m.h), 0)) / measures.length : 0;
-        mainStart = around / 2;
-        mainGap = around;
-        break;
+    // ── FLEX WRAP: break flow children into lines ──
+    const lines = []; // [{start, end, sizes[], mainSize, crossSize}]
+    if (isWrap && N > 0) {
+      let lineStart = 0;
+      let lineCursor = 0;
+      for (let i = 0; i < N; i++) {
+        const itemMain = basis[i];
+        const wouldBe = lineCursor + (i > lineStart ? gap : 0) + itemMain;
+        if (i > lineStart && wouldBe > innerMain) {
+          // Flush line
+          lines.push({ start: lineStart, end: i });
+          lineStart = i;
+          lineCursor = itemMain;
+        } else {
+          lineCursor = wouldBe;
+        }
       }
-      // 'start' is default: mainStart=0, mainGap=gap
+      lines.push({ start: lineStart, end: N });
+    } else {
+      lines.push({ start: 0, end: N });
     }
 
-    // Position children
-    let cursor = mainStart;
-    const positions = [];
-    for (let i = 0; i < children.length; i++) {
-      const mw = measures[i].w, mh = measures[i].h;
-      const childMain = isRow ? mw : mh;
-      const childCross = isRow ? mh : mw;
+    // ── Per-line: resolve flex sizes (grow/shrink distribution) ──
+    const resolvedMain = new Float64Array(N);  // final main-axis size per child
+    const resolvedCross = new Float64Array(N); // final cross-axis size per child
+    const lineCrossSizes = [];
 
-      // Cross-axis alignment
-      let crossPos = 0;
-      switch (align) {
-        case 'center': crossPos = (innerCross - childCross) / 2; break;
-        case 'end': crossPos = innerCross - childCross; break;
-        // 'start' and 'stretch': crossPos = 0
+    for (const line of lines) {
+      const { start, end } = line;
+      const count = end - start;
+      const gapTotal = Math.max(0, count - 1) * gap;
+
+      // Basis sum for this line
+      let basisSum = 0;
+      for (let i = start; i < end; i++) basisSum += basis[i];
+      const freeSpace = innerMain - basisSum - gapTotal;
+
+      // Apply grow or shrink
+      for (let i = start; i < end; i++) resolvedMain[i] = basis[i];
+
+      if (freeSpace > 0) {
+        // Grow: distribute positive free space proportionally by grow weight
+        let totalGrow = 0;
+        for (let i = start; i < end; i++) totalGrow += grow[i];
+        if (totalGrow > 0) {
+          for (let i = start; i < end; i++) {
+            if (grow[i] > 0) resolvedMain[i] += freeSpace * grow[i] / totalGrow;
+          }
+        }
+      } else if (freeSpace < 0) {
+        // Shrink: distribute negative space proportionally by shrink * basis (CSS spec)
+        let totalShrinkScaled = 0;
+        for (let i = start; i < end; i++) totalShrinkScaled += shrink[i] * basis[i];
+        if (totalShrinkScaled > 0) {
+          for (let i = start; i < end; i++) {
+            if (shrink[i] > 0) {
+              resolvedMain[i] += freeSpace * (shrink[i] * basis[i]) / totalShrinkScaled;
+            }
+          }
+          // Clamp and redistribute if any went below min
+          let deficit = 0;
+          let redistWeight = 0;
+          for (let i = start; i < end; i++) {
+            if (resolvedMain[i] < minMain[i]) {
+              deficit += minMain[i] - resolvedMain[i];
+              resolvedMain[i] = minMain[i];
+            } else {
+              redistWeight += shrink[i] * basis[i];
+            }
+          }
+          if (deficit > 0 && redistWeight > 0) {
+            for (let i = start; i < end; i++) {
+              if (resolvedMain[i] > minMain[i] && shrink[i] > 0) {
+                resolvedMain[i] -= deficit * (shrink[i] * basis[i]) / redistWeight;
+                resolvedMain[i] = Math.max(resolvedMain[i], minMain[i]);
+              }
+            }
+          }
+        }
       }
 
-      const px = x + padding + (isRow ? cursor : crossPos);
-      const py = y + padding + (isRow ? crossPos : cursor);
-      positions.push({ x: px, y: py });
-      cursor += childMain + mainGap;
+      // Clamp to min/max
+      for (let i = start; i < end; i++) {
+        resolvedMain[i] = Math.max(minMain[i], Math.min(maxMain[i], resolvedMain[i]));
+      }
+
+      // Cross-axis sizing for this line
+      let lineMaxCross = 0;
+      for (let i = start; i < end; i++) {
+        const intrinsicCross = isRow ? measures[i].h : measures[i].w;
+        resolvedCross[i] = Math.max(minCross[i], Math.min(maxCross[i], intrinsicCross));
+        lineMaxCross = Math.max(lineMaxCross, resolvedCross[i]);
+      }
+      lineCrossSizes.push(lineMaxCross);
     }
 
-    // Background rect (if fill specified)
+    // ── Align-content: distribute cross-axis space among lines ──
+    const totalLineCross = lineCrossSizes.reduce((s, c) => s + c, 0);
+    const lineGap = gap; // use same gap for cross-axis line spacing
+    const totalLineSpace = totalLineCross + Math.max(0, lines.length - 1) * lineGap;
+    const freeCross = innerCross - totalLineSpace;
+    let lineCrossStart = 0;
+    let lineCrossGap = lineGap;
+
+    if (lines.length > 1 && freeCross > 0) {
+      switch (alignContent) {
+        case 'center': lineCrossStart = freeCross / 2; break;
+        case 'end': lineCrossStart = freeCross; break;
+        case 'space-between':
+          lineCrossGap = lines.length > 1 ? lineGap + freeCross / (lines.length - 1) : lineGap;
+          break;
+        case 'space-around': {
+          const around = freeCross / lines.length;
+          lineCrossStart = around / 2;
+          lineCrossGap = lineGap + around;
+          break;
+        }
+        case 'stretch': {
+          // Distribute extra cross-space equally among lines
+          const extra = freeCross / lines.length;
+          for (let li = 0; li < lines.length; li++) lineCrossSizes[li] += extra;
+          break;
+        }
+        // 'start': default
+      }
+    }
+
+    // ── Position children ──
+    const positions = new Array(N);
+    const finalW = new Float64Array(N);
+    const finalH = new Float64Array(N);
+    let crossCursor = lineCrossStart;
+
+    for (let li = 0; li < lines.length; li++) {
+      const { start, end } = lines[li];
+      const count = end - start;
+      const lineCross = lineCrossSizes[li];
+
+      // Main-axis: recompute actual used main space after grow/shrink
+      let usedMain = 0;
+      for (let i = start; i < end; i++) usedMain += resolvedMain[i];
+      usedMain += Math.max(0, count - 1) * gap;
+      const freeMain = innerMain - usedMain;
+
+      // Justify: distribute free space along main axis
+      let mainStart = 0;
+      let mainGap = gap;
+      switch (justify) {
+        case 'center': mainStart = freeMain / 2; break;
+        case 'end': mainStart = freeMain; break;
+        case 'space-between':
+          mainGap = count > 1 ? gap + freeMain / (count - 1) : gap;
+          break;
+        case 'space-around': {
+          const around = count > 0 ? freeMain / count : 0;
+          mainStart = around / 2;
+          mainGap = gap + around;
+          break;
+        }
+        case 'space-evenly': {
+          const even = count > 0 ? freeMain / (count + 1) : 0;
+          mainStart = even;
+          mainGap = gap + even;
+          break;
+        }
+      }
+
+      let mainCursor = mainStart;
+      for (let i = start; i < end; i++) {
+        const c = flowChildren[i];
+        const margin = this._getMargin(c);
+        const itemMain = resolvedMain[i];
+        const itemCross = resolvedCross[i];
+
+        // Per-child cross-axis alignment (align-self overrides panel align)
+        const selfAlign = this._attr(c, 'align-self', align);
+        let crossPos = 0;
+        switch (selfAlign) {
+          case 'center': crossPos = (lineCross - itemCross) / 2; break;
+          case 'end': crossPos = lineCross - itemCross; break;
+          case 'stretch':
+            resolvedCross[i] = Math.max(minCross[i], Math.min(maxCross[i], lineCross));
+            break;
+          // 'start': crossPos = 0
+        }
+
+        const mMainBefore = isRow ? margin.left : margin.top;
+        const mMainAfter  = isRow ? margin.right : margin.bottom;
+        const mCrossBefore = isRow ? margin.top : margin.left;
+
+        const px = x + pad.left + (isRow ? mainCursor + mMainBefore : crossPos + crossCursor + mCrossBefore);
+        const py = y + pad.top  + (isRow ? crossPos + crossCursor + mCrossBefore : mainCursor + mMainBefore);
+
+        finalW[i] = isRow ? itemMain : resolvedCross[i];
+        finalH[i] = isRow ? resolvedCross[i] : itemMain;
+        positions[i] = { x: px, y: py };
+        mainCursor += itemMain + mMainBefore + mMainAfter + mainGap;
+      }
+
+      crossCursor += lineCross + lineCrossGap;
+    }
+    if (isWrapReverse) {
+      // Reverse line order: flip cross positions
+      for (let li = 0; li < lines.length; li++) {
+        const { start, end } = lines[li];
+        for (let i = start; i < end; i++) {
+          if (isRow) positions[i].y = y + pad.top + innerCross - (positions[i].y - y - pad.top) - finalH[i];
+          else positions[i].x = x + pad.left + innerCross - (positions[i].x - x - pad.left) - finalW[i];
+        }
+      }
+    }
+
+    // ── Background rect ──
     if (fill) {
       const radius = this._numAttr(node, 'radius', 0);
       this._addRectPath(x, y, panelW, panelH, radius, this._packColor(fill));
     }
-
-    // Stroke on panel
+    // ── Stroke ──
     const stroke = this._attr(node, 'stroke', undefined);
     if (stroke) {
       const sw = this._numAttr(node, 'stroke-width', 1);
@@ -808,12 +1088,17 @@ export class RexSurface {
       this._addRectPath(x - hsw, y - hsw, panelW + sw, panelH + sw, radius > 0 ? radius + hsw : 0, sc);
       this._addRectPathReversed(x + hsw, y + hsw, panelW - sw, panelH - sw, radius > 0 ? Math.max(0, radius - hsw) : 0, sc);
     }
+    // ── Gradient fill on panel ──
+    const gradient = this._attr(node, 'gradient', undefined);
+    if (gradient) {
+      const radius = this._numAttr(node, 'radius', 0);
+      this._addGradientRectPath(x, y, panelW, panelH, radius, gradient);
+    }
 
-    // Compute clip rect for overflow: hidden/scroll
+    // ── Clip rect for overflow ──
     let clip = parentClip || null;
     if (overflow === 'hidden' || overflow === 'scroll') {
       const newClip = { x, y, w: panelW, h: panelH };
-      // Intersect with parent clip
       if (clip) {
         const cx1 = Math.max(clip.x, newClip.x), cy1 = Math.max(clip.y, newClip.y);
         const cx2 = Math.min(clip.x + clip.w, newClip.x + newClip.w);
@@ -824,12 +1109,45 @@ export class RexSurface {
       }
     }
 
-    // Collect children at computed positions (with scroll offset)
-    for (let i = 0; i < children.length; i++) {
-      const child = children[i];
+    // ── Collect flow children (z-index sorted) ──
+    // Build render list: [{child, ox, oy, zIndex}]
+    const renderList = [];
+    for (let i = 0; i < N; i++) {
+      const child = flowChildren[i];
       const pos = positions[i];
       const ox = pos.x - this._numAttr(child, 'x', 0);
       const oy = pos.y - this._numAttr(child, 'y', 0) - scrollY;
+      const z = this._numAttr(child, 'z-index', 0);
+      renderList.push({ child, ox, oy, z });
+    }
+
+    // ── Absolute children: position relative to panel, escape flex flow ──
+    for (const child of absChildren) {
+      const margin = this._getMargin(child);
+      const left   = this._evalDim(child, 'left', null, panelW);
+      const top    = this._evalDim(child, 'top', null, panelH);
+      const right  = this._evalDim(child, 'right', null, panelW);
+      const bottom = this._evalDim(child, 'bottom', null, panelH);
+      const cw = this._numAttr(child, 'w', 0) || (left != null && right != null ? panelW - left - right : 0);
+      const ch = this._numAttr(child, 'h', 0) || (top != null && bottom != null ? panelH - top - bottom : 0);
+
+      let ax = x + pad.left + margin.left;
+      let ay = y + pad.top + margin.top;
+      if (left != null) ax = x + left + margin.left;
+      else if (right != null) ax = x + panelW - right - cw - margin.right;
+      if (top != null) ay = y + top + margin.top;
+      else if (bottom != null) ay = y + panelH - bottom - ch - margin.bottom;
+
+      const ox = ax - this._numAttr(child, 'x', 0);
+      const oy = ay - this._numAttr(child, 'y', 0) - scrollY;
+      const z = this._numAttr(child, 'z-index', 0);
+      renderList.push({ child, ox, oy, z });
+    }
+
+    // ── Sort by z-index (stable) and render ──
+    renderList.sort((a, b) => a.z - b.z);
+
+    for (const { child, ox, oy } of renderList) {
       switch (child.type) {
         case 'rect': this._collectRect(child, ox, oy, clip); break;
         case 'text': this._collectText(child, ox, oy, clip); break;
@@ -837,6 +1155,11 @@ export class RexSurface {
         case 'shadow': this._collectShadow(child, ox, oy); break;
         case 'path': this._collectPath(child, ox, oy); break;
         case 'text-editor': this._collectTextEditor(child, ox, oy, clip); break;
+        default: {
+          const h = this._elementHandlers.get(child.type);
+          if (h && h.collect) h.collect(child, ox, oy, clip, this);
+          break;
+        }
       }
     }
   }
@@ -991,9 +1314,19 @@ export class RexSurface {
   }
 
   _measureElementInner(node) {
+    // Absolute-positioned elements don't contribute to parent layout size
+    if (this._attr(node, 'position', '') === 'absolute') return { w: 0, h: 0 };
+
+    const margin = this._getMargin(node);
+    const mw = margin.left + margin.right;
+    const mh = margin.top + margin.bottom;
+
     switch (node.type) {
-      case 'rect':
-        return { w: this._numAttr(node, 'w', 100), h: this._numAttr(node, 'h', 100) };
+      case 'rect': {
+        const w = this._evalDim(node, 'w', 100, this._width);
+        const h = this._evalDim(node, 'h', 100, this._height);
+        return { w: (w || 100) + mw, h: (h || 100) + mh };
+      }
       case 'text': {
         const text = node.name || '';
         const size = this._numAttr(node, 'size', 16);
@@ -1001,45 +1334,73 @@ export class RexSurface {
         this._measureCtx.font = this._sdfFont;
         const scale = size / SDF_GLYPH_SIZE;
         const measured = this._measureCtx.measureText(text);
-        return { w: measured.width * scale, h: size };
+        return { w: measured.width * scale + mw, h: size + mh };
       }
       case 'panel': {
-        const padding = this._numAttr(node, 'padding', 0);
+        const pad = this._getPadding(node);
+        const padH = pad.left + pad.right;
+        const padV = pad.top + pad.bottom;
         const gap = this._numAttr(node, 'gap', 0);
-        const isRow = (this._attr(node, 'layout', 'column')) === 'row';
-        const surfaceTypes = ['rect', 'text', 'panel', 'shadow', 'path', 'text-editor'];
-        const children = node.children.filter(c => surfaceTypes.includes(c.type));
+        const rawDir = this._attr(node, 'layout', 'column');
+        const dir = this._resolveBreakpoint(node, rawDir);
+        const isRow = dir === 'row';
+        // Only measure flow children (not absolute-positioned)
+        const children = node.children.filter(c =>
+          this._surfaceTypeSet.has(c.type) && this._attr(c, 'position', '') !== 'absolute'
+        );
         const measures = children.map(c => this._measureElement(c));
-        const explicitW = this._numAttr(node, 'w', 0), explicitH = this._numAttr(node, 'h', 0);
-        if (explicitW && explicitH) return { w: explicitW, h: explicitH };
+
+        // Explicit dimensions (support percentages)
+        const explicitW = this._evalDim(node, 'w', 0, this._width);
+        const explicitH = this._evalDim(node, 'h', 0, this._height);
+        if (explicitW && explicitH) return { w: explicitW + mw, h: explicitH + mh };
+
+        // Use flex-basis when available for main axis measurement
+        const mainSizes = children.map((c, i) => {
+          const fb = this._attr(c, 'flex-basis', null);
+          if (fb != null) return +fb;
+          return isRow ? measures[i].w : measures[i].h;
+        });
+        const crossSizes = measures.map(m => isRow ? m.h : m.w);
+
+        const mainTotal = mainSizes.reduce((s, m) => s + m, 0) + Math.max(0, mainSizes.length - 1) * gap;
+        const crossMax = crossSizes.length > 0 ? Math.max(...crossSizes) : 0;
+
+        // Apply min-width / min-height / max-width / max-height on the panel itself
+        let w, h;
         if (isRow) {
-          return {
-            w: measures.reduce((s, m) => s + m.w, 0) + Math.max(0, measures.length - 1) * gap + padding * 2,
-            h: (measures.length > 0 ? Math.max(...measures.map(m => m.h)) : 0) + padding * 2,
-          };
+          w = explicitW || (mainTotal + padH);
+          h = explicitH || (crossMax + padV);
+        } else {
+          w = explicitW || (crossMax + padH);
+          h = explicitH || (mainTotal + padV);
         }
-        return {
-          w: (measures.length > 0 ? Math.max(...measures.map(m => m.w)) : 0) + padding * 2,
-          h: measures.reduce((s, m) => s + m.h, 0) + Math.max(0, measures.length - 1) * gap + padding * 2,
-        };
+
+        // Clamp to min/max
+        const minW = this._numAttr(node, 'min-width', 0);
+        const maxW = this._numAttr(node, 'max-width', Infinity);
+        const minH = this._numAttr(node, 'min-height', 0);
+        const maxH = this._numAttr(node, 'max-height', Infinity);
+        w = Math.max(minW, Math.min(maxW, w));
+        h = Math.max(minH, Math.min(maxH, h));
+
+        return { w: w + mw, h: h + mh };
       }
-      case 'shadow': {
-        // Shadow doesn't contribute to layout size — it overflows
+      case 'shadow':
         return { w: 0, h: 0 };
-      }
       case 'path': {
         const d = node.name || node.attrs.d || '';
         const bbox = this._pathBBox(d);
-        return { w: bbox.maxX - bbox.minX, h: bbox.maxY - bbox.minY };
+        return { w: bbox.maxX - bbox.minX + mw, h: bbox.maxY - bbox.minY + mh };
       }
       case 'text-editor': {
-        const w = this._numAttr(node, 'w', 400);
-        const h = this._numAttr(node, 'h', 300);
-        return { w, h };
+        const w = this._evalDim(node, 'w', 400, this._width) || 400;
+        const h = this._evalDim(node, 'h', 300, this._height) || 300;
+        return { w: w + mw, h: h + mh };
       }
       default: {
-        const h = this._elementHandlers.get(node.type);
-        if (h && h.measure) return h.measure(node, this);
+        const handler = this._elementHandlers.get(node.type);
+        if (handler && handler.measure) return handler.measure(node, this);
         return { w: 0, h: 0 };
       }
     }

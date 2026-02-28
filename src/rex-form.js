@@ -17,7 +17,7 @@ export class RexForm {
     const v=node.attrs[key];
     if(v===undefined||v===null) return fallback;
     if(typeof v==='object'&&v.expr!==undefined){
-      if(!v._compiled) v._compiled=Rex.compileExpr(v);
+      if(v._compiled===undefined) v._compiled=Rex.compileExpr(v)??false;
       if(!this._evalCtx) this._evalCtx=this._makeFormEvalContext();
       const r=Rex.evalExpr(v._compiled,this._evalCtx);
       return r!==undefined?r:fallback;

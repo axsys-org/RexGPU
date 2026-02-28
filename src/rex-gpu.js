@@ -683,7 +683,7 @@ export class RexGPU {
         const initBuf = new Float32Array(size / 4);
         const keys = Object.keys(dataNode.attrs);
         for (let ki = 0; ki < keys.length; ki++) {
-          const v = Rex.evalExpr(Rex.compileExpr(dataNode.attrs[keys[ki]]), {});
+          const v = Rex.evalExpr(Rex.compileExpr(dataNode.attrs[keys[ki]]), { resolve: () => 0 });
           if (typeof v === 'number') initBuf[ki] = v;
         }
         this.device.queue.writeBuffer(gpuBuf, 0, initBuf);

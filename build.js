@@ -14,10 +14,18 @@ const SRC_FILES = [
   'rex-form',
   'rex-behaviour',
   'rex-pcn',
+  'rex-audio',
+  'rex-fiber',
   'plan-bridge',
   'tab-manager',
   'claude-api',
   'main',
+];
+
+// Standalone worklet files — copied verbatim to dist/ (loaded via addModule)
+const WORKLET_FILES = [
+  'synth-processor',
+  'derive-worker',
 ];
 
 function resolveFile(name) {
@@ -60,6 +68,16 @@ function build() {
   const outPath = path.join(DIST, 'rexgpu.html');
   fs.writeFileSync(outPath, html);
   console.log(`Built ${outPath} (${(Buffer.byteLength(html) / 1024).toFixed(1)} KB)`);
+
+  // Copy worklet files verbatim (AudioWorklet modules must be separate files)
+  for (const name of WORKLET_FILES) {
+    const src = path.join(SRC, name + '.js');
+    const dst = path.join(DIST, name + '.js');
+    if (fs.existsSync(src)) {
+      fs.copyFileSync(src, dst);
+      console.log(`Copied ${name}.js → dist/`);
+    }
+  }
 }
 
 if (process.argv.includes('--watch')) {

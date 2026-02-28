@@ -11,6 +11,7 @@ import { RexPCN } from './rex-pcn.js';
 import { PLANBridge } from './plan-bridge.js';
 import { TabManager } from './tab-manager.js';
 import { callClaude } from './claude-api.js';
+import { RexAudio } from './rex-audio.js';
 
 (async()=>{ try {
   const canvas  = document.getElementById('gpu-canvas');
@@ -98,6 +99,30 @@ import { callClaude } from './claude-api.js';
     } catch(e) { log(`pcn init failed: ${e.message}`, 'err'); pcn = null; }
   }
 
+  // ── Audio transducer ──
+  const audio = new RexAudio(log);
+  window._audio = audio;
+  // AudioContext requires user gesture — init on first interaction
+  let audioInitialized = false;
+  async function ensureAudio() {
+    if (audioInitialized) return;
+    audioInitialized = true;
+    const ok = await audio.init();
+    if (ok) log('audio: ready', 'ok');
+    // Bridge: FFT data → GPU texture (1D, frequencyBinCount wide)
+    audio.onFftData = (fft, wave) => {
+      if (!gpu.device || !gpu._fftTexture) return;
+      gpu.device.queue.writeTexture(
+        { texture: gpu._fftTexture },
+        fft,
+        { bytesPerRow: fft.byteLength },
+        { width: fft.length, height: 1 }
+      );
+    };
+  }
+  document.addEventListener('pointerdown', ensureAudio, { once: true });
+  document.addEventListener('keydown', ensureAudio, { once: true });
+
   // ── Form transducer ──
   const form = new RexForm(formMount);
   form.onFieldChange = (name,val)=>{
@@ -130,9 +155,11 @@ import { callClaude } from './claude-api.js';
   behaviour.getShrubLM = (shrubName) => pcn ? pcn.getShrubLM(shrubName) : null;
   // Bridge: goal-state generator for self-healing recovery
   behaviour.getGoalState = (shrub, slot, target, slots) => pcn ? pcn.findGoalState(shrub, slot, target, slots) : null;
-  // ── Channel bridge: behaviour → GPU heap ──
+  // ── Channel bridge: behaviour → GPU heap + audio params ──
   behaviour.onChannelPush = (buffer, field, value) => {
     gpu.setChannelValue(buffer, field, value);
+    // Also route to audio transducer (pattern name = buffer, param = field)
+    audio.setParam(buffer, field, value);
   };
   // ── Readback bridge: GPU → behaviour ──
   gpu.onReadback = (name, values) => {
@@ -213,6 +240,7 @@ import { callClaude } from './claude-api.js';
         pcn.setDepGraph(depEdges);
       }
       if(surface) surface.compile(currentTree, canvas.width, canvas.height);
+      try { audio.transduce(currentTree, true); } catch(ea){ log(`audio compile: ${ea.message}`,'err'); }
       gpu._structureChanged=true;
       bridge.snapshotForm(form.state);
       bridge.pinTree(src);
@@ -451,6 +479,23 @@ import { callClaude } from './claude-api.js';
         if(surfaceDirty&&surface&&currentTree){
           try{ surface.compile(currentTree, canvas.width, canvas.height); }catch(e5){log(`surface recompile: ${e5.message}`,'err');}
           surfaceDirty=false;
+        }
+        // Audio transducer: tick scheduler + update FFT texture
+        if(audioInitialized){
+          try {
+            // Ensure FFT texture exists on GPU (created once, 1D 1024-wide R8Unorm)
+            if(gpu.device && !gpu._fftTexture){
+              gpu._fftTexture = gpu.device.createTexture({
+                label: 'fft',
+                size: { width: 1024, height: 1 },
+                format: 'r8unorm',
+                usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+              });
+              gpu._fftSampler = gpu.device.createSampler({ magFilter:'linear', minFilter:'linear' });
+              log('audio: FFT texture created (1024×1 r8unorm)', 'ok');
+            }
+            audio.transduce(currentTree, false);
+          } catch(ea){ log(`audio: ${ea.message}`,'err'); }
         }
         // Surface transducer: composite 2D over 3D (or solo)
         if(surface&&surface.active){

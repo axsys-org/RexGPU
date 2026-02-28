@@ -656,7 +656,8 @@ export class RexBehaviour {
       }
       if (!bypassed) {
         const guardResult = this._evalExpr(talk.guard, ctx);
-        if (!guardResult) {
+        // Guards must return boolean/number — strings (e.g. from malformed expressions) fail
+        if (!guardResult || typeof guardResult === 'string') {
           this.log(`behaviour: guard rejected for "${key}"`, 'warn');
           shrub.slots.set(`__lm_bypass_${actionName}`, 0);
           if (this.onTalkFired) {
@@ -940,7 +941,7 @@ export class RexBehaviour {
 
     // Expression object from parser: {expr: "...", rex: ...}
     if (expr && typeof expr === 'object' && expr.expr !== undefined) {
-      if (!expr._compiled) expr._compiled = Rex.compileExpr(expr);
+      if (expr._compiled === undefined) expr._compiled = Rex.compileExpr(expr) ?? false;
       if (expr._compiled) {
         const evalCtx = this._makeBehaviourContext(ctx);
         return Rex.evalExpr(expr._compiled, evalCtx);
