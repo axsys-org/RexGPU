@@ -899,11 +899,118 @@ function colorRex(nestTy, rex) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// INCREMENTAL LEXING — line-level token cache
+// Re-lex only changed lines; fallback on multi-line token boundaries.
+// ═══════════════════════════════════════════════════════════════════
+
+let _lexCache = null; // { lines: string[], lineTokens: Token[][] }
+
+function lexIncremental(src) {
+  if (!_lexCache) {
+    // Cold start — full lex, build line cache
+    const tokens = lex(src);
+    _lexCache = { lines: src.split('\n'), lineTokens: _splitTokensByLine(tokens) };
+    return tokens;
+  }
+
+  const newLines = src.split('\n');
+  const oldLines = _lexCache.lines;
+
+  // Find first differing line (prefix match)
+  let firstChanged = 0;
+  const minLen = Math.min(oldLines.length, newLines.length);
+  while (firstChanged < minLen && oldLines[firstChanged] === newLines[firstChanged]) firstChanged++;
+
+  // Find last differing line (suffix match)
+  let oldEnd = oldLines.length - 1, newEnd = newLines.length - 1;
+  while (oldEnd > firstChanged && newEnd > firstChanged && oldLines[oldEnd] === newLines[newEnd]) {
+    oldEnd--; newEnd--;
+  }
+
+  // No change
+  if (firstChanged >= minLen && oldLines.length === newLines.length) {
+    return _rebuildTokens(_lexCache.lineTokens);
+  }
+
+  // Check if changed region touches multi-line constructs (ugly strings, trad strings)
+  let needsFullLex = false;
+  for (let i = firstChanged; i <= newEnd; i++) {
+    const line = newLines[i];
+    if (line.includes("''") || line.includes('""')) { needsFullLex = true; break; }
+    // Check for unclosed trad string (quote without matching close on same line)
+    let quoteCount = 0;
+    for (let j = 0; j < line.length; j++) if (line[j] === '"') quoteCount++;
+    if (quoteCount % 2 !== 0) { needsFullLex = true; break; }
+  }
+  // Also check old changed lines for multi-line tokens we might be breaking
+  if (!needsFullLex) {
+    for (let i = firstChanged; i <= oldEnd; i++) {
+      const line = oldLines[i];
+      if (line.includes("''") || line.includes('""')) { needsFullLex = true; break; }
+      let quoteCount = 0;
+      for (let j = 0; j < line.length; j++) if (line[j] === '"') quoteCount++;
+      if (quoteCount % 2 !== 0) { needsFullLex = true; break; }
+    }
+  }
+
+  if (needsFullLex) {
+    const tokens = lex(src);
+    _lexCache = { lines: newLines, lineTokens: _splitTokensByLine(tokens) };
+    return tokens;
+  }
+
+  // Re-lex only the changed lines
+  // Append \n so the last changed line gets an EOL token (unless it's the absolute last line)
+  let changedSrc = newLines.slice(firstChanged, newEnd + 1).join('\n');
+  const isLastLine = newEnd >= newLines.length - 1;
+  if (!isLastLine) changedSrc += '\n';
+  const changedTokens = lex(changedSrc);
+  // Remove the trailing EOF from the changed-region lex
+  if (changedTokens.length > 0 && changedTokens[changedTokens.length - 1].ty === T.EOF) {
+    changedTokens.pop();
+  }
+  const newLineTokens = _splitTokensByLine(changedTokens);
+  // If we appended \n, the split produces an extra empty trailing line group — remove it
+  if (!isLastLine && newLineTokens.length > 0 && newLineTokens[newLineTokens.length - 1].length === 0) {
+    newLineTokens.pop();
+  }
+
+  // Splice into cache: replace old lines [firstChanged..oldEnd] with new
+  const oldLineTokens = _lexCache.lineTokens;
+  oldLineTokens.splice(firstChanged, oldEnd - firstChanged + 1, ...newLineTokens);
+  _lexCache.lines = newLines;
+
+  return _rebuildTokens(oldLineTokens);
+}
+
+function _splitTokensByLine(tokens) {
+  const lines = [[]];
+  for (const t of tokens) {
+    if (t.ty === T.EOF) break;
+    lines[lines.length - 1].push(t);
+    if (t.ty === T.EOL) lines.push([]);
+  }
+  return lines;
+}
+
+function _rebuildTokens(lineTokens) {
+  const tokens = [];
+  for (const line of lineTokens) {
+    for (const t of line) tokens.push(t);
+  }
+  tokens.push(tok(T.EOF, '', 0, 0));
+  return tokens;
+}
+
+// Reset incremental cache (e.g., on tab switch)
+function _resetLexCache() { _lexCache = null; }
+
+// ═══════════════════════════════════════════════════════════════════
 // PIPELINE — full 5-stage Rex parsing
 // ═══════════════════════════════════════════════════════════════════
 
 function pipeline(src) {
-  const tokens = lex(src);
+  const tokens = lexIncremental(src);
   nestjoin(tokens);
   const blocks = bsplit(tokens);
   const joined = quipjoin(blocks);
@@ -1864,8 +1971,82 @@ function _foldContext(parent, acc, key, item) {
   };
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// EXPRESSION → WGSL TRANSPILER
+// ═══════════════════════════════════════════════════════════════════
+
+// Maps Rex stdlib fn → WGSL expression template
+// '%0','%1','%2' = arg placeholders
+const _wgslOps = {
+  add: '(%0 + %1)', sub: '(%0 - %1)', mul: '(%0 * %1)',
+  div: '(%0 / %1)', mod: '(%0 % %1)',
+  eq: 'f32(%0 == %1)', neq: 'f32(%0 != %1)',
+  gt: 'f32(%0 > %1)', lt: 'f32(%0 < %1)',
+  gte: 'f32(%0 >= %1)', lte: 'f32(%0 <= %1)',
+  and: 'f32(%0 != 0.0 && %1 != 0.0)', or: 'f32(%0 != 0.0 || %1 != 0.0)',
+  not: 'f32(%0 == 0.0)',
+  sin: 'sin(%0)', cos: 'cos(%0)', tan: 'tan(%0)',
+  asin: 'asin(%0)', acos: 'acos(%0)', atan: 'atan(%0)',
+  atan2: 'atan2(%0, %1)',
+  abs: 'abs(%0)', sign: 'sign(%0)',
+  min: 'min(%0, %1)', max: 'max(%0, %1)',
+  floor: 'floor(%0)', ceil: 'ceil(%0)', round: 'round(%0)',
+  sqrt: 'sqrt(%0)', pow: 'pow(%0, %1)',
+  log: 'log(%0)', log2: 'log2(%0)', exp: 'exp(%0)',
+  fract: 'fract(%0)',
+  step: 'step(%0, %1)',
+  smoothstep: 'smoothstep(%0, %1, %2)',
+  clamp: 'clamp(%0, %1, %2)',
+  lerp: 'mix(%0, %1, %2)', mix: 'mix(%0, %1, %2)',
+  pi: '3.14159265358979',
+  tau: '6.28318530717959',
+  'if': 'select(%2, %1, %0 != 0.0)',
+  'to-num': '%0',
+};
+
+function compileExprToWGSL(node, resolve) {
+  if (!node) return { wgsl: '0.0', viable: false };
+  switch (node.op) {
+    case 'lit': {
+      if (typeof node.value === 'boolean') return { wgsl: node.value ? '1.0' : '0.0', viable: true };
+      if (typeof node.value === 'number') {
+        const s = String(node.value);
+        return { wgsl: s.includes('.') ? s : s + '.0', viable: true };
+      }
+      return { wgsl: '0.0', viable: false }; // string/array literals not viable
+    }
+    case 'slot': {
+      const r = resolve ? resolve('slot', node.path) : null;
+      if (r) return { wgsl: r, viable: true };
+      return { wgsl: '0.0', viable: false };
+    }
+    case 'ident': {
+      const r = resolve ? resolve('ident', node.name) : null;
+      if (r) return { wgsl: r, viable: true };
+      return { wgsl: '0.0', viable: false };
+    }
+    case 'dep': {
+      const r = resolve ? resolve('dep', node.label) : null;
+      if (r) return { wgsl: r, viable: true };
+      return { wgsl: '0.0', viable: false };
+    }
+    case 'call': {
+      const tmpl = _wgslOps[node.fn];
+      if (!tmpl) return { wgsl: '0.0', viable: false };
+      // Zero-arg constants (pi, tau)
+      if (!node.args || node.args.length === 0) return { wgsl: tmpl, viable: true };
+      const args = node.args.map(a => compileExprToWGSL(a, resolve));
+      if (args.some(a => !a.viable)) return { wgsl: '0.0', viable: false };
+      let out = tmpl;
+      for (let i = 0; i < args.length; i++) out = out.split('%' + i).join(args[i].wgsl);
+      return { wgsl: out, viable: true };
+    }
+    default: return { wgsl: '0.0', viable: false };
+  }
+}
+
 // ── Extensible content-type set ──
-const _contentTypes = new Set(['shader','wgsl','code','kernel','lib','text-editor']);
+const _contentTypes = new Set(['shader','wgsl','code','kernel','lib','text-editor','filter']);
 
 export const Rex = {
   // ── Canonical Rex ──
@@ -1875,10 +2056,11 @@ export const Rex = {
   printNodes: prNodes,
   Word, Quip, Trad, Slug, Ugly, Heir, TightPre, TightInf, NestPre, NestInf, Block, BK,
   // ── Compiled expressions ──
-  compileExpr, evalExpr, collectSlotRefs, collectDepRefs,
+  compileExpr, evalExpr, compileExprToWGSL, collectSlotRefs, collectDepRefs,
   // ── Content-type registration ──
   registerContentType(t) { _contentTypes.add(t); },
   unregisterContentType(t) { _contentTypes.delete(t); },
+  resetLexCache: _resetLexCache,
   // ── Shrub ↔ Rex roundtrip ──
   fromShrub, printShrub,
 

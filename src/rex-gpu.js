@@ -64,6 +64,20 @@ export class RexGPU {
     this._barrierSchedule = [];
     this._aliasingPlan = [];
     this._heapInfo = '';
+    this._barrierViolations = 0;
+    this._opticAccessMap = new Map();  // bufferName/fieldName → [{passIndex, access, stage}]
+
+    // ── Readback enhancements ──
+    this._readbackPrevValues = new Map();
+
+    // ── Hot shader patching ──
+    this._filterParamClassification = new Map();
+    this._pipelineOverrides = new Map();
+    this._prevFilterParams = new Map();
+
+    // ── Incremental recompilation ──
+    this._prevTree = null;
+    this._prevHeapLayout = null;
 
     // ── GPU feature detection ──
     this._features = new Set();
@@ -97,6 +111,13 @@ export class RexGPU {
     // ── Mipmap generation pipeline (lazy) ──
     this._mipPipeline = null;
     this._mipSampler = null;
+
+    // ── Derive compute (GPU-side @derive evaluation) ──
+    this._deriveComputePipeline = null;
+    this._deriveStorageBuffer = null;
+    this._deriveBindGroup = null;
+    this._deriveFieldCount = 0;
+    this._deriveFields = [];   // [{name, wgslField}] — maps field index → derive name
   }
 
   registerCompileType(typeName, handler) { this._compileHandlers.set(typeName, handler); }
@@ -104,6 +125,185 @@ export class RexGPU {
   registerResourceType(typeName, handler) { this._resourceHandlers.set(typeName, handler); }
   registerInputKey(code) { this._inputKeys.add(code); }
   registerKeyBinding(code, axis, value) { this._inputKeys.add(code); this._keyBindings.set(code, {axis, value}); }
+  registerFilterType(name, def) { this._filterLibrary.set(name, def); }
+
+  // ════════════════════════════════════════════════════════════════
+  // BUILT-IN FILTER LIBRARY — pixel-level FX templates
+  // Each entry: { wgsl, params, passes, needsNeighbors }
+  //   wgsl: pixel body injected into compute template (has `color`, `uv`, `px`, `dims`, `src`)
+  //   params: { name: defaultValue } → injected as WGSL `const PARAM_name`
+  //   passes: number of passes (default 1; blur = 2 for separable H+V)
+  //   needsNeighbors: if true, src is texture_2d for textureLoad neighbor access
+  // ════════════════════════════════════════════════════════════════
+
+  _filterLibrary = new Map([
+    ['grayscale', {
+      wgsl: `let lum = dot(color.rgb, vec3f(0.2126, 0.7152, 0.0722));
+  color = vec4f(vec3f(lum), color.a);`,
+      params: {}, passes: 1, needsNeighbors: false,
+    }],
+    ['sepia', {
+      wgsl: `let lum = dot(color.rgb, vec3f(0.2126, 0.7152, 0.0722));
+  let sep = vec3f(lum * 1.2, lum * 1.0, lum * 0.8);
+  color = vec4f(mix(color.rgb, sep, PARAM_intensity), color.a);`,
+      params: { intensity: 1.0 }, passes: 1, needsNeighbors: false,
+    }],
+    ['invert', {
+      wgsl: `color = vec4f(1.0 - color.rgb, color.a);`,
+      params: {}, passes: 1, needsNeighbors: false,
+    }],
+    ['brightness', {
+      wgsl: `color = vec4f(color.rgb * PARAM_amount, color.a);`,
+      params: { amount: 1.2 }, passes: 1, needsNeighbors: false,
+    }],
+    ['contrast', {
+      wgsl: `color = vec4f((color.rgb - 0.5) * PARAM_amount + 0.5, color.a);`,
+      params: { amount: 1.5 }, passes: 1, needsNeighbors: false,
+    }],
+    ['saturate', {
+      wgsl: `let sat_lum = dot(color.rgb, vec3f(0.2126, 0.7152, 0.0722));
+  color = vec4f(mix(vec3f(sat_lum), color.rgb, PARAM_amount), color.a);`,
+      params: { amount: 1.5 }, passes: 1, needsNeighbors: false,
+    }],
+    ['hue-rotate', {
+      wgsl: `let hr_rad = PARAM_angle * 3.14159265 / 180.0;
+  let hr_cos = cos(hr_rad); let hr_sin = sin(hr_rad);
+  let hr_mat = mat3x3f(
+    0.213 + 0.787*hr_cos - 0.213*hr_sin, 0.213 - 0.213*hr_cos + 0.143*hr_sin, 0.213 - 0.213*hr_cos - 0.787*hr_sin,
+    0.715 - 0.715*hr_cos - 0.715*hr_sin, 0.715 + 0.285*hr_cos + 0.140*hr_sin, 0.715 - 0.715*hr_cos + 0.715*hr_sin,
+    0.072 - 0.072*hr_cos + 0.928*hr_sin, 0.072 - 0.072*hr_cos - 0.283*hr_sin, 0.072 + 0.928*hr_cos + 0.072*hr_sin
+  );
+  color = vec4f(hr_mat * color.rgb, color.a);`,
+      params: { angle: 90.0 }, passes: 1, needsNeighbors: false,
+    }],
+    ['threshold', {
+      wgsl: `let thr_lum = dot(color.rgb, vec3f(0.2126, 0.7152, 0.0722));
+  let thr_v = select(0.0, 1.0, thr_lum >= PARAM_level);
+  color = vec4f(vec3f(thr_v), color.a);`,
+      params: { level: 0.5 }, passes: 1, needsNeighbors: false,
+    }],
+    ['posterize', {
+      wgsl: `color = vec4f(floor(color.rgb * PARAM_levels + 0.5) / PARAM_levels, color.a);`,
+      params: { levels: 4.0 }, passes: 1, needsNeighbors: false,
+    }],
+    ['color-matrix', {
+      wgsl: `let cm = mat4x4f(
+    PARAM_m0, PARAM_m1, PARAM_m2, PARAM_m3,
+    PARAM_m4, PARAM_m5, PARAM_m6, PARAM_m7,
+    PARAM_m8, PARAM_m9, PARAM_m10, PARAM_m11,
+    PARAM_m12, PARAM_m13, PARAM_m14, PARAM_m15
+  );
+  color = cm * color;`,
+      params: { m0:1,m1:0,m2:0,m3:0, m4:0,m5:1,m6:0,m7:0, m8:0,m9:0,m10:1,m11:0, m12:0,m13:0,m14:0,m15:1 },
+      passes: 1, needsNeighbors: false,
+    }],
+    ['blur', {
+      // Separable Gaussian: pass 0 = horizontal, pass 1 = vertical
+      wgslH: `var blur_acc = vec4f(0.0);
+  var blur_wt = 0.0;
+  let blur_r = i32(PARAM_radius);
+  for (var bx = -blur_r; bx <= blur_r; bx++) {
+    let sp = vec2i(i32(px.x) + bx, i32(px.y));
+    if (sp.x >= 0 && sp.x < i32(dims.x)) {
+      let w = exp(-f32(bx*bx) / (2.0 * PARAM_radius * PARAM_radius / 4.0));
+      blur_acc += textureLoad(src, sp, 0) * w;
+      blur_wt += w;
+    }
+  }
+  color = blur_acc / blur_wt;`,
+      wgslV: `var blur_acc = vec4f(0.0);
+  var blur_wt = 0.0;
+  let blur_r = i32(PARAM_radius);
+  for (var by = -blur_r; by <= blur_r; by++) {
+    let sp = vec2i(i32(px.x), i32(px.y) + by);
+    if (sp.y >= 0 && sp.y < i32(dims.y)) {
+      let w = exp(-f32(by*by) / (2.0 * PARAM_radius * PARAM_radius / 4.0));
+      blur_acc += textureLoad(src, sp, 0) * w;
+      blur_wt += w;
+    }
+  }
+  color = blur_acc / blur_wt;`,
+      params: { radius: 5.0 }, passes: 2, needsNeighbors: true,
+    }],
+    ['sharpen', {
+      wgsl: `let sc = textureLoad(src, vec2i(px), 0);
+  let sl = textureLoad(src, vec2i(i32(px.x)-1, i32(px.y)), 0);
+  let sr = textureLoad(src, vec2i(i32(px.x)+1, i32(px.y)), 0);
+  let su = textureLoad(src, vec2i(i32(px.x), i32(px.y)-1), 0);
+  let sd = textureLoad(src, vec2i(i32(px.x), i32(px.y)+1), 0);
+  let unsharp = sc * (1.0 + 4.0 * PARAM_amount) - (sl + sr + su + sd) * PARAM_amount;
+  color = vec4f(clamp(unsharp.rgb, vec3f(0.0), vec3f(1.0)), sc.a);`,
+      params: { amount: 1.0 }, passes: 1, needsNeighbors: true,
+    }],
+    ['edge-detect', {
+      wgsl: `let ec = textureLoad(src, vec2i(px), 0).rgb;
+  let el = textureLoad(src, vec2i(i32(px.x)-1, i32(px.y)), 0).rgb;
+  let er = textureLoad(src, vec2i(i32(px.x)+1, i32(px.y)), 0).rgb;
+  let eu = textureLoad(src, vec2i(i32(px.x), i32(px.y)-1), 0).rgb;
+  let ed = textureLoad(src, vec2i(i32(px.x), i32(px.y)+1), 0).rgb;
+  let gx = er - el;
+  let gy = ed - eu;
+  let edge = sqrt(gx * gx + gy * gy);
+  color = vec4f(clamp(edge, vec3f(0.0), vec3f(1.0)), 1.0);`,
+      params: {}, passes: 1, needsNeighbors: true,
+    }],
+    ['pixelate', {
+      wgsl: `let pxl_sz = max(PARAM_size, 1.0);
+  let block = floor(vec2f(px) / pxl_sz) * pxl_sz + pxl_sz * 0.5;
+  color = textureSampleLevel(src, filter_samp, block / dims, 0.0);`,
+      params: { size: 8.0 }, passes: 1, needsNeighbors: false,
+    }],
+    ['noise', {
+      wgsl: `let nf = fract(sin(dot(vec2f(px) + PARAM_seed, vec2f(12.9898, 78.233))) * 43758.5453);
+  color = vec4f(color.rgb + (nf - 0.5) * PARAM_amount, color.a);`,
+      params: { amount: 0.1, seed: 0.0 }, passes: 1, needsNeighbors: false,
+    }],
+    ['vignette', {
+      wgsl: `let vig_d = distance(uv, vec2f(0.5));
+  let vig_f = smoothstep(PARAM_radius, PARAM_radius - PARAM_softness, vig_d);
+  color = vec4f(color.rgb * vig_f, color.a);`,
+      params: { radius: 0.75, softness: 0.4 }, passes: 1, needsNeighbors: false,
+    }],
+    ['bloom', {
+      // Single-pass bloom: threshold extract + 2D box blur (5x5) + additive blend with original
+      wgsl: `let orig = color;
+  var bl_acc = vec4f(0.0); var bl_wt = 0.0;
+  let bl_r = 4;
+  for (var by = -bl_r; by <= bl_r; by++) {
+    for (var bx = -bl_r; bx <= bl_r; bx++) {
+      let sp = vec2i(i32(px.x) + bx, i32(px.y) + by);
+      if (sp.x >= 0 && sp.x < i32(dims.x) && sp.y >= 0 && sp.y < i32(dims.y)) {
+        let s = textureLoad(src, sp, 0);
+        let sl = dot(s.rgb, vec3f(0.2126, 0.7152, 0.0722));
+        let bright = s * step(PARAM_threshold, sl);
+        let w = exp(-f32(bx*bx + by*by) / 8.0);
+        bl_acc += bright * w;
+        bl_wt += w;
+      }
+    }
+  }
+  color = orig + bl_acc / max(bl_wt, 1.0) * PARAM_intensity;`,
+      params: { threshold: 0.8, intensity: 0.5 }, passes: 1, needsNeighbors: true,
+    }],
+    ['chromatic-aberration', {
+      wgsl: `let ca_dir = (uv - 0.5) * PARAM_offset / dims;
+  let ca_r = textureSampleLevel(src, filter_samp, uv + ca_dir, 0.0).r;
+  let ca_g = color.g;
+  let ca_b = textureSampleLevel(src, filter_samp, uv - ca_dir, 0.0).b;
+  color = vec4f(ca_r, ca_g, ca_b, color.a);`,
+      params: { offset: 3.0 }, passes: 1, needsNeighbors: false,
+    }],
+    ['color-balance', {
+      wgsl: `let cb_lum = dot(color.rgb, vec3f(0.2126, 0.7152, 0.0722));
+  let cb_shadows = clamp(1.0 - cb_lum * 2.0, 0.0, 1.0);
+  let cb_highlights = clamp(cb_lum * 2.0 - 1.0, 0.0, 1.0);
+  let cb_midtones = 1.0 - cb_shadows - cb_highlights;
+  color = vec4f(color.rgb + vec3f(PARAM_sr, PARAM_sg, PARAM_sb) * cb_shadows
+    + vec3f(PARAM_mr, PARAM_mg, PARAM_mb) * cb_midtones
+    + vec3f(PARAM_hr, PARAM_hg, PARAM_hb) * cb_highlights, color.a);`,
+      params: { sr:0,sg:0,sb:0, mr:0,mg:0,mb:0, hr:0,hg:0,hb:0 }, passes: 1, needsNeighbors: false,
+    }],
+  ]);
 
   async init() {
     if (!navigator.gpu) { this.log('WebGPU not available','err'); return false; }
@@ -240,7 +440,24 @@ export class RexGPU {
   }
 
   transduce(tree, structureChanged) {
-    if (structureChanged) this._compile(tree);
+    if (structureChanged) {
+      // Try hot patch first (filter param override changes only)
+      if (this._tryHotPatchFilters(tree)) {
+        // Hot patch succeeded — skip full compile
+      } else if (this._prevTree) {
+        // Try incremental recompilation
+        const changes = this._diffShrub(this._prevTree, tree);
+        const phases = this._mapChangesToPhases(changes);
+        if (phases.size > 0 && this._canIncrementalCompile(phases)) {
+          this._incrementalCompile(tree, phases);
+        } else {
+          this._compile(tree);
+        }
+      } else {
+        this._compile(tree);
+      }
+      this._prevTree = JSON.parse(JSON.stringify(tree));
+    }
     this._execute();
     this.frameCount++;
   }
@@ -285,6 +502,15 @@ export class RexGPU {
     // Mipmap pipeline
     this._mipPipeline = null;
     this._mipSampler = null;
+    // Spec v1.1 state
+    this._opticAccessMap.clear();
+    this._readbackPrevValues.clear();
+    this._filterParamClassification.clear();
+    this._pipelineOverrides.clear();
+    this._prevFilterParams.clear();
+    this._prevTree = null;
+    this._prevHeapLayout = null;
+    this._barrierViolations = 0;
   }
 
   // ════════════════════════════════════════════════════════════════
@@ -304,6 +530,12 @@ export class RexGPU {
     // 1. Structs
     this._compileStructs(tree);
 
+    // 1.1. Unified heap notation — @heap nodes → synthetic structs + buffers
+    this._compileHeap(tree);
+
+    // 1.5. Filters — expand @filter nodes into synthetic textures/shaders/pipelines/dispatches
+    this._compileFilters(tree);
+
     // 2. Shaders (resolve #import for structs AND libs, auto-inject WGSL enables)
     this._compileShaders(tree);
 
@@ -313,8 +545,12 @@ export class RexGPU {
     // 4. Optics
     this._compileOptics(tree);
 
+    // 4.5. Heap compaction — liveness analysis + dead optic elimination
+    this._compactHeap();
+
     // 5. Allocate heap
     this._allocateHeap(tree);
+    this._prevHeapLayout = new Map(this._heapLayout);
 
     // 6. Storage buffers
     this._compileStorageBuffers(tree);
@@ -343,6 +579,12 @@ export class RexGPU {
     // 12. Command list (stencil, MSAA, bundles, indirect dispatch, queries)
     this._compileCommandList(tree);
 
+    // 12.5. Optic access annotation — track per-pass read/write on resources
+    this._annotateOpticAccesses();
+
+    // 12.6. Derive barriers from optic access patterns
+    this._deriveBarriersFromOptics();
+
     // 13. Write defaults
     this._writeDefaults();
 
@@ -365,16 +607,41 @@ export class RexGPU {
     // Destroy old staging buffers
     for (const rb of this._readbacks) { if (rb.staging) rb.staging.destroy(); }
     this._readbacks = [];
+    this._readbackPrevValues.clear();
     for (const node of Rex.findAll(tree, 'readback')) {
-      const from = node.attrs.from;    // buffer name
-      const offset = +(node.attrs.offset || 0);
-      const count = +(node.attrs.count || 1);   // number of f32s to read
-      const size = count * 4;
-      const srcBuf = this._storageBuffers.get(from);
-      if (!srcBuf) { this.log(`readback "${node.name||'?'}": buffer "${from}" not found`, 'err'); continue; }
-      const staging = this.device.createBuffer({ size, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
-      this._readbacks.push({ name: node.name || from, srcBuffer: srcBuf, srcOffset: offset, size, staging, pending: false });
-      this.log(`readback: "${node.name||from}" ${count} floats from "${from}"+${offset}`, 'ok');
+      const path = node.attrs.path;
+      if (path) {
+        // Optic-driven readback: resolve path through optic table
+        const resolved = this._resolveOpticPath(path);
+        if (!resolved) { this.log(`readback "${node.name||'?'}": path "${path}" not resolved`, 'err'); continue; }
+        const srcBuf = resolved.isHeap ? this._heapBuffer : this._storageBuffers.get(resolved.buffer);
+        if (!srcBuf) { this.log(`readback "${node.name||'?'}": buffer "${resolved.buffer}" not found`, 'err'); continue; }
+        const staging = this.device.createBuffer({ size: resolved.size, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+        const mode = node.attrs['on-change'] ? 'on-change' : node.attrs.every ? 'every' : 'one-shot';
+        this._readbacks.push({
+          name: node.name || path, srcBuffer: srcBuf, srcOffset: resolved.offset,
+          size: resolved.size, staging, pending: false,
+          path, structLayout: resolved.structLayout, type: resolved.type, mode,
+          every: +(node.attrs.every || 1), lastReadFrame: -Infinity,
+          toSlot: node.attrs.to || null, isHeapBuffer: resolved.isHeap,
+        });
+        this.log(`readback: "${node.name||path}" via optic path "${path}" (${mode})`, 'ok');
+      } else {
+        // Legacy raw byte range readback
+        const from = node.attrs.from;
+        const offset = +(node.attrs.offset || 0);
+        const count = +(node.attrs.count || 1);
+        const size = count * 4;
+        const srcBuf = this._storageBuffers.get(from);
+        if (!srcBuf) { this.log(`readback "${node.name||'?'}": buffer "${from}" not found`, 'err'); continue; }
+        const staging = this.device.createBuffer({ size, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+        this._readbacks.push({
+          name: node.name || from, srcBuffer: srcBuf, srcOffset: offset, size, staging, pending: false,
+          path: null, structLayout: null, type: null, mode: 'one-shot',
+          every: 1, lastReadFrame: -Infinity, toSlot: null, isHeapBuffer: false,
+        });
+        this.log(`readback: "${node.name||from}" ${count} floats from "${from}"+${offset}`, 'ok');
+      }
     }
   }
 
@@ -506,6 +773,380 @@ export class RexGPU {
       this._wgslStructs.set(s.name, wgsl);
       this.log(`struct ${s.name}: ${size}B [${layout.map(l=>`${l.name}@${l.offset}`).join(', ')}]`,'cmd');
     }
+  }
+
+  // ════════════════════════════════════════════════════════════════
+  // HOT SHADER PATCHING — pipeline-overridable constants (Spec §5)
+  // ════════════════════════════════════════════════════════════════
+
+  _classifyFilterParam(filterName, paramName, value, nodeAttrs) {
+    const attrVal = nodeAttrs[paramName];
+    // Expression → per-frame uniform (future: uniform buffer path)
+    if (attrVal && typeof attrVal === 'object' && attrVal.expr) return 'uniform';
+    // Literal matching builtin default → compile-time const
+    const builtin = this._filterLibrary.get(filterName);
+    if (builtin && builtin.params && builtin.params[paramName] === value) return 'const';
+    // Literal differing from default → pipeline override
+    return 'override';
+  }
+
+  _tryHotPatchFilters(tree) {
+    if (this._prevFilterParams.size === 0) return false;
+    const filters = Rex.findAll(tree, 'filter');
+    if (filters.length === 0) return false;
+
+    let canHotPatch = true;
+    const patchOps = []; // [{pipelineKey, newOverrides}]
+
+    for (let fi = 0; fi < filters.length; fi++) {
+      const f = filters[fi];
+      const filterName = f.name || f.attrs.type || `filter_${fi}`;
+      const prevParams = this._prevFilterParams.get(filterName);
+      if (!prevParams) { canHotPatch = false; break; }
+
+      const builtin = this._filterLibrary.get(filterName);
+      const params = { ...(builtin?.params || {}) };
+      // Override from attrs
+      for (const [k, v] of Object.entries(f.attrs)) {
+        if (k !== 'src' && k !== 'out' && k !== 'type' && k !== 'matrix' && k in params) {
+          params[k] = typeof v === 'number' ? v : +v;
+        }
+      }
+
+      // Check what changed
+      const classifications = this._filterParamClassification.get(filterName);
+      if (!classifications) { canHotPatch = false; break; }
+
+      let hasNonOverrideChange = false;
+      let hasOverrideChange = false;
+      for (const [k, v] of Object.entries(params)) {
+        if (prevParams[k] !== v) {
+          const cls = classifications.get(k);
+          if (cls === 'override') {
+            hasOverrideChange = true;
+          } else {
+            hasNonOverrideChange = true;
+            break;
+          }
+        }
+      }
+      if (hasNonOverrideChange) { canHotPatch = false; break; }
+
+      if (hasOverrideChange) {
+        // Find all pipeline keys for this filter's passes
+        const passes = builtin?.passes || 1;
+        for (let pass = 0; pass < passes; pass++) {
+          const pfx = `_filter_${fi}_${pass}`;
+          const pipeKey = `${pfx}_pipe`;
+          const newOverrides = {};
+          for (const [k, v] of Object.entries(params)) {
+            if (classifications.get(k) === 'override') {
+              newOverrides[`PARAM_${k}`] = Number(v);
+            }
+          }
+          patchOps.push({ pipelineKey: pipeKey, newOverrides });
+        }
+        this._prevFilterParams.set(filterName, { ...params });
+      }
+    }
+
+    if (!canHotPatch || patchOps.length === 0) return false;
+
+    // Apply hot patches — recreate pipelines with new constants
+    for (const op of patchOps) {
+      const pe = this.pipelines.get(op.pipelineKey);
+      if (!pe || pe.type !== 'compute') continue;
+      const mod = this.shaderModules.get(pe.shaderKey);
+      if (!mod) continue;
+      const resScope = pe.resourceScope ? this._resourceScopes?.get(pe.resourceScope) : null;
+      const layout = resScope
+        ? this.device.createPipelineLayout({ bindGroupLayouts: [resScope.layout] })
+        : 'auto';
+      const newPipeline = this.device.createComputePipeline({
+        layout, compute: { module: mod, entryPoint: 'main', constants: op.newOverrides },
+      });
+      pe.pipeline = newPipeline;
+      pe.overrides = { ...op.newOverrides };
+      this.log(`hot-patch: ${op.pipelineKey} overrides updated`, 'ok');
+    }
+    return true;
+  }
+
+  // ════════════════════════════════════════════════════════════════
+  // FILTER EXPANSION — @filter nodes → synthetic textures/shaders/pipelines/dispatches
+  // ════════════════════════════════════════════════════════════════
+
+  _compileFilters(tree) {
+    const filters = Rex.findAll(tree, 'filter');
+    if (!filters.length) return;
+
+    const filterOutputs = new Map();
+    const batches = this._buildFusionBatches(filters, tree);
+    let filterIdx = 0;
+    let fusedBatches = 0;
+
+    for (const batch of batches) {
+      if (batch.fusible && batch.filters.length > 1) {
+        this._emitFusedShader(batch, filterIdx, tree, filterOutputs);
+        fusedBatches++;
+        filterIdx += batch.filters.length;
+      } else {
+        for (const f of batch.filters) {
+          this._emitSingleFilter(f, filterIdx, tree, filterOutputs);
+          filterIdx++;
+        }
+      }
+    }
+
+    this.log(`filters: ${filterIdx} expanded${fusedBatches > 0 ? ` (${fusedBatches} fused batches)` : ''}`, 'ok');
+  }
+
+  _buildFusionBatches(filters, tree) {
+    const batches = [];
+    let currentBatch = { filters: [], fusible: true, srcName: null, texW: 0, texH: 0 };
+
+    for (const f of filters) {
+      const filterName = f.name || f.attrs.type;
+      const srcName = f.attrs.src;
+      if (!srcName) { batches.push({ filters: [f], fusible: false }); continue; }
+
+      const builtin = this._filterLibrary.get(filterName);
+      const customCode = f.content?.trim();
+      const needsNeighbors = builtin?.needsNeighbors || (customCode && /textureLoad\s*\(\s*src/.test(customCode));
+      const multiPass = (builtin?.passes || 1) > 1;
+      const hasExternalOut = f.attrs.out != null;
+
+      // Resolve texture dimensions
+      const srcTex = Rex.findAll(tree, 'texture').find(t => t.name === srcName);
+      const texW = srcTex?.attrs?.width || 512;
+      const texH = srcTex?.attrs?.height || 512;
+
+      const canFuse = !needsNeighbors && !multiPass && !hasExternalOut;
+
+      if (canFuse && currentBatch.filters.length > 0 && currentBatch.fusible) {
+        // Check same source chain and dimensions
+        const firstSrc = currentBatch.srcName;
+        if (srcName === firstSrc && texW === currentBatch.texW && texH === currentBatch.texH) {
+          currentBatch.filters.push(f);
+          continue;
+        }
+      }
+
+      // Close current batch and start new
+      if (currentBatch.filters.length > 0) batches.push(currentBatch);
+      currentBatch = { filters: [f], fusible: canFuse, srcName, texW, texH };
+    }
+    if (currentBatch.filters.length > 0) batches.push(currentBatch);
+    return batches;
+  }
+
+  _emitFusedShader(batch, filterIdxBase, tree, filterOutputs) {
+    const texFmt = 'rgba8unorm';
+    const srcName = batch.srcName;
+    const effectiveSrc = filterOutputs.get(srcName) || srcName;
+    const pfx = `_fused_${filterIdxBase}`;
+    const dstName = `${pfx}_out`;
+
+    // Collect all pixel bodies and params with namespaced prefixes
+    const allParamDecls = [];
+    const allOverrides = {};
+    const allBodies = [];
+
+    for (let i = 0; i < batch.filters.length; i++) {
+      const f = batch.filters[i];
+      const filterName = f.name || f.attrs.type || `filter_${filterIdxBase + i}`;
+      const builtin = this._filterLibrary.get(filterName);
+      const customCode = f.content?.trim();
+
+      // Resolve params
+      const params = { ...(builtin?.params || {}) };
+      if (builtin) {
+        if (filterName === 'color-matrix' && f.attrs.matrix && Array.isArray(f.attrs.matrix)) {
+          const m = f.attrs.matrix;
+          for (let j = 0; j < 16; j++) params[`m${j}`] = +(m[j] ?? (j % 5 === 0 ? 1 : 0));
+        }
+        for (const [k, v] of Object.entries(f.attrs)) {
+          if (k !== 'src' && k !== 'out' && k !== 'type' && k !== 'matrix' && k in params) {
+            params[k] = typeof v === 'number' ? v : +v;
+          }
+        }
+      }
+
+      // Classify params and emit with namespaced prefix
+      const classifications = new Map();
+      for (const [k, v] of Object.entries(params)) {
+        const cls = this._classifyFilterParam(filterName, k, v, f.attrs);
+        classifications.set(k, cls);
+        const nsKey = `PARAM_${filterName}_${k}`;
+        if (cls === 'override') {
+          allParamDecls.push(`override ${nsKey}: f32 = ${Number(v).toFixed(6)};`);
+          allOverrides[nsKey] = Number(v);
+        } else {
+          allParamDecls.push(`const ${nsKey}: f32 = ${Number(v).toFixed(6)};`);
+        }
+      }
+      this._filterParamClassification.set(filterName, classifications);
+      this._prevFilterParams.set(filterName, { ...params });
+
+      // Get pixel body and rewrite PARAM_ references to namespaced versions
+      let pixelBody = customCode || builtin.wgsl;
+      // Rewrite PARAM_xyz → PARAM_filterName_xyz for params that belong to this filter
+      for (const k of Object.keys(params)) {
+        pixelBody = pixelBody.replace(new RegExp(`PARAM_${k}\\b`, 'g'), `PARAM_${filterName}_${k}`);
+      }
+
+      allBodies.push(`  // ── ${filterName} ──\n  ${pixelBody}`);
+    }
+
+    // Build fused shader
+    const shaderCode = `@group(0) @binding(0) var filter_samp: sampler;
+@group(0) @binding(1) var src: texture_2d<f32>;
+@group(0) @binding(2) var dst: texture_storage_2d<${texFmt}, write>;
+
+${allParamDecls.join('\n')}
+
+@compute @workgroup_size(8, 8)
+fn main(@builtin(global_invocation_id) gid: vec3u) {
+  let dims = vec2f(textureDimensions(src));
+  let px = gid.xy;
+  if (px.x >= u32(dims.x) || px.y >= u32(dims.y)) { return; }
+  let uv = (vec2f(px) + 0.5) / dims;
+  var color = textureSampleLevel(src, filter_samp, uv, 0.0);
+
+${allBodies.join('\n\n')}
+
+  textureStore(dst, px, color);
+}`;
+
+    // Inject ONE set of synthetic nodes
+    const existingTex = Rex.findAll(tree, 'texture').find(t => t.name === dstName);
+    if (!existingTex) {
+      tree.children.push({ type: 'texture', name: dstName, attrs: { width: batch.texW, height: batch.texH, format: texFmt, storage: true }, children: [], content: null, _d: 1 });
+    }
+    tree.children.push({ type: 'shader', name: pfx, attrs: {}, children: [], content: shaderCode, _d: 1 });
+    tree.children.push({ type: 'resources', name: `${pfx}_res`, attrs: {}, children: [
+      { type: 'texture', name: effectiveSrc, attrs: {}, children: [], content: null, _d: 2 },
+      { type: 'texture', name: dstName, attrs: { storage: true, format: texFmt }, children: [], content: null, _d: 2 },
+    ], content: null, _d: 1 });
+    tree.children.push({ type: 'pipeline', name: `${pfx}_pipe`, attrs: {
+      compute: pfx, resources: `${pfx}_res`,
+      _overrides: Object.keys(allOverrides).length > 0 ? allOverrides : undefined,
+    }, children: [], content: null, _d: 1 });
+    tree.children.push({ type: 'dispatch', name: null, attrs: {
+      pipeline: `${pfx}_pipe`, grid: [Math.ceil(batch.texW / 8), Math.ceil(batch.texH / 8), 1],
+    }, children: [], content: null, _d: 1 });
+
+    // Track output for chaining
+    filterOutputs.set(srcName, dstName);
+    this.log(`fused: ${batch.filters.length} filters → ${pfx} (${effectiveSrc} → ${dstName})`, 'ok');
+  }
+
+  _emitSingleFilter(f, filterIdx, tree, filterOutputs) {
+    const filterName = f.name || f.attrs.type || `filter_${filterIdx}`;
+    const srcName = f.attrs.src;
+    if (!srcName) { this.log(`filter "${filterName}": missing :src attribute`, 'err'); return; }
+
+    const effectiveSrc = filterOutputs.get(srcName) || srcName;
+    const srcTex = Rex.findAll(tree, 'texture').find(t => t.name === srcName) ||
+                   Rex.findAll(tree, 'texture').find(t => t.name === effectiveSrc);
+    const texW = srcTex?.attrs?.width || 512;
+    const texH = srcTex?.attrs?.height || 512;
+    const texFmt = 'rgba8unorm';
+
+    const builtin = this._filterLibrary.get(filterName);
+    const customCode = f.content?.trim();
+    if (!builtin && !customCode) { this.log(`filter "${filterName}": unknown filter and no custom code`, 'err'); return; }
+
+    const outName = f.attrs.out || null;
+    const passes = builtin?.passes || 1;
+
+    const params = { ...(builtin?.params || {}) };
+    if (builtin) {
+      if (filterName === 'color-matrix' && f.attrs.matrix && Array.isArray(f.attrs.matrix)) {
+        const m = f.attrs.matrix;
+        for (let i = 0; i < 16; i++) params[`m${i}`] = +(m[i] ?? (i % 5 === 0 ? 1 : 0));
+      }
+      for (const [k, v] of Object.entries(f.attrs)) {
+        if (k !== 'src' && k !== 'out' && k !== 'type' && k !== 'matrix' && k in params) {
+          params[k] = typeof v === 'number' ? v : +v;
+        }
+      }
+    }
+
+    // Classify and generate WGSL declarations for params (hot shader patching)
+    const classifications = new Map();
+    const paramDecls = [];
+    const overrides = {};
+    for (const [k, v] of Object.entries(params)) {
+      const cls = this._classifyFilterParam(filterName, k, v, f.attrs);
+      classifications.set(k, cls);
+      if (cls === 'override') {
+        paramDecls.push(`override PARAM_${k}: f32 = ${Number(v).toFixed(6)};`);
+        overrides[`PARAM_${k}`] = Number(v);
+      } else {
+        paramDecls.push(`const PARAM_${k}: f32 = ${Number(v).toFixed(6)};`);
+      }
+    }
+    const paramConsts = paramDecls.join('\n');
+    this._filterParamClassification.set(filterName, classifications);
+    this._prevFilterParams.set(filterName, { ...params });
+
+    let currentSrc = effectiveSrc;
+    for (let pass = 0; pass < passes; pass++) {
+      const pfx = `_filter_${filterIdx}_${pass}`;
+      const isLastPass = pass === passes - 1;
+      const dstName = isLastPass && outName ? outName : `${pfx}_out`;
+
+      let pixelBody;
+      if (customCode) { pixelBody = customCode; }
+      else if (passes === 1) { pixelBody = builtin.wgsl; }
+      else { pixelBody = pass === 0 ? builtin.wgslH : builtin.wgslV; }
+
+      const needsNeighbors = builtin?.needsNeighbors || /textureLoad\s*\(\s*src/.test(pixelBody);
+
+      const shaderCode = `@group(0) @binding(0) var filter_samp: sampler;
+@group(0) @binding(1) var src: texture_2d<f32>;
+@group(0) @binding(2) var dst: texture_storage_2d<${texFmt}, write>;
+
+${paramConsts}
+
+@compute @workgroup_size(8, 8)
+fn main(@builtin(global_invocation_id) gid: vec3u) {
+  let dims = vec2f(textureDimensions(src));
+  let px = gid.xy;
+  if (px.x >= u32(dims.x) || px.y >= u32(dims.y)) { return; }
+  let uv = (vec2f(px) + 0.5) / dims;
+  var color = ${needsNeighbors ? 'textureLoad(src, vec2i(px), 0)' : 'textureSampleLevel(src, filter_samp, uv, 0.0)'};
+
+  ${pixelBody}
+
+  textureStore(dst, px, color);
+}`;
+
+      const existingTex = Rex.findAll(tree, 'texture').find(t => t.name === dstName);
+      if (!existingTex) {
+        tree.children.push({ type: 'texture', name: dstName, attrs: { width: texW, height: texH, format: texFmt, storage: true }, children: [], content: null, _d: 1 });
+      }
+      tree.children.push({ type: 'shader', name: pfx, attrs: {}, children: [], content: shaderCode, _d: 1 });
+      tree.children.push({ type: 'resources', name: `${pfx}_res`, attrs: {}, children: [
+        { type: 'texture', name: currentSrc, attrs: {}, children: [], content: null, _d: 2 },
+        { type: 'texture', name: dstName, attrs: { storage: true, format: texFmt }, children: [], content: null, _d: 2 },
+      ], content: null, _d: 1 });
+      tree.children.push({ type: 'pipeline', name: `${pfx}_pipe`, attrs: {
+        compute: pfx, resources: `${pfx}_res`,
+        _overrides: Object.keys(overrides).length > 0 ? overrides : undefined,
+      }, children: [], content: null, _d: 1 });
+      tree.children.push({ type: 'dispatch', name: null, attrs: {
+        pipeline: `${pfx}_pipe`, grid: [Math.ceil(texW / 8), Math.ceil(texH / 8), 1],
+      }, children: [], content: null, _d: 1 });
+
+      this.log(`filter "${filterName}" pass ${pass}: ${pfx} (${currentSrc} → ${dstName})`, 'ok');
+      currentSrc = dstName;
+    }
+
+    const finalOut = outName || `_filter_${filterIdx}_${passes - 1}_out`;
+    filterOutputs.set(srcName, finalOut);
+    if (outName) filterOutputs.set(outName, finalOut);
   }
 
   _compileShaders(tree) {
@@ -1195,6 +1836,161 @@ struct VSOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
     }
   }
 
+  // ── Derive compute: generate a single compute shader from GPU-eligible @derive expressions ──
+  // Takes classified GPU derives from behaviour transducer, generates DeriveState struct,
+  // compute shader body (topological order), pipeline, storage buffer, bind group.
+  // The storage buffer is then bindable by render passes — zero CPU round-trip.
+  _compileDeriveCompute(gpuDerives) {
+    // Clean up previous derive compute resources
+    this._deriveComputePipeline = null;
+    this._deriveBindGroup = null;
+    this._deriveFields = [];
+    this._deriveFieldCount = 0;
+    if (this._deriveStorageBuffer) {
+      this._deriveStorageBuffer.destroy();
+      this._deriveStorageBuffer = null;
+    }
+
+    if (!gpuDerives || gpuDerives.length === 0 || !this.device) return;
+
+    // Build DeriveState struct fields (one f32 per derive, topological order)
+    const fields = [];
+    for (const d of gpuDerives) {
+      const wf = d._wgslField;
+      if (!fields.find(f => f.wgslField === wf)) {
+        fields.push({ name: `${d.shrub}/${d.slot}`, wgslField: wf });
+      }
+    }
+    this._deriveFields = fields;
+    this._deriveFieldCount = fields.length;
+
+    // Generate WGSL
+    const structFields = fields.map((f, i) => `  ${f.wgslField}: f32, // [${i}] ${f.name}`).join('\n');
+
+    // Find which heap buffer the derives reference (first one found in params.* references)
+    // We bind the heap uniform so the compute shader can read current params
+    let heapBufferName = null;
+    for (const d of gpuDerives) {
+      if (d._wgsl && d._wgsl.includes('params.')) {
+        // Find the heap layout entry this maps to
+        for (const [name] of this._heapLayout) {
+          heapBufferName = name;
+          break;
+        }
+        if (heapBufferName) break;
+      }
+    }
+
+    // Build the struct for heap uniform (mirror the existing struct)
+    let paramsStruct = '';
+    let paramsBinding = '';
+    if (heapBufferName) {
+      const hl = this._heapLayout.get(heapBufferName);
+      if (hl && hl.structDef) {
+        const pFields = hl.structDef.layout.map(f => {
+          const wt = f.type === 'f32' ? 'f32' : f.type === 'i32' ? 'i32' : f.type === 'u32' ? 'u32' : 'f32';
+          return `  ${f.name.replace(/-/g, '_')}: ${wt},`;
+        }).join('\n');
+        paramsStruct = `struct Params {\n${pFields}\n}\n`;
+        paramsBinding = `@group(0) @binding(1) var<uniform> params: Params;`;
+      }
+    }
+
+    // Compute body: one assignment per derive in topological order
+    const assignments = gpuDerives.map(d => `  derives.${d._wgslField} = ${d._wgsl};`).join('\n');
+
+    const shaderCode = `
+${paramsStruct}
+struct DeriveState {
+${structFields}
+}
+
+@group(0) @binding(0) var<storage, read_write> derives: DeriveState;
+${paramsBinding}
+
+@compute @workgroup_size(1)
+fn main() {
+${assignments}
+}
+`.trim();
+
+    // Create shader module
+    let mod;
+    try {
+      mod = this.device.createShaderModule({ code: shaderCode });
+      if (mod.getCompilationInfo) {
+        mod.getCompilationInfo().then(info => {
+          for (const msg of info.messages) {
+            if (msg.type === 'error') {
+              this.log(`derive compute shader error: ${msg.message} (line ${msg.lineNum})`, 'err');
+            }
+          }
+        });
+      }
+    } catch (e) {
+      this.log(`derive compute: shader creation failed: ${e.message}`, 'err');
+      return;
+    }
+
+    // Storage buffer: one f32 per derive field (16-byte aligned minimum)
+    const bufSize = Math.max(16, Math.ceil(fields.length * 4 / 16) * 16);
+    this._deriveStorageBuffer = this.device.createBuffer({
+      size: bufSize,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+    });
+
+    // Create pipeline with auto layout
+    try {
+      this._deriveComputePipeline = this.device.createComputePipeline({
+        layout: 'auto',
+        compute: { module: mod, entryPoint: 'main' },
+      });
+    } catch (e) {
+      this.log(`derive compute: pipeline creation failed: ${e.message}`, 'err');
+      this._deriveStorageBuffer.destroy();
+      this._deriveStorageBuffer = null;
+      return;
+    }
+
+    // Create bind group
+    const entries = [{ binding: 0, resource: { buffer: this._deriveStorageBuffer } }];
+    if (heapBufferName && this._heapBuffer) {
+      const hl = this._heapLayout.get(heapBufferName);
+      if (hl) {
+        entries.push({ binding: 1, resource: { buffer: this._heapBuffer, offset: hl.offset, size: hl.size } });
+      }
+    }
+    try {
+      this._deriveBindGroup = this.device.createBindGroup({
+        layout: this._deriveComputePipeline.getBindGroupLayout(0),
+        entries,
+      });
+    } catch (e) {
+      this.log(`derive compute: bind group creation failed: ${e.message}`, 'err');
+      this._deriveComputePipeline = null;
+      return;
+    }
+
+    // Register derive buffer as a named storage buffer so @bind :storage _derives works
+    this._storageBuffers.set('_derives', this._deriveStorageBuffer);
+
+    this.log(`derive compute: ${fields.length} fields, shader compiled ✓`, 'ok');
+  }
+
+  // Execute the derive compute dispatch — called before render passes in _execute()
+  _executeDeriveDispatch(enc) {
+    if (!this._deriveComputePipeline || !this._deriveBindGroup) return;
+    const cp = enc.beginComputePass();
+    cp.setPipeline(this._deriveComputePipeline);
+    cp.setBindGroup(0, this._deriveBindGroup);
+    cp.dispatchWorkgroups(1);
+    cp.end();
+  }
+
+  // Get the derive storage buffer for downstream binding
+  getDeriveStorageBuffer() { return this._deriveStorageBuffer; }
+  getDeriveFields() { return this._deriveFields; }
+
   _compileBarrierSchedule(tree) {
     this._barrierSchedule = [];
     const passes = Rex.findAll(tree, 'pass');
@@ -1309,6 +2105,540 @@ struct VSOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
     return w * h * bpp;
   }
 
+  // ════════════════════════════════════════════════════════════════
+  // BARRIER ENFORCEMENT — optic-derived barriers (Spec §3)
+  // ════════════════════════════════════════════════════════════════
+
+  _annotateOpticAccesses() {
+    this._opticAccessMap.clear();
+    const addAccess = (key, passIndex, access, stage) => {
+      if (!this._opticAccessMap.has(key)) this._opticAccessMap.set(key, []);
+      this._opticAccessMap.get(key).push({ passIndex, access, stage });
+    };
+    for (let ci = 0; ci < this._commandList.length; ci++) {
+      const cmd = this._commandList[ci];
+      if (cmd.type === 'pass') {
+        // Render target writes
+        if (cmd.target) addAccess(cmd.target, ci, 'write', 'FRAGMENT');
+        if (cmd.targets) for (const t of cmd.targets) addAccess(t, ci, 'write', 'FRAGMENT');
+        if (cmd.depthTarget) addAccess(cmd.depthTarget, ci, 'write', 'FRAGMENT');
+        // Draw bind groups — reads
+        for (const draw of cmd.draws) {
+          for (const b of draw.binds) {
+            if (b.buffer) addAccess(b.buffer, ci, 'read', 'VERTEX');
+            if (b.texture) addAccess(b.texture, ci, 'read', 'FRAGMENT');
+            if (b.storage) {
+              const names = Array.isArray(b.storage) ? b.storage : [b.storage];
+              for (const s of names) { addAccess(s, ci, 'read', 'FRAGMENT'); addAccess(s, ci, 'write', 'FRAGMENT'); }
+            }
+          }
+        }
+      } else if (cmd.type === 'dispatch') {
+        for (const b of (cmd.binds || [])) {
+          if (b.buffer) addAccess(b.buffer, ci, 'read', 'COMPUTE');
+          if (b.storage) {
+            const names = Array.isArray(b.storage) ? b.storage : [b.storage];
+            for (const s of names) { addAccess(s, ci, 'read', 'COMPUTE'); addAccess(s, ci, 'write', 'COMPUTE'); }
+          }
+        }
+      }
+    }
+  }
+
+  _deriveBarriersFromOptics() {
+    const opticBarriers = [];
+    for (const [resource, accesses] of this._opticAccessMap) {
+      if (accesses.length < 2) continue;
+      // Sort by passIndex
+      accesses.sort((a, b) => a.passIndex - b.passIndex);
+      for (let i = 0; i < accesses.length - 1; i++) {
+        const a = accesses[i], b = accesses[i + 1];
+        if (a.passIndex === b.passIndex) continue;
+        let hazardType = null;
+        if (a.access === 'write' && b.access === 'read') hazardType = 'RAW';
+        else if (a.access === 'write' && b.access === 'write') hazardType = 'WAW';
+        else if (a.access === 'read' && b.access === 'write') hazardType = 'WAR';
+        if (hazardType) {
+          // Check if this barrier already exists in the schedule
+          const exists = this._barrierSchedule.some(bs =>
+            bs.afterPass === String(a.passIndex) && bs.beforePass === String(b.passIndex)
+          );
+          if (!exists) {
+            opticBarriers.push({
+              afterPass: String(a.passIndex), beforePass: String(b.passIndex),
+              hazardType, opticPaths: [resource],
+              srcStage: a.stage, dstStage: b.stage, enforced: false,
+            });
+          }
+        }
+      }
+    }
+    // Merge optic-derived barriers into schedule
+    for (const ob of opticBarriers) {
+      this._barrierSchedule.push({
+        afterPass: ob.afterPass, beforePass: ob.beforePass,
+        before: `STAGE_${ob.srcStage}`, after: `STAGE_${ob.dstStage}`,
+        hazards: ob.hazardType,
+        details: ob.opticPaths.map(p => ({ resource: p, type: ob.hazardType })),
+        enforced: false,
+      });
+    }
+    if (opticBarriers.length > 0) {
+      this.log(`barriers: ${opticBarriers.length} derived from optic accesses`, 'ok');
+    }
+  }
+
+  _enforceBarriers() {
+    this._barrierViolations = 0;
+    if (this._barrierSchedule.length === 0) return;
+    // WebGPU barriers are implicit at pass boundaries.
+    // Validate ordering: afterPass index < beforePass index in command list.
+    for (const barrier of this._barrierSchedule) {
+      const after = Number(barrier.afterPass);
+      const before = Number(barrier.beforePass);
+      if (!isNaN(after) && !isNaN(before)) {
+        if (after >= before) {
+          this._barrierViolations++;
+          this.log(`barrier violation: pass ${after} must complete before pass ${before} [${barrier.hazards}]`, 'warn');
+        } else {
+          barrier.enforced = true;
+        }
+      }
+    }
+    if (this._barrierViolations > 0) {
+      this.log(`barriers: ${this._barrierViolations} violations detected`, 'warn');
+    }
+  }
+
+  // ════════════════════════════════════════════════════════════════
+  // OPTIC-DRIVEN READBACK — path-based typed readback (Spec §4)
+  // ════════════════════════════════════════════════════════════════
+
+  _resolveOpticPath(path) {
+    if (!path || !path.startsWith('/')) return null;
+    const parts = path.slice(1).split('/');
+    if (parts.length === 0) return null;
+
+    const bufferName = parts[0];
+    // Check uniform heap first
+    const hl = this._heapLayout.get(bufferName);
+    if (hl && hl.structDef) {
+      if (parts.length === 1) {
+        // Entire buffer — return full struct
+        return { buffer: bufferName, offset: hl.offset, size: hl.size, type: null, structLayout: hl.structDef.layout, isHeap: true };
+      }
+      // Navigate struct layout
+      let currentLayout = hl.structDef.layout;
+      let currentOffset = hl.offset;
+      for (let i = 1; i < parts.length; i++) {
+        const fieldName = parts[i];
+        const field = currentLayout.find(f => f.name === fieldName);
+        if (!field) return null;
+        currentOffset += field.offset;
+        // Check if this field is a nested struct
+        const nestedStruct = this._structs.get(field.type);
+        if (nestedStruct && i < parts.length - 1) {
+          currentLayout = nestedStruct.layout;
+        } else if (i === parts.length - 1) {
+          // Leaf field or nested struct at end of path
+          if (nestedStruct) {
+            return { buffer: bufferName, offset: currentOffset, size: nestedStruct.size, type: null, structLayout: nestedStruct.layout, isHeap: true };
+          }
+          return { buffer: bufferName, offset: currentOffset, size: field.size, type: field.type, structLayout: null, isHeap: true };
+        } else {
+          return null; // non-struct intermediate in path
+        }
+      }
+    }
+
+    // Check storage buffers
+    const sb = this._storageBuffers.get(bufferName);
+    if (sb) {
+      // Find the struct associated with this storage buffer from the tree
+      // Storage buffers may have a struct via :struct attr — look up in _structs
+      for (const [sName, sDef] of this._structs) {
+        // Try to match: look for the field path in this struct
+        if (parts.length >= 2) {
+          let currentLayout = sDef.layout;
+          let currentOffset = 0;
+          let found = true;
+          for (let i = 1; i < parts.length; i++) {
+            const field = currentLayout.find(f => f.name === parts[i]);
+            if (!field) { found = false; break; }
+            currentOffset += field.offset;
+            if (i < parts.length - 1) {
+              const nested = this._structs.get(field.type);
+              if (nested) currentLayout = nested.layout;
+              else { found = false; break; }
+            } else {
+              if (found) return { buffer: bufferName, offset: currentOffset, size: field.size, type: field.type, structLayout: null, isHeap: false };
+            }
+          }
+        }
+      }
+    }
+
+    return null;
+  }
+
+  _deserializeStruct(dataView, offset, structLayout) {
+    const result = {};
+    for (const field of structLayout) {
+      const off = offset + field.offset;
+      const nested = this._structs.get(field.type);
+      if (nested) {
+        result[field.name] = this._deserializeStruct(dataView, off, nested.layout);
+      } else if (field.type === 'f32') {
+        result[field.name] = dataView.getFloat32(off, true);
+      } else if (field.type === 'u32') {
+        result[field.name] = dataView.getUint32(off, true);
+      } else if (field.type === 'i32') {
+        result[field.name] = dataView.getInt32(off, true);
+      } else if (field.type === 'f32x2') {
+        result[field.name] = [dataView.getFloat32(off, true), dataView.getFloat32(off + 4, true)];
+      } else if (field.type === 'f32x3') {
+        result[field.name] = [dataView.getFloat32(off, true), dataView.getFloat32(off + 4, true), dataView.getFloat32(off + 8, true)];
+      } else if (field.type === 'f32x4') {
+        result[field.name] = [dataView.getFloat32(off, true), dataView.getFloat32(off + 4, true), dataView.getFloat32(off + 8, true), dataView.getFloat32(off + 12, true)];
+      } else {
+        result[field.name] = 0;
+      }
+    }
+    return result;
+  }
+
+  // ════════════════════════════════════════════════════════════════
+  // HEAP COMPACTION — liveness analysis + dead optic elimination (Spec §6)
+  // ════════════════════════════════════════════════════════════════
+
+  _compactHeap() {
+    if (this._optics.length === 0) return;
+    // Conservative liveness: scan shader sources for field name references
+    const liveness = this._buildLivenessMap();
+    const eliminated = this._eliminateDeadOptics(liveness);
+    if (eliminated > 0) this.log(`compaction: eliminated ${eliminated} dead optics`, 'ok');
+    // Alias non-overlapping optics (register allocation for heap slots)
+    const aliased = this._aliasHeapSlots(liveness);
+    if (aliased > 0) this.log(`compaction: aliased ${aliased} heap slots`, 'ok');
+  }
+
+  _buildLivenessMap() {
+    const liveness = new Map(); // fieldPath → {firstRead, lastRead}
+    // Scan shader sources for u.fieldName references
+    const shaderRefs = new Map(); // shaderKey → Set<fieldName>
+    for (const [key, code] of this._lastGoodShaders) {
+      const refs = new Set();
+      // Match u.fieldName patterns in WGSL
+      const matches = code.matchAll(/\bu\.(\w+)/g);
+      for (const m of matches) refs.add(m[1]);
+      shaderRefs.set(key, refs);
+    }
+    // Map shader references to pass indices via command list
+    if (this._commandList) {
+      for (let ci = 0; ci < this._commandList.length; ci++) {
+        const cmd = this._commandList[ci];
+        const pipelineKeys = [];
+        if (cmd.type === 'pass') {
+          for (const draw of cmd.draws) if (draw.pipelineKey) pipelineKeys.push(draw.pipelineKey);
+        } else if (cmd.type === 'dispatch') {
+          if (cmd.pipelineKey) pipelineKeys.push(cmd.pipelineKey);
+        }
+        for (const pk of pipelineKeys) {
+          const pe = this.pipelines.get(pk);
+          if (!pe) continue;
+          // Find which shader this pipeline uses
+          for (const [sk, refs] of shaderRefs) {
+            for (const fieldName of refs) {
+              for (const op of this._optics) {
+                if (op.fieldName === fieldName) {
+                  const key = `${op.bufferName}/${op.fieldName}`;
+                  const entry = liveness.get(key) || { firstRead: Infinity, lastRead: -1 };
+                  entry.firstRead = Math.min(entry.firstRead, ci);
+                  entry.lastRead = Math.max(entry.lastRead, ci);
+                  liveness.set(key, entry);
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    return liveness;
+  }
+
+  _eliminateDeadOptics(liveness) {
+    let eliminated = 0;
+    this._optics = this._optics.filter(op => {
+      // Form/builtin optics are always live (external writes)
+      if (op.source === 'form' || op.source === 'builtin') return true;
+      const key = `${op.bufferName}/${op.fieldName}`;
+      if (!liveness.has(key) || liveness.get(key).lastRead < 0) {
+        eliminated++;
+        return false;
+      }
+      return true;
+    });
+    return eliminated;
+  }
+
+  _aliasHeapSlots(liveness) {
+    // Group optics by buffer — only alias within same buffer
+    let aliased = 0;
+    const opticsByBuffer = new Map();
+    for (const op of this._optics) {
+      if (!opticsByBuffer.has(op.bufferName)) opticsByBuffer.set(op.bufferName, []);
+      opticsByBuffer.get(op.bufferName).push(op);
+    }
+    for (const [bufName, ops] of opticsByBuffer) {
+      if (ops.length < 2) continue;
+      // Sort by firstRead
+      const withLiveness = ops.map(op => {
+        const key = `${op.bufferName}/${op.fieldName}`;
+        const live = liveness.get(key) || { firstRead: 0, lastRead: Infinity };
+        return { op, ...live };
+      }).sort((a, b) => a.firstRead - b.firstRead);
+      // Greedy interval scheduling
+      const slots = []; // [{lastRead, offset, size, align}]
+      for (const entry of withLiveness) {
+        const size = this._typeSize(entry.op.type);
+        const align = Math.max(4, size <= 4 ? 4 : size <= 8 ? 8 : 16);
+        let found = false;
+        for (const slot of slots) {
+          if (slot.lastRead < entry.firstRead && slot.size === size && slot.align === align) {
+            // Alias: reuse this slot's offset
+            entry.op.heapOffset = slot.offset;
+            slot.lastRead = entry.lastRead;
+            found = true;
+            aliased++;
+            break;
+          }
+        }
+        if (!found) {
+          slots.push({ lastRead: entry.lastRead, offset: entry.op.heapOffset, size, align });
+        }
+      }
+    }
+    return aliased;
+  }
+
+  // ════════════════════════════════════════════════════════════════
+  // INCREMENTAL RECOMPILATION — structural diffing (Spec §7)
+  // ════════════════════════════════════════════════════════════════
+
+  _diffShrub(prev, next, path = '') {
+    const changes = [];
+    if (!prev && !next) return changes;
+    if (!prev) { changes.push({ path, type: next.type, changeKind: 'added' }); return changes; }
+    if (!next) { changes.push({ path, type: prev.type, changeKind: 'removed' }); return changes; }
+    if (prev.type !== next.type || prev.name !== next.name) {
+      changes.push({ path, type: next.type || prev.type, changeKind: 'modified' });
+      return changes;
+    }
+    // Compare attrs
+    const prevAttrs = JSON.stringify(prev.attrs || {});
+    const nextAttrs = JSON.stringify(next.attrs || {});
+    const attrsChanged = prevAttrs !== nextAttrs;
+    // Compare content
+    const contentChanged = (prev.content || '') !== (next.content || '');
+    if (attrsChanged || contentChanged) {
+      changes.push({ path: path || `/${prev.type}:${prev.name || ''}`, type: prev.type, changeKind: contentChanged ? 'modified' : 'attrs-only' });
+    }
+    // Compare children
+    const maxLen = Math.max((prev.children || []).length, (next.children || []).length);
+    for (let i = 0; i < maxLen; i++) {
+      const childPath = `${path}/${(next.children?.[i] || prev.children?.[i])?.type || 'unknown'}[${i}]`;
+      const sub = this._diffShrub(prev.children?.[i] || null, next.children?.[i] || null, childPath);
+      changes.push(...sub);
+    }
+    return changes;
+  }
+
+  _mapChangesToPhases(changes) {
+    const phases = new Set();
+    for (const c of changes) {
+      switch (c.type) {
+        case 'struct': case 'field': phases.add(1); phases.add(2); phases.add(3); phases.add(4); phases.add(5); phases.add(9); phases.add(12); break;
+        case 'shader': phases.add(2); phases.add(9); break;
+        case 'buffer': phases.add(3); phases.add(4); phases.add(5); phases.add(6); break;
+        case 'texture': phases.add(7); phases.add(8.5); break;
+        case 'pipeline': phases.add(9); break;
+        case 'pass': case 'dispatch': phases.add(12); phases.add(10); break;
+        case 'filter':
+          if (c.changeKind === 'attrs-only') phases.add(1.5); // may be hot-patchable
+          else { phases.add(1.5); phases.add(2); phases.add(9); phases.add(12); }
+          break;
+        case 'heap': phases.add(1.1); phases.add(3); phases.add(4); phases.add(5); break;
+        default: // Unknown type — full recompile
+          for (let p = 0; p <= 15; p++) phases.add(p);
+      }
+    }
+    return phases;
+  }
+
+  _detectOpticStability() {
+    if (!this._prevHeapLayout) return false;
+    if (this._prevHeapLayout.size !== this._heapLayout.size) return false;
+    for (const [name, entry] of this._heapLayout) {
+      const prev = this._prevHeapLayout.get(name);
+      if (!prev) return false;
+      if (prev.offset !== entry.offset || prev.size !== entry.size) return false;
+    }
+    return true;
+  }
+
+  _canIncrementalCompile(phases) {
+    // Can't do incremental if early phases (structs, heap layout) are affected
+    if (phases.has(1) || phases.has(3) || phases.has(5)) return false;
+    return true;
+  }
+
+  _incrementalCompile(tree, phases) {
+    this.log('── INCREMENTAL COMPILE ──', 'cmd');
+    this._warnedTypes.clear();
+    if (phases.has(0)) this._compileLibs(tree);
+    if (phases.has(1)) this._compileStructs(tree);
+    if (phases.has(1.1)) this._compileHeap(tree);
+    if (phases.has(1.5)) this._compileFilters(tree);
+    if (phases.has(2)) this._compileShaders(tree);
+    // phases 3,4,5 require full recompile (caught by _canIncrementalCompile)
+    if (phases.has(7)) this._compileTextures(tree);
+    if (phases.has(8.5)) this._compileResourceScopes(tree);
+    if (phases.has(9)) { for (const p of Rex.findAll(tree, 'pipeline')) this._buildPipeline(p.name, p); }
+    if (phases.has(10)) this._compileBarrierSchedule(tree);
+    if (phases.has(12)) {
+      this._compileCommandList(tree);
+      this._annotateOpticAccesses();
+      this._deriveBarriersFromOptics();
+    }
+    if (phases.has(14)) this._compileReadbacks(tree);
+    this.log(`incremental: ${phases.size} phases recompiled`, 'ok');
+  }
+
+  // ════════════════════════════════════════════════════════════════
+  // UNIFIED HEAP NOTATION — @heap nodes (Spec §1)
+  // ════════════════════════════════════════════════════════════════
+
+  _typeAlign(t) {
+    const a = { 'f32': 4, 'i32': 4, 'u32': 4, 'f32x2': 8, 'f32x3': 16, 'f32x4': 16, 'f32x4x4': 16 };
+    return a[t] || 16; // default 16 for nested structs
+  }
+
+  _compileHeap(tree) {
+    const heapNodes = Rex.findAll(tree, 'heap');
+    if (!heapNodes.length) return;
+
+    for (const heapNode of heapNodes) {
+      const name = heapNode.name;
+      if (!name) { this.log('heap: @heap node missing name', 'err'); continue; }
+      const count = heapNode.attrs.count ? +heapNode.attrs.count : 0;
+
+      // Build struct from children recursively
+      const result = this._heapNodeToStruct(heapNode, name);
+
+      // Register all generated structs
+      for (const [sName, sDef] of result.nestedStructs) {
+        this._structs.set(sName, sDef);
+        this._wgslStructs.set(sName, sDef.wgsl);
+        this.log(`heap struct ${sName}: ${sDef.size}B`, 'ok');
+      }
+      // Register the top-level struct
+      this._structs.set(result.structName, { size: result.size, layout: result.layout });
+      this._wgslStructs.set(result.structName, result.wgsl);
+      this.log(`heap struct ${result.structName}: ${result.size}B [${result.layout.map(l => `${l.name}@${l.offset}`).join(', ')}]`, 'cmd');
+
+      // Inject synthetic @buffer node for downstream compile phases
+      const syntheticBuffer = {
+        type: 'buffer', name, attrs: { struct: result.structName }, children: [], content: null, _d: 1,
+      };
+
+      if (count > 0) {
+        // Storage buffer mode
+        syntheticBuffer.attrs.usage = ['storage'];
+        syntheticBuffer.attrs.size = result.size * count;
+      }
+
+      // Collect default values into a synthetic @data node
+      const dataAttrs = {};
+      this._collectHeapDefaults(heapNode, result.layout, dataAttrs, '');
+      if (Object.keys(dataAttrs).length > 0) {
+        syntheticBuffer.children.push({ type: 'data', name: null, attrs: dataAttrs, children: [], content: null, _d: 2 });
+      }
+
+      tree.children.push(syntheticBuffer);
+      this.log(`heap: "${name}" → synthetic @buffer (${count > 0 ? `storage x${count}` : 'uniform'})`, 'ok');
+    }
+  }
+
+  _heapNodeToStruct(node, prefix) {
+    const structName = prefix.split('_').map(s => s.charAt(0).toUpperCase() + s.slice(1)).join('_');
+    const layout = [];
+    const nestedStructs = new Map();
+    let size = 0;
+
+    for (const child of (node.children || [])) {
+      const fieldName = child.name;
+      if (!fieldName) continue;
+
+      const fieldType = child.attrs?.type;
+      if (fieldType) {
+        // Leaf field — typed
+        const bs = this._typeSize(fieldType);
+        const align = this._typeAlign(fieldType);
+        size = Math.ceil(size / align) * align;
+        layout.push({ name: fieldName, type: fieldType, offset: size, size: bs });
+        size += bs;
+      } else if (child.children && child.children.length > 0) {
+        // Nested struct — recurse
+        const childPrefix = `${prefix}_${fieldName}`;
+        const nested = this._heapNodeToStruct(child, childPrefix);
+        // Register nested structs
+        for (const [k, v] of nested.nestedStructs) nestedStructs.set(k, v);
+        nestedStructs.set(nested.structName, { size: nested.size, layout: nested.layout, wgsl: nested.wgsl });
+        // Nested struct alignment: 16 bytes
+        const align = 16;
+        size = Math.ceil(size / align) * align;
+        layout.push({ name: fieldName, type: nested.structName, offset: size, size: nested.size });
+        size += nested.size;
+      }
+    }
+
+    // Pad to 16-byte boundary
+    size = Math.ceil(size / 16) * 16;
+
+    // Generate WGSL
+    const wgsl = `struct ${structName} {\n${layout.map(l => `  ${l.name}: ${this._structs.has(l.type) ? l.type : this._toWGSL(l.type)},`).join('\n')}\n}`;
+
+    return { structName, size, layout, wgsl, nestedStructs };
+  }
+
+  _collectHeapDefaults(node, layout, dataAttrs, prefix) {
+    for (const child of (node.children || [])) {
+      if (!child.name) continue;
+      const field = layout.find(f => f.name === child.name);
+      if (!field) continue;
+
+      if (child.attrs?.type) {
+        // Leaf field — check for default value
+        // Value can be in child.attrs (first non-type/name attr) or child content
+        const keys = Object.keys(child.attrs).filter(k => k !== 'type');
+        if (keys.length > 0) {
+          // Use first non-type attr as default value
+          dataAttrs[child.name] = child.attrs[keys[0]];
+        }
+        // Check for inline value — content of the node
+        if (child.content) {
+          try { dataAttrs[child.name] = JSON.parse(child.content); } catch { dataAttrs[child.name] = child.content; }
+        }
+      } else if (child.children && child.children.length > 0) {
+        // Nested — recurse into nested struct's layout
+        const nestedStruct = this._structs.get(field.type);
+        if (nestedStruct) {
+          this._collectHeapDefaults(child, nestedStruct.layout, dataAttrs, `${prefix}${child.name}_`);
+        }
+      }
+    }
+  }
+
   _buildPipeline(key, pNode) {
     // Resolve explicit layout from @resources scope
     const resName = pNode.attrs.resources;
@@ -1321,8 +2651,11 @@ struct VSOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
     if (compName) {
       const mod = this.shaderModules.get(compName);
       if (!mod) { this.log(`pipeline "${key}": shader "${compName}" not found`,'err'); return; }
-      const pipeline = this.device.createComputePipeline({ layout: explicitLayout, compute:{module:mod, entryPoint:pNode.attrs.entry||'main'} });
-      this.pipelines.set(key, {pipeline, type:'compute', resourceScope: resName || null});
+      const pipeOverrides = pNode.attrs._overrides || {};
+      const computeDesc = { module: mod, entryPoint: pNode.attrs.entry || 'main' };
+      if (Object.keys(pipeOverrides).length > 0) computeDesc.constants = pipeOverrides;
+      const pipeline = this.device.createComputePipeline({ layout: explicitLayout, compute: computeDesc });
+      this.pipelines.set(key, { pipeline, type: 'compute', resourceScope: resName || null, overrides: { ...pipeOverrides }, shaderKey: compName });
       this.log(`pipeline "${key}": compute \u2713${resScope ? ` [resources: ${resName}]` : ''}`,'ok');
       return;
     }
@@ -1514,6 +2847,8 @@ struct VSOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
     for (const [, tq] of this._querySets) { tq.nextIndex = 0; }
 
     const enc = this.device.createCommandEncoder();
+    // Derive compute dispatch — GPU-side @derive evaluation before render passes
+    this._executeDeriveDispatch(enc);
     const tv = this.context.getCurrentTexture().createView();
     this._executeCommandList(enc, tv);
 
@@ -1525,23 +2860,57 @@ struct VSOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
       }
     }
 
-    // Readback copies (before submit)
+    // Readback copies (before submit) — respect mode
     for (const rb of this._readbacks) {
-      if (!rb.pending) enc.copyBufferToBuffer(rb.srcBuffer, rb.srcOffset, rb.staging, 0, rb.size);
+      if (rb.pending) continue;
+      if (rb.mode === 'one-shot' && rb.lastReadFrame >= 0) continue;
+      if (rb.mode === 'every' && (this.frameCount - rb.lastReadFrame) < rb.every) continue;
+      enc.copyBufferToBuffer(rb.srcBuffer, rb.srcOffset, rb.staging, 0, rb.size);
     }
 
     this.device.queue.submit([enc.finish()]);
 
-    // Async readback — standard buffers
+    // Async readback — standard buffers (with typed deserialization)
     if (this.onReadback) {
       for (const rb of this._readbacks) {
         if (rb.pending) continue;
+        if (rb.mode === 'one-shot' && rb.lastReadFrame >= 0) continue;
+        if (rb.mode === 'every' && (this.frameCount - rb.lastReadFrame) < rb.every) continue;
         rb.pending = true;
         rb.staging.mapAsync(GPUMapMode.READ).then(() => {
-          const data = new Float32Array(rb.staging.getMappedRange().slice(0));
+          const raw = rb.staging.getMappedRange().slice(0);
           rb.staging.unmap();
           rb.pending = false;
-          this.onReadback(rb.name, data);
+          rb.lastReadFrame = this.frameCount;
+
+          let data;
+          if (rb.structLayout) {
+            // Optic-driven: typed deserialization
+            data = this._deserializeStruct(new DataView(raw), 0, rb.structLayout);
+          } else if (rb.type) {
+            // Single field optic readback
+            const dv = new DataView(raw);
+            if (rb.type === 'f32') data = dv.getFloat32(0, true);
+            else if (rb.type === 'u32') data = dv.getUint32(0, true);
+            else if (rb.type === 'i32') data = dv.getInt32(0, true);
+            else data = new Float32Array(raw);
+          } else {
+            // Legacy: raw Float32Array
+            data = new Float32Array(raw);
+          }
+
+          // on-change: compare against previous value
+          if (rb.mode === 'on-change') {
+            const prev = this._readbackPrevValues.get(rb.name);
+            const curr = JSON.stringify(data);
+            if (prev === curr) return;
+            this._readbackPrevValues.set(rb.name, curr);
+          }
+
+          const meta = rb.structLayout || rb.type
+            ? { typed: true, toSlot: rb.toSlot || null }
+            : null;
+          this.onReadback(rb.name, data, meta);
         }).catch(() => { rb.pending = false; });
       }
     }
@@ -1568,6 +2937,7 @@ struct VSOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
 
   _executeCommandList(enc, tv) {
     if (!this._commandList) return;
+    this._enforceBarriers();
     const cw = this.canvas.width, ch = this.canvas.height;
 
     for (const cmd of this._commandList) {

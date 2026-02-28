@@ -16,6 +16,12 @@ export class RexBehaviour {
     this._depTriggers = new Map();  // "sourceShrub/slot" → [{shrub, label}] (transitive closure)
     this._channels = [];         // [{from:{shrub,slot}, to:{buffer,field}, mode, lastValue}]
     this._compiled = false;
+
+    // ── Per-derive dirty tracking ──
+    this._derivedSlots = null;     // Map<"shrub/slot", deriveIndex> — persisted from _orderDerives
+    this._deriveRevDeps = null;    // Array<Array<number>> — reverse adjacency
+    this._deriveDirty = null;      // Uint8Array(N) — 1=dirty 0=clean
+    this._deriveFormDeps = null;   // Map<formFieldName, Set<deriveIndex>>
     this.onSlotChange = null;    // callback(shrubName, slotName, value)
     this.onChannelPush = null;   // callback(buffer, field, value) → GPU heap write
     this.onTalkFired = null;     // callback(record) — rich causal record per talk invocation
@@ -57,6 +63,9 @@ export class RexBehaviour {
   // Check if a @def exists
   hasDef(name) { return this._defs.has(name); }
 
+  // Get GPU-eligible derives (compiled WGSL expressions) — consumed by GPU transducer
+  getGpuDerives() { return this._gpuDerives || []; }
+
   // Fire a @talk action externally (e.g. from surface click) — delegates to invoke
   fireTalk(shrubName, actionName, params) {
     this.invoke(shrubName, actionName, params || {});
@@ -65,18 +74,23 @@ export class RexBehaviour {
   transduce(tree, structureChanged) {
     if (structureChanged || !this._compiled) {
       this._compile(tree);
+      this._markAllDerivesDirty();
     }
-    // Execute phase: recompute all derives, then push channels
-    this._recomputeDerives();
-    this._pushChannels();
+    this._flushDerives();
   }
 
-  // Push a form field value into the behaviour system and recompute derives/channels
+  // Push a form field value into the behaviour system and mark affected derives dirty
   pushFormValue(name, val) {
     if (!this._compiled) return;
-    // Recompute derives that may depend on form values (via %name refs)
-    this._recomputeDerives();
-    this._pushChannels();
+    if (this._deriveFormDeps) {
+      const deps = this._deriveFormDeps.get(name);
+      if (deps) {
+        for (const idx of deps) this._markDeriveDirtyByIndex(idx);
+      }
+    } else {
+      this._markAllDerivesDirty();
+    }
+    this._flushDerives();
   }
 
   // ════════════════════════════════════════════════════════════════
@@ -128,7 +142,10 @@ export class RexBehaviour {
     // 7. Order derives by dependency
     this._orderDerives();
 
-    // 8. Build transitive dep closure (promonad composition)
+    // 8. Classify derives: GPU-eligible vs CPU-only
+    this._classifyDerives();
+
+    // 9. Build transitive dep closure (promonad composition)
     this._buildDepClosure();
 
     this._compiled = true;
@@ -352,13 +369,15 @@ export class RexBehaviour {
         for (const mut of reaction.mutations) {
           this._executeMutation(mut, ctx);
         }
-        // Collect what changed and recurse
+        // Collect what changed, mark dirty, and recurse (no flush — invoke handles it)
         const downstream = new Map();
         for (const [s, v] of targetShrubData.slots) {
-          if (v !== preSnapshot.get(s)) downstream.set(s, v);
+          if (v !== preSnapshot.get(s)) {
+            downstream.set(s, v);
+            this._markDeriveDirty(targetShrub, s);
+          }
         }
         if (downstream.size > 0) {
-          this._recomputeDerives();
           this._fireDepReactions(targetShrub, downstream, depth + 1);
         }
       }
@@ -459,6 +478,148 @@ export class RexBehaviour {
       for (let i = 0; i < N; i++) { if (!inOrder.has(i)) order.push(i); }
     }
     this._derives = order.map(i => this._derives[i]);
+
+    // ── Persist dependency graph for dirty tracking ──
+    // Remap indices from pre-sort to post-sort order
+    const oldToNew = new Int32Array(N);
+    for (let i = 0; i < order.length; i++) oldToNew[order[i]] = i;
+
+    this._derivedSlots = new Map();
+    for (const [key, oldIdx] of derivedSlots) {
+      this._derivedSlots.set(key, oldToNew[oldIdx]);
+    }
+
+    this._deriveRevDeps = new Array(N);
+    for (let i = 0; i < N; i++) this._deriveRevDeps[i] = [];
+    for (let oldI = 0; oldI < N; oldI++) {
+      const newI = oldToNew[oldI];
+      for (const oldDep of revDeps[oldI]) {
+        this._deriveRevDeps[newI].push(oldToNew[oldDep]);
+      }
+    }
+
+    this._deriveDirty = new Uint8Array(N);
+  }
+
+  // ── GPU derive classification ──
+  // Splits this._derives into _gpuDerives (WGSL-transpilable, pure math, all slots
+  // resolve to heap fields or prior GPU derives) and _cpuDerives (everything else).
+  // GPU derives run as a single compute dispatch; CPU derives eval via JS as before.
+  _classifyDerives() {
+    this._gpuDerives = [];
+    this._cpuDerives = [];
+    if (this._derives.length === 0) return;
+
+    // Build set of channel targets: "shrub/slot" → "buffer/field"
+    // These tell us which slots map to GPU heap fields
+    const channelTargets = new Map();
+    for (const ch of this._channels) {
+      channelTargets.set(`${ch.from.shrub}/${ch.from.slot}`, `${ch.to.buffer}/${ch.to.field}`);
+    }
+
+    // Track which derives are GPU-eligible (by "shrub/slot" key)
+    const gpuDeriveKeys = new Set();
+
+    // First pass: check transpilability + slot resolution
+    for (const d of this._derives) {
+      const deriveKey = `${d.shrub}/${d.slot}`;
+
+      // Skip derives with onSlotChange or surprise callbacks that need CPU-side values
+      // (We can't detect this perfectly at compile time, so we check if the slot has
+      // min/max range constraints — those trigger surprise detection which needs CPU)
+      const shrub = this._shrubs.get(d.shrub);
+      let needsCpu = false;
+      if (shrub) {
+        const slotSchema = shrub.schema.slots.get(d.slot);
+        if (slotSchema && (slotSchema.min !== undefined || slotSchema.max !== undefined)) {
+          needsCpu = true; // surprise detection needs CPU eval
+        }
+      }
+
+      if (needsCpu || !d.compiled) {
+        this._cpuDerives.push(d);
+        continue;
+      }
+
+      // Build resolver: maps slot/ident/dep refs to WGSL accessor strings
+      const resolver = (kind, name) => {
+        if (kind === 'slot') {
+          // Check if this slot is produced by a prior GPU derive
+          const refKey = `${d.shrub}/${name}`;
+          if (gpuDeriveKeys.has(refKey)) {
+            // Sanitize name for WGSL struct field
+            return `derives.${name.replace(/-/g, '_')}`;
+          }
+          // Check if this slot maps to a heap field via @channel
+          const target = channelTargets.get(refKey);
+          if (target) {
+            const field = target.split('/').pop();
+            return `params.${field.replace(/-/g, '_')}`;
+          }
+          // Check if it's a direct heap field name (common pattern)
+          return `params.${name.replace(/-/g, '_')}`;
+        }
+        if (kind === 'ident') {
+          // Idents that are slot references
+          const refKey = `${d.shrub}/${name}`;
+          if (gpuDeriveKeys.has(refKey)) return `derives.${name.replace(/-/g, '_')}`;
+          return `params.${name.replace(/-/g, '_')}`;
+        }
+        if (kind === 'dep') {
+          // Cross-shrub dep: resolve via schema
+          if (!shrub) return null;
+          const depDef = shrub.schema.deps.get(name);
+          if (!depDef) return null;
+          const parts = depDef.path.split('/').filter(Boolean);
+          if (parts.length < 2) return null;
+          const crossKey = `${parts[0]}/${parts.slice(1).join('/')}`;
+          if (gpuDeriveKeys.has(crossKey)) return `derives.${parts.slice(1).join('_').replace(/-/g, '_')}`;
+          return `params.${parts.slice(1).join('_').replace(/-/g, '_')}`;
+        }
+        return null;
+      };
+
+      const result = Rex.compileExprToWGSL(d.compiled, resolver);
+      if (result.viable) {
+        d._wgsl = result.wgsl;
+        d._wgslField = d.slot.replace(/-/g, '_');
+        this._gpuDerives.push(d);
+        gpuDeriveKeys.add(deriveKey);
+      } else {
+        this._cpuDerives.push(d);
+      }
+    }
+
+    // Channel elimination: mark channels whose source is a GPU derive as eliminated
+    // These channels would copy derive results from JS to GPU heap — unnecessary when
+    // the derive result is already in GPU storage buffer.
+    let eliminated = 0;
+    for (const ch of this._channels) {
+      const chKey = `${ch.from.shrub}/${ch.from.slot}`;
+      ch._gpuEliminated = gpuDeriveKeys.has(chKey);
+      if (ch._gpuEliminated) eliminated++;
+    }
+
+    if (this._gpuDerives.length > 0) {
+      this.log(`behaviour: derives classified: ${this._gpuDerives.length} GPU, ${this._cpuDerives.length} CPU, ${eliminated} channels eliminated`, 'ok');
+    }
+
+    // Build form dependency map: formFieldName → Set<cpuDeriveIndex>
+    this._deriveFormDeps = new Map();
+    const cpuDrvs = this._cpuDerives;
+    for (let i = 0; i < cpuDrvs.length; i++) {
+      const d = cpuDrvs[i];
+      if (!d.compiled) continue;
+      const refs = new Set();
+      Rex.collectSlotRefs(d.compiled, refs);
+      for (const ref of refs) {
+        if (ref.startsWith('form/')) {
+          const fieldName = ref.slice(5);
+          if (!this._deriveFormDeps.has(fieldName)) this._deriveFormDeps.set(fieldName, new Set());
+          this._deriveFormDeps.get(fieldName).add(i);
+        }
+      }
+    }
   }
 
   _extractSlotRefs(expr, compiled) {
@@ -485,6 +646,94 @@ export class RexBehaviour {
   // EXECUTE PHASE — Expression Evaluation
   // ════════════════════════════════════════════════════════════════
 
+  // ── Per-derive dirty tracking ──
+
+  _markDeriveDirty(shrubName, slotName) {
+    if (!this._derivedSlots || !this._deriveDirty) return;
+    const key = `${shrubName}/${slotName}`;
+    const idx = this._derivedSlots.get(key);
+    if (idx === undefined) return;
+    if (this._deriveDirty[idx]) return;  // already dirty
+    this._deriveDirty[idx] = 1;
+    // Propagate: mark all transitive dependents via revDeps
+    const stack = this._deriveRevDeps[idx].slice();
+    while (stack.length > 0) {
+      const cur = stack.pop();
+      if (!this._deriveDirty[cur]) {
+        this._deriveDirty[cur] = 1;
+        for (const dep of this._deriveRevDeps[cur]) stack.push(dep);
+      }
+    }
+  }
+
+  _markDeriveDirtyByIndex(idx) {
+    if (!this._deriveDirty || this._deriveDirty[idx]) return;
+    this._deriveDirty[idx] = 1;
+    const stack = this._deriveRevDeps[idx].slice();
+    while (stack.length > 0) {
+      const cur = stack.pop();
+      if (!this._deriveDirty[cur]) {
+        this._deriveDirty[cur] = 1;
+        for (const dep of this._deriveRevDeps[cur]) stack.push(dep);
+      }
+    }
+  }
+
+  _markAllDerivesDirty() {
+    if (this._deriveDirty) this._deriveDirty.fill(1);
+  }
+
+  // Batched derive flush: eval only dirty CPU derives in topological order, then push channels.
+  // Replaces the old pattern of calling _recomputeDerives() + _pushChannels() at every mutation point.
+  _flushDerives() {
+    // Write ShrubLM confidence/ready shadow slots before derive pass
+    if (this.getShrubLM) {
+      for (const [shrubName, shrub] of this._shrubs) {
+        const lm = this.getShrubLM(shrubName);
+        if (!lm) continue;
+        shrub.slots.set(`__lm_ready_${shrubName}`, lm.ready ? 1 : 0);
+        shrub.slots.set(`__lm_confidence_${shrubName}`, lm.confidence);
+      }
+    }
+
+    const derivesToEval = this._cpuDerives || this._derives;
+    const hasDirty = this._deriveDirty;
+    for (let i = 0; i < derivesToEval.length; i++) {
+      if (hasDirty && !hasDirty[i]) continue;  // skip clean derives
+      if (hasDirty) hasDirty[i] = 0;
+
+      const d = derivesToEval[i];
+      const shrub = this._shrubs.get(d.shrub);
+      if (!shrub) continue;
+      const ctx = { shrub: d.shrub, slots: shrub.slots, kids: shrub.kids, deps: shrub.schema.deps };
+      const val = this._evalExpr(d.expr, ctx);
+      if (val !== undefined) {
+        const prev = shrub.slots.get(d.slot);
+        shrub.slots.set(d.slot, val);
+        if (val !== prev) {
+          // Value changed — mark downstream derives dirty (they have higher indices)
+          this._markDeriveDirty(d.shrub, d.slot);
+          if (this.onSlotChange) this.onSlotChange(d.shrub, d.slot, val);
+          // Surprise detection
+          if (this.onSurpriseSignal && typeof val === 'number') {
+            const slotSchema = shrub.schema.slots.get(d.slot);
+            if (slotSchema) {
+              const { min, max } = slotSchema;
+              if ((min !== undefined && val < min) || (max !== undefined && val > max)) {
+                this.onSurpriseSignal(d.shrub, d.slot, val, { min, max });
+                try { this._attemptRecovery(d.shrub, d.slot, val, { min, max }); }
+                catch (e) { this.log(`behaviour: recovery error: ${e.message}`, 'err'); }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    this._pushChannels();
+  }
+
+  // Legacy: kept for backward compat — delegates to _flushDerives with all-dirty
   _recomputeDerives() {
     // Write ShrubLM confidence/ready shadow slots before derive pass
     if (this.getShrubLM) {
@@ -496,7 +745,9 @@ export class RexBehaviour {
       }
     }
 
-    for (const d of this._derives) {
+    // Only iterate CPU derives — GPU derives run as compute dispatch
+    const derivesToEval = this._cpuDerives || this._derives;
+    for (const d of derivesToEval) {
       const shrub = this._shrubs.get(d.shrub);
       if (!shrub) continue;
       const ctx = { shrub: d.shrub, slots: shrub.slots, kids: shrub.kids, deps: shrub.schema.deps };
@@ -579,6 +830,8 @@ export class RexBehaviour {
     if (this._channels.length === 0 || !this.onChannelPush) return;
     const now = performance.now();
     for (const ch of this._channels) {
+      // Skip GPU-eliminated channels — derive result already in GPU storage buffer
+      if (ch._gpuEliminated) continue;
       const shrub = this._shrubs.get(ch.from.shrub);
       if (!shrub) continue;
       const val = shrub.slots.get(ch.from.slot);
@@ -677,17 +930,20 @@ export class RexBehaviour {
       this._executeMutation(mut, ctx);
     }
 
-    // Recompute derives after mutations
-    this._recomputeDerives();
-
-    // Fire transitive dep reactions triggered by slot changes
+    // Mark derives dirty for changed slots (instead of full recompute)
     const directChanges = new Map();
     for (const [s, v] of shrub.slots) {
-      if (v !== preSnapshot.get(s)) directChanges.set(s, v);
+      if (v !== preSnapshot.get(s)) {
+        directChanges.set(s, v);
+        this._markDeriveDirty(shrubName, s);
+      }
     }
+
+    // Fire transitive dep reactions (marks more derives dirty)
     if (directChanges.size > 0) this._fireDepReactions(shrubName, directChanges);
 
-    this._pushChannels();
+    // Single batched flush after all mutations + dep reactions complete
+    this._flushDerives();
 
     // Build causal record and emit
     if (this.onTalkFired) {

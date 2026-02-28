@@ -42,8 +42,14 @@ export class RexForm {
           if(self.externalState&&self.externalState[key]!==undefined) return self.externalState[key];
           return 0;
         }
-        if(op==='call'&&self.behaviour&&self.behaviour.hasDef(key)){
-          return self.behaviour.callDef(key,args);
+        if(op==='call'){
+          if(self.behaviour&&self.behaviour.hasDef(key)) return self.behaviour.callDef(key,args);
+          // Zero-arg call: treat as ident/slot (handles `(form/x)`, `(my-field)`, etc.)
+          if(!args||args.length===0){
+            if(key.startsWith('form/')&&self.state[key.slice(5)]!==undefined) return self.state[key.slice(5)];
+            if(self.state[key]!==undefined) return self.state[key];
+            if(self.externalState&&self.externalState[key]!==undefined) return self.externalState[key];
+          }
         }
         return undefined;
       }

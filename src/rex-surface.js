@@ -472,6 +472,13 @@ export class RexSurface {
     this._surfaceTypeSet = new Set(['rect', 'text', 'panel', 'shadow', 'path', 'text-editor']);
     this._warnedTypes = new Set();
 
+    // Incremental compile tracking
+    this._lastTree = null;
+    this._lastCanvasWidth = 0;
+    this._lastCanvasHeight = 0;
+    this._editorDirty = false;
+    this._nonEditorCounts = null;  // {paths, segs, quads, grads, stops} saved before editor collection
+
     // Create pipelines once
     this._createPipelines();
   }
@@ -511,6 +518,20 @@ export class RexSurface {
     this._tilesX = Math.ceil(canvasWidth / TILE_SIZE);
     this._tilesY = Math.ceil(canvasHeight / TILE_SIZE);
 
+    const sizeChanged = canvasWidth !== this._lastCanvasWidth || canvasHeight !== this._lastCanvasHeight;
+    const treeChanged = tree !== this._lastTree;
+
+    // ── Fast path: editor-only recompile ──
+    if (!treeChanged && !sizeChanged && this._editorDirty && this._active && this._nonEditorCounts) {
+      this._editorDirty = false;
+      return this._recompileEditorOnly();
+    }
+
+    this._lastTree = tree;
+    this._lastCanvasWidth = canvasWidth;
+    this._lastCanvasHeight = canvasHeight;
+    this._editorDirty = false;
+
     // 1. Collect all surface elements
     this._paths = [];
     this._segments = [];
@@ -520,6 +541,7 @@ export class RexSurface {
     this._measureCache = new Map();  // Phase 2C: memoize _measureElement per compile
     this._surfaceCtx = null;         // reset eval context each compile (picks up fresh formState)
     this._warnedTypes.clear();
+    this._nonEditorCounts = null;
     this._collectElements(tree, 0, 0);
 
     const hasPaths = this._paths.length > 0;
@@ -547,6 +569,38 @@ export class RexSurface {
     this._createBindGroups();
 
     this.log(`surface: ${this._paths.length} paths, ${this._segments.length} segs, ${this._textQuads.length} glyphs, ${this._tilesX}x${this._tilesY} tiles`, 'ok');
+  }
+
+  // ── Incremental editor-only recompile ──
+  // Only re-collects text-editor elements, preserving all non-editor paths/segments.
+  // Called when tree reference unchanged and only editor content changed.
+  _recompileEditorOnly() {
+    const c = this._nonEditorCounts;
+    this._paths.length = c.paths;
+    this._segments.length = c.segs;
+    this._textQuads.length = c.quads;
+    this._gradients.length = c.grads;
+    this._gradientStops.length = c.stops;
+
+    this._surfaceCtx = null;
+    this._nonEditorCounts = null;  // will be re-saved by _collectTextEditor
+
+    // Re-collect only text-editor elements via cached node refs
+    for (const [, ed] of this._editors) {
+      if (ed._node) {
+        this._collectTextEditor(ed._node, ed._offsetX || 0, ed._offsetY || 0, ed._clip);
+      }
+    }
+
+    const hasPaths = this._paths.length > 0;
+    const hasText = this._textQuads.length > 0;
+    if (!hasPaths && !hasText) { this._active = false; return; }
+    this._active = true;
+
+    if (hasText) this._buildGlyphAtlas();
+    this._createBuffers();
+    this._uploadSceneData();
+    this._createBindGroups();
   }
 
   // ════════════════════════════════════════════════════════════════
@@ -1166,6 +1220,14 @@ export class RexSurface {
 
   // ── @text-editor — interactive editable text area (Phase 5: self-hosting) ──
   _collectTextEditor(node, offsetX, offsetY, clip) {
+    // Save non-editor counts on first editor (for incremental recompile)
+    if (!this._nonEditorCounts) {
+      this._nonEditorCounts = {
+        paths: this._paths.length, segs: this._segments.length,
+        quads: this._textQuads.length, grads: this._gradients.length,
+        stops: this._gradientStops.length,
+      };
+    }
     const id = node.name || node.attrs.id || `editor-${this._editors.size}`;
     const x = this._numAttr(node, 'x', 0) + offsetX;
     const y = this._numAttr(node, 'y', 0) + offsetY;
@@ -1194,6 +1256,8 @@ export class RexSurface {
     ed.x = x; ed.y = y; ed.w = w; ed.h = h;
     ed.lineHeight = lineHeight; ed.size = size; ed.padding = padding;
     ed.hasLineNumbers = !!this._attr(node, 'line-numbers', false);
+    // Cache for incremental recompile
+    ed._node = node; ed._offsetX = offsetX; ed._offsetY = offsetY; ed._clip = clip;
 
     const cursorPos = ed.cursor;
     const scrollY = ed.scrollY;

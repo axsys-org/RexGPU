@@ -566,45 +566,90 @@ This is why the spec describes transcoding as functor composition even though no
 
 ---
 
-## 11. Migration Plan
+## 11. Infrastructure Now Available (Feb 27 2026)
+
+The following subsystems have been built and tested. RexMedia can build on top of them rather than implementing from scratch.
+
+### Fiber Runtime (`src/rex-fiber.js`, 1250 lines, 45/45 tests)
+
+- **Hooks** — `rexUseState`, `rexUseMemo`, `rexUseOne`, `rexUseResource`, `rexUseContext`. Media nodes can use `rexUseResource` for load/dispose lifecycle and `rexUseMemo` to skip redundant decodes.
+- **Yeet/Gather** — `@track` children yeet decoded segments upstream; `@media` parent gathers them into the namespace. Natural fit for DAG amendment pattern.
+- **Keyed reconciliation** — `@track drums` / `@track bass` as keyed children. Add/remove tracks without re-decoding the source.
+- **FiberHeapAllocator** — SharedArrayBuffer-capable (`{shared: true}`), first-fit free list, dirty range tracking. Media scalars (BPM, RMS, beat timestamps) can live on the shared heap at compiled offsets.
+
+### Worker Pool (`DeriveWorkerPool`, `src/derive-worker.js`)
+
+- **Round-robin dispatch** to `hardwareConcurrency - 1` workers over SharedArrayBuffer.
+- **Graceful degradation** — if no COOP/COEP headers, falls back to main-thread.
+- **Crash recovery** — respawns failed workers, rejects pending tasks.
+- **Relevance to RexMedia**: heavy transcode passes (Demucs, Essentia, GLTF parse) can reuse this pool or follow the same Worker + `postMessage` pattern. The `derive-worker.js` pattern (standalone file, copied to `dist/` via `WORKLET_FILES`) is the template.
+
+### Command Ring (`CommandRing`, io_uring-style)
+
+- **SQE/CQE tracking** — each submitted command gets a monotonic ID, completion with timing data.
+- **Frame aggregation** — `submitFrame()`/`endFrame()` → `{commandCount, totalGpuMs}`.
+- **Relevance to RexMedia**: transcode passes can be tracked as ring submissions. `ring.submit('transcode', {asset: 'song', pass: 'stems'})` → `ring.complete(id, {tracks: 4})` on worker response. Gives unified profiling across GPU commands and media decode.
+
+### Channel Contention (`ChannelContention`, Pedersen claim/queue)
+
+- **CAS-based claim/queue** for contested heap offsets.
+- **Relevance to RexMedia**: live resources (FFT, video frame) updating the same namespace entry or heap offset as a GPU pass reading it. Contention ensures writes don't race reads across frames.
+
+### Audio System (`src/rex-audio.js`, `src/synth-processor.js`)
+
+- **AudioWorklet synth** already running in a separate thread.
+- **Sample loading** — `_sampleCache`, `_sampleMap` ready to migrate to namespace.
+- **FFT data** — `AnalyserNode` producing live frequency data, ready to route to namespace.
+
+### Build System
+
+- `WORKLET_FILES` array copies standalone scripts to `dist/` (currently: `synth-processor.js`, `derive-worker.js`). Future media workers (e.g., `demucs-worker.js`, `essentia-worker.js`) follow the same pattern.
+
+---
+
+## 12. Migration Plan
 
 ### Phase A — Skeleton (no breaking changes)
 
 1. Create `src/rex-media.js` — `RexMedia` class, namespace map, `transduce`/`compile`/`execute`
-2. `@media :type sample-bank` — migrate `RexAudio._sampleMap` / `_sampleCache` here
-3. `@media :type image` — migrate `RexGPU._textures` loading here
-4. Wire `main.js`: `media = new RexMedia(gpu.device, audio._ctx, log)`, call before GPU/audio
-5. Pass `media` to `RexGPU` and `RexAudio` for namespace reads
+2. Each `@media` node compiles to a fiber via `rexUse(mediaFiber, node)` — hooks manage load/dispose lifecycle
+3. `@media :type sample-bank` — migrate `RexAudio._sampleMap` / `_sampleCache` here
+4. `@media :type image` — migrate `RexGPU._textures` loading here
+5. Wire `main.js`: `media = new RexMedia(gpu.device, audio._ctx, log)`, call before GPU/audio
+6. Pass `media` to `RexGPU` and `RexAudio` for namespace reads
 
 ### Phase B — Live resources
 
-6. `@media :type video` → `importExternalTexture` per frame
-7. `@media :type audio :transcode [fft]` → live FFT (migrate from `RexAudio.onFftData`)
-8. Beat events: `media.onBeat` → `behaviour.fireTalk`
+7. `@media :type video` → `importExternalTexture` per frame (via `rexUseMemo` with frame-version dep)
+8. `@media :type audio :transcode [fft]` → live FFT (migrate from `RexAudio.onFftData`)
+9. Beat events: `media.onBeat` → `behaviour.fireTalk`
+10. Live namespace scalars (BPM, RMS) written to shared heap via `FiberHeapAllocator`
 
-### Phase C — Transcode passes
+### Phase C — Transcode passes (Worker architecture)
 
-9. Essentia.js WASM — BPM + beat tracking + key detection
-10. Demucs ONNX — stem splitting, Worker architecture, OPFS caching
-11. GLTF loader — mesh + skeleton + animation
-12. Gaussian splat decoder — .splat / .ply binary format
+11. Essentia.js WASM — BPM + beat tracking + key detection (Worker, follows derive-worker.js pattern)
+12. Demucs ONNX — stem splitting, OPFS model caching (heavy Worker, `CommandRing` tracked)
+13. GLTF loader — mesh + skeleton + animation (Worker for parse, main thread for GPU upload)
+14. Gaussian splat decoder — .splat / .ply binary format
+15. `@track` children as keyed fibers: yeet decoded segments, parent gathers into namespace
 
 ### Phase D — Full namespace wiring
 
-13. Rex optic paths in `@buffer :data` resolve via namespace (replaces form-state-only lookup)
-14. `@bind :media path` in GPU passes
-15. `@pattern :bank path` in audio patterns
-16. Remove duplicate asset stores from individual transducers
+16. Rex optic paths in `@buffer :data` resolve via namespace (replaces form-state-only lookup)
+17. `@bind :media path` in GPU passes
+18. `@pattern :bank path` in audio patterns
+19. `ChannelContention` guards live resource writes vs GPU reads
+20. Remove duplicate asset stores from individual transducers
 
 ### Phase E — Codec algebra (long-term)
 
-17. Formalize `Codec<Domain, Value>` typeclass in Rex type system (post Rex-WASM-Parser)
-18. `registerTranscodePass` becomes composable: passes chain as functor composition
-19. Trained transcoding model as universal decode node
+21. Formalize `Codec<Domain, Value>` typeclass in Rex type system (post Rex-WASM-Parser)
+22. `registerTranscodePass` becomes composable: passes chain as functor composition
+23. Trained transcoding model as universal decode node
 
 ---
 
-## 12. Open Questions
+## 13. Open Questions
 
 1. **OPFS vs Cache API for model storage** — OPFS is faster for large random-access files (Demucs 80MB). Cache API is simpler. Use OPFS for models, Cache API for WASM modules.
 

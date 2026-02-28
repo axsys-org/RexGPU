@@ -162,10 +162,22 @@ import { RexAudio } from './rex-audio.js';
     audio.setParam(buffer, field, value);
   };
   // ── Readback bridge: GPU → behaviour ──
-  gpu.onReadback = (name, values) => {
-    // Push readback values as behaviour slot updates: @readback name maps to shrub "_gpu" slot "name"
-    // Values array is accessible; first value pushed as scalar
-    if(behaviour) behaviour.pushFormValue(name, values.length === 1 ? values[0] : Array.from(values));
+  gpu.onReadback = (name, values, meta) => {
+    if (!behaviour) return;
+    // Optic-driven readback: typed object → push individual fields as slots
+    if (meta && meta.typed && typeof values === 'object' && !ArrayBuffer.isView(values)) {
+      // Push the whole object
+      behaviour.pushFormValue(name, values);
+      // Also push individual fields: "name/field" → value
+      for (const [k, v] of Object.entries(values)) {
+        behaviour.pushFormValue(`${name}/${k}`, v);
+      }
+      // Route to specific slot if :to was specified
+      if (meta.toSlot) behaviour.pushFormValue(meta.toSlot, values);
+    } else {
+      // Legacy: raw Float32Array readback
+      behaviour.pushFormValue(name, values.length === 1 ? values[0] : Array.from(values));
+    }
   };
   // Wire form state into behaviour and surface for expression evaluation
   behaviour.formState = form.state;
@@ -228,6 +240,10 @@ import { RexAudio } from './rex-audio.js';
       interactAttrs=Rex.find(currentTree,'interact')?.attrs||null;
       form.transduce(currentTree);
       behaviour.transduce(currentTree, true);
+      // GPU derive compute: compile GPU-eligible @derive expressions to compute shader
+      if (gpu.device) {
+        gpu._compileDeriveCompute(behaviour.getGpuDerives());
+      }
       // PCN: register each @shrub as agent + ShrubLM, wire connectome + dep graph
       if(pcn){
         const depEdges = behaviour.getCrossShrubDeps();
@@ -371,7 +387,7 @@ import { RexAudio } from './rex-audio.js';
       const r=canvas.getBoundingClientRect();
       const dpr=Math.min(devicePixelRatio||1,2);
       if(surface.handleEditorClick((e.clientX-r.left)*dpr,(e.clientY-r.top)*dpr)){
-        surfaceDirty=true; // Defer recompile to frame loop
+        surfaceDirty=true; surface._editorDirty=true;
       }
     }
   });
@@ -380,7 +396,7 @@ import { RexAudio } from './rex-audio.js';
       if(e.target===editor||e.target===prompt) return;
       if(surface.handleEditorKey(e.key, e.shiftKey, e.ctrlKey, e.metaKey)){
         e.preventDefault();
-        surfaceDirty=true; // Defer recompile to frame loop
+        surfaceDirty=true; surface._editorDirty=true;
       }
     }
   });
@@ -388,7 +404,7 @@ import { RexAudio } from './rex-audio.js';
     if(surface && surface.focusedEditor){
       if(surface.handleEditorScroll(e2.deltaY)){
         e2.preventDefault();
-        surfaceDirty=true; // Defer recompile to frame loop
+        surfaceDirty=true; surface._editorDirty=true;
         return;
       }
     }
@@ -428,7 +444,7 @@ import { RexAudio } from './rex-audio.js';
       pre.style.cssText='font-size:9px;color:var(--dim);margin-top:4px;max-height:60px;overflow:auto;white-space:pre;';
       pre.textContent=rexSrc.slice(0,300)+(rexSrc.length>300?'\n\u2026':'');
       thinking.appendChild(pre);
-      editor.value=rexSrc; lastSrc=''; gpu.invalidate(); form.state={}; parseSource();
+      editor.value=rexSrc; lastSrc=''; Rex.resetLexCache(); gpu.invalidate(); form.state={}; parseSource();
       flushLog();
       if(currentTree){
         const nc=(function count(n){let c=1;for(const ch of n.children)c+=count(ch);return c;})(currentTree);
@@ -532,7 +548,7 @@ import { RexAudio } from './rex-audio.js';
     // Restore state from active tab
     const tab = tabMgr.getActive();
     if (tab) {
-      lastSrc = ''; // Force re-parse
+      lastSrc = ''; Rex.resetLexCache(); // Force re-parse
       parseSource();
     }
     currentRafId = requestAnimationFrame(frame);

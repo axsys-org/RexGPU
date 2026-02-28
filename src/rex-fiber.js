@@ -18,6 +18,7 @@ const Hook = {
   CALLBACK: 3,
   RESOURCE: 4,
   CONTEXT:  5,
+  GPU_MEMO: 6,
 };
 
 const STATE_SLOTS = 3;
@@ -168,6 +169,28 @@ export function rexUseContext(contextKey) {
   return ref.current;
 }
 
+// GPU memo hook: registers a compiled Rex expression for GPU compute evaluation.
+// Returns a GPUSlotRef {field, index} that downstream hooks/passes bind directly.
+// Deps tracked CPU-side — if deps change, host marks shader for recompilation.
+export function rexUseGpuMemo(exprAst, deps) {
+  const fiber = _getCurrentFiber();
+  const idx = _pushState(fiber, Hook.GPU_MEMO);
+  const s = fiber.state;
+  if (s[idx] === _UNSET || !_isSameDeps(s[idx + 1], deps)) {
+    // Register with host for GPU compute batch inclusion
+    const field = `gpumemo_${fiber.id}_${idx}`;
+    const ref = { field, index: -1, exprAst, dirty: true };
+    s[idx] = ref;
+    s[idx + 1] = deps ? deps.slice() : null;
+    // Notify host that GPU compute shader needs recompilation
+    if (fiber.host && fiber.host._gpuMemoRegistry) {
+      fiber.host._gpuMemoRegistry.set(field, ref);
+      fiber.host._gpuMemoDirty = true;
+    }
+  }
+  return s[idx];
+}
+
 // ── §5 Combinators ───────────────────────────────────────────────
 
 export function rexYeet(value) {
@@ -244,92 +267,90 @@ function _arraysEqual(a, b) {
 
 export class FiberQueue {
   constructor() {
-    this.head = null;
-    this.tail = null;
-    this.hint = null;
-    this.set = new Set();
+    this._heap = [];            // binary min-heap by _compareFibers
+    this._idx = new Map();      // fiber → index in _heap (O(1) lookup for remove)
+    this.set = new Set();       // preserved: O(1) membership check
   }
 
   insert(fiber) {
     if (this.set.has(fiber)) return;
     this.set.add(fiber);
-    const node = { fiber, next: null };
-    if (!this.head) { this.head = this.tail = node; return; }
-    // Fast: append
-    if (_compareFibers(this.tail.fiber, fiber) <= 0) {
-      this.tail.next = node; this.tail = node; return;
-    }
-    // Fast: prepend
-    if (_compareFibers(fiber, this.head.fiber) < 0) {
-      node.next = this.head; this.head = node; return;
-    }
-    // General: sorted insert with hint
-    let cur = (this.hint && _compareFibers(this.hint.fiber, fiber) <= 0)
-      ? this.hint : this.head;
-    while (cur.next && _compareFibers(cur.next.fiber, fiber) < 0) cur = cur.next;
-    node.next = cur.next;
-    cur.next = node;
-    if (!node.next) this.tail = node;
-    this.hint = cur;
+    const i = this._heap.length;
+    this._heap.push(fiber);
+    this._idx.set(fiber, i);
+    this._up(i);
   }
 
   remove(fiber) {
     if (!this.set.has(fiber)) return;
     this.set.delete(fiber);
-    if (this.head && this.head.fiber === fiber) {
-      if (this.hint === this.head) this.hint = this.head.next;
-      this.head = this.head.next;
-      if (!this.head) { this.tail = null; this.hint = null; }
-      return;
-    }
-    let q = this.head;
-    while (q && q.next) {
-      if (q.next.fiber === fiber) {
-        if (this.hint === q.next) this.hint = q.next.next;
-        if (this.tail === q.next) this.tail = q;
-        q.next = q.next.next;
-        return;
-      }
-      q = q.next;
-    }
+    const i = this._idx.get(fiber);
+    this._idx.delete(fiber);
+    const last = this._heap.length - 1;
+    if (i === last) { this._heap.pop(); return; }
+    const moved = this._heap[last];
+    this._heap[i] = moved;
+    this._heap.pop();
+    this._idx.set(moved, i);
+    this._up(i);
+    this._down(this._idx.get(moved));
   }
 
   reorder(parent) {
     const extracted = [];
-    let prev = null, cur = this.head;
-    while (cur) {
-      if (_isDescendant(parent, cur.fiber)) {
-        extracted.push(cur.fiber);
-        this.set.delete(cur.fiber);
-        if (prev) { prev.next = cur.next; }
-        else { this.head = cur.next; }
-        if (this.tail === cur) this.tail = prev;
-        if (this.hint === cur) this.hint = prev;
-        cur = prev ? prev.next : this.head;
-      } else {
-        prev = cur; cur = cur.next;
-      }
+    for (let i = this._heap.length - 1; i >= 0; i--) {
+      if (_isDescendant(parent, this._heap[i])) extracted.push(this._heap[i]);
     }
-    if (!this.head) { this.tail = null; this.hint = null; }
-    if (extracted.length) {
-      extracted.sort(_compareFibers);
-      for (const f of extracted) this.insert(f);
-    }
+    for (const f of extracted) this.remove(f);
+    for (const f of extracted) this.insert(f);
   }
 
-  peek() { return this.head ? this.head.fiber : null; }
+  peek() { return this._heap.length > 0 ? this._heap[0] : null; }
 
   pop() {
-    if (!this.head) return null;
-    const fiber = this.head.fiber;
-    if (this.hint === this.head) this.hint = this.head.next;
-    this.head = this.head.next;
-    if (!this.head) { this.tail = null; this.hint = null; }
-    this.set.delete(fiber);
-    return fiber;
+    if (this._heap.length === 0) return null;
+    const top = this._heap[0];
+    this.set.delete(top);
+    this._idx.delete(top);
+    if (this._heap.length === 1) { this._heap.length = 0; return top; }
+    const last = this._heap.pop();
+    this._heap[0] = last;
+    this._idx.set(last, 0);
+    this._down(0);
+    return top;
   }
 
-  get size() { return this.set.size; }
+  get size() { return this._heap.length; }
+
+  _up(i) {
+    const h = this._heap;
+    while (i > 0) {
+      const p = (i - 1) >> 1;
+      if (_compareFibers(h[i], h[p]) >= 0) break;
+      this._swap(i, p);
+      i = p;
+    }
+  }
+
+  _down(i) {
+    const h = this._heap, n = h.length;
+    while (true) {
+      let s = i;
+      const l = 2 * i + 1, r = 2 * i + 2;
+      if (l < n && _compareFibers(h[l], h[s]) < 0) s = l;
+      if (r < n && _compareFibers(h[r], h[s]) < 0) s = r;
+      if (s === i) break;
+      this._swap(i, s);
+      i = s;
+    }
+  }
+
+  _swap(i, j) {
+    const h = this._heap;
+    const t = h[i]; h[i] = h[j]; h[j] = t;
+    this._idx.set(h[i], i);
+    this._idx.set(h[j], j);
+  }
 }
 
 // ── §8 Support Classes ───────────────────────────────────────────
@@ -764,6 +785,9 @@ export class RexFiberHost {
         workerUrl: opts.workerUrl,
       });
     }
+    // GPU memo registry: field → {field, index, exprAst, dirty}
+    this._gpuMemoRegistry = new Map();
+    this._gpuMemoDirty = false;
   }
 
   // ID
@@ -806,6 +830,11 @@ export class RexFiberHost {
   get contention() { return this._contention; }
   get commandRing() { return this._commandRing; }
   get workerPool() { return this._workerPool; }
+
+  // GPU memo: registered expressions for GPU compute batch
+  get gpuMemoRegistry() { return this._gpuMemoRegistry; }
+  get gpuMemoDirty() { return this._gpuMemoDirty; }
+  clearGpuMemoDirty() { this._gpuMemoDirty = false; }
 
   // Mount root
   mount(fn, args) {
