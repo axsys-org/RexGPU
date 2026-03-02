@@ -403,6 +403,232 @@ The visual result: the character appears to crystallize out of a fluid perturbat
 
 ---
 
+## The No-UI-Tree Thesis
+
+### What "No UI Tree" Actually Means
+
+Every UI framework in existence is a tree:
+
+```
+React:    Component → Component → Component → DOM
+Flutter:  Widget → Widget → Widget → RenderObject
+SwiftUI:  View → View → View → UIView
+CSS:      Box → Box → Box → Pixel
+```
+
+Layout is a tree walk. Hit testing is a tree walk. Focus is a tree walk. Accessibility is a tree walk. Animation is tree diffing. The tree is the universal abstraction — and the universal bottleneck.
+
+The field paradigm eliminates the tree for layout and rendering. Elements are not nested boxes. They are field perturbations — point sources with position, strength, and falloff. Layout is not constraint solving. It is field equilibrium — the smooth-min composition of all sources, evaluated per-pixel on the GPU. There is no layout pass because there is no tree to walk.
+
+### Two Levels of Tree Elimination
+
+**Level 1: No rendering/layout tree (achievable)**
+
+The `@field` system replaces the widget tree for layout and rendering:
+
+```
+BEFORE (tree):  Panel → Row → [Button, Text, Button] → measure → layout → rasterize
+AFTER (field):  φ(x,y) = smin(source_a, source_b, source_c, k) → per-pixel evaluate → done
+```
+
+No tree walk. No constraint solver. No layout pass. No measure pass. Elements merge, split, and flow continuously. The field IS the layout. Animation does not exist — the field is always settling toward equilibrium, so motion is continuous and free.
+
+The Vello path rasterizer (`rex-surface.js:2449`) still exists for crisp text and icons, but it composites *on top* of the field output. The field provides the spatial structure; the surface provides the visual detail.
+
+**Level 2: No DOM at all (the hard problem)**
+
+The platform requires a DOM for affordances the GPU cannot provide:
+
+| Affordance | Why DOM Required | Field Alternative |
+|---|---|---|
+| Text selection | Selection API owns the clipboard | Invisible `<span>` with `color: transparent` |
+| Screen readers | ARIA requires real DOM nodes | Accessibility shadow (minimal semantic DOM) |
+| IME composition | EditContext or `<textarea>` required | EditContext fiber resource |
+| Tab navigation | focusable elements required | `<gpu-anchor>` with computed tabindex |
+| Popovers/tooltips | Top layer API | CSS anchor positioning on anchor divs |
+| Copy/paste | Clipboard API reads from DOM | Native — invisible text IS the clipboard source |
+
+This is why the Field-DOM spec has `@anchor` — the ghost ship bridge. The field renders everything visually, but invisible DOM elements provide platform affordances. It is the Flutter model: GPU renders, DOM serves accessibility and input.
+
+The developer never writes a UI tree. They write field sources. The minimal DOM tree is *synthesized* from field topology.
+
+### What the Field Gradient Replaces
+
+The tree was always an approximation of a continuous function. Every tree operation has a field equivalent that is continuous, composable, and GPU-parallel:
+
+| Tree Operation | Field Equivalent | Advantage |
+|---|---|---|
+| Layout (measure + place) | Field equilibrium (smooth-min composition) | No passes — equilibrium is the layout |
+| Hit testing (tree walk + bounds check) | Field sampling at cursor position | Continuous — gives proximity, not just in/out |
+| Tab order (DOM order / tabindex) | Steepest descent on field gradient | Spatial, not syntactic — follows visual flow |
+| Focus (activeElement) | Local field minimum | Natural — strongest field = most interactive |
+| Animation (state diff + interpolation) | Field evolution (advect/diffuse/react) | Free — field always settling toward equilibrium |
+| Proximity/hover | Field value at cursor | Continuous — 0.3 = approaching, 0.9 = on it |
+| Responsive breakpoints | Source strength functions | Continuous — no snap, smooth transition |
+| Z-ordering (tree depth / z-index) | Field strength dominance | Natural — strongest source wins |
+| Nesting (parent → child) | Nested fields (`@field` inside `@field`) | Scoped — child field bounded by parent source |
+| Component composition | Field source composition (smooth-min algebra) | Algebraic — commutative, associative, continuous |
+
+The tree encodes discrete containment. The field encodes continuous influence. Every UI is influence — buttons attract clicks, panels contain content, gaps repel elements. The field makes the influence explicit.
+
+### Why Rex Can Do This and Others Cannot
+
+Rex has four properties that make tree elimination possible:
+
+**1. Compile-time sugar expansion.** `@field` expands to `@texture` + `@shader` + `@pipeline` + `@dispatch`. Same pattern as `@filter` (`rex-gpu.js:885`). No new runtime. The field evaluator is just a compute shader — it runs in the same GPU command list as everything else.
+
+**2. Profunctor optics.** The DOM↔GPU bridge is a bidirectional optic. Forward: shrub slot → derive → channel → heap → WGSL uniform → field source position → anchor CSS transform. Backward: DOM Selection → slot write → derive dirty → channel push → GPU re-evaluate. The same algebra handles GPU readback, agent tool channels, form widgets, and field sources. No special-casing.
+
+**3. Fiber lifecycle.** DOM anchors persist across recompile via `rexUseResource` (`rex-fiber.js:142`). The user edits source code → tree re-parses → field re-expands → fiber reconciles by key → existing anchor DOM elements survive. Focus preserved. IME composition unbroken. Screen reader state intact.
+
+**4. Shrub as universal proxy.** The shrub holds all truth — field source parameters, anchor visibility, selection state, hover proximity, evolution step count. The field and DOM are views over the shrub. When the user drags a panel, the shrub slot updates, the channel pushes to GPU heap, the field re-evaluates, the anchor repositions. One source of truth, three projections (GPU field, surface rasterizer, DOM anchor).
+
+No other framework has all four. React has component trees but no GPU pipeline. Flutter has GPU rendering but Dart widget trees. Unity has compute shaders but no reactive data flow. Shadertoy has field evaluation but no DOM integration. Rex unifies them in a single `.rex` file.
+
+### Implications
+
+**For application developers:** Write field sources, not widget trees. Describe *where things are* and *how strongly they attract*, not *how they nest*. Layout is physics. Animation is evolution. Interaction is sampling.
+
+**For the framework:** The rendering pipeline becomes: evaluate field → visualize → composite with surface → sync anchors. No measure pass. No layout pass. No tree diff. The compile step generates shaders; the execute step runs them. The fiber host manages DOM resources. Everything else is existing infrastructure.
+
+**For the platform:** The DOM becomes a semantic shadow — 20-50 anchor elements providing ARIA roles, focus targets, and clipboard access. Not 500 nested divs encoding visual structure. The browser's layout engine handles 20 absolutely-positioned elements with `contain: layout style` — zero reflow, zero style recalc.
+
+**For accessibility:** Field gradient provides richer navigation than tree order. Steepest-descent paths converge on interactive elements. Gradient magnitude encodes "interaction density." Hilbert curve linearization preserves spatial locality. The continuous field contains more navigational information than a discrete tree — screen readers get *better* navigation, not worse.
+
+**For performance:** One compute dispatch evaluates the field for all elements simultaneously. O(sources × pixels) on the GPU, fully parallel. Compare to O(nodes) sequential tree walk in React/Flutter. The field evaluator doesn't care about element count — it cares about pixel count, which is fixed by resolution. 100 elements and 1000 elements cost the same.
+
+### The Remaining Question
+
+Can the developer experience match the abstraction? Writing `@source sidebar :pos (10 10) :strength 1.0 :falloff gaussian :sigma 120` is more alien than `<div class="sidebar">`. The field paradigm requires spatial thinking — positions, strengths, falloff functions — instead of hierarchical thinking — parents, children, siblings.
+
+The answer is tooling: visual field editors where you place sources by dragging, adjust strength by scrolling, see the field isosurface in real-time. The `.rex` source is the serialization format, not the authoring interface. The field is visual — it should be authored visually.
+
+But even without visual tooling, the notation is learnable. Three parameters per source (position, strength, falloff) versus dozens of CSS properties per element. And the results are fundamentally different — organic, continuous, responsive without breakpoints, animated without keyframes.
+
+---
+
+## Poisson Layout (Soft Flexbox)
+
+The research doc's Poisson equation section (§152-161) describes an approach not yet in the Field-DOM spec but worth developing: **layout as Laplace solve**.
+
+### The Idea
+
+Given sparse constraints (element positions, sizes, margins), solve the Laplace equation `Δu = 0` in the interior to find the smoothest possible field consistent with those constraints. This is "soft flexbox" — desired positions are boundary conditions, the field finds the smoothest equilibrium.
+
+```
+Given:  "sidebar at x=0, width=300" and "content at x=300, fills rest"
+Solve:  Δu = 0 with these boundary conditions
+Result: Smooth transition region between sidebar and content
+```
+
+### Why It Matters
+
+Traditional flexbox is rigid — grow factors and min/max constraints produce sharp transitions. Poisson layout produces C² continuous fields — infinitely smooth. The transition between "sidebar visible" and "sidebar hidden" is not a breakpoint snap but a smooth evolution of the Poisson solution as boundary conditions change.
+
+### GPU Implementation
+
+Jacobi iteration on a 2D grid — the same infrastructure as stable fluids pressure solve:
+
+```wgsl
+@compute @workgroup_size(16, 16)
+fn jacobi_step(@builtin(global_invocation_id) gid: vec3u) {
+  if (is_boundary(gid.xy)) { return; }  // fixed constraints
+  let sum = textureLoad(field, gid.xy + vec2i(1,0), 0).r
+          + textureLoad(field, gid.xy - vec2i(1,0), 0).r
+          + textureLoad(field, gid.xy + vec2i(0,1), 0).r
+          + textureLoad(field, gid.xy - vec2i(0,1), 0).r;
+  textureStore(field, vec2i(gid.xy), vec4f(sum * 0.25, 0, 0, 0));
+}
+```
+
+20-40 iterations per frame. Converges fast for UI-scale grids (256×256 to 512×512). Could be added as `:evolution poisson` or `:composition poisson` in the spec.
+
+---
+
+## Jump Flooding for Field Bootstrap
+
+When transitioning from Rex's existing surface elements (@rect, @panel, @text) to field layout, you need to convert rasterized geometry into an SDF. Jump Flooding Algorithm (JFA) does this in O(log₂N) compute passes:
+
+### Algorithm
+
+```
+1. Seed: for each pixel on a geometry boundary, store its own position
+2. For step_size in [N/2, N/4, N/8, ..., 1]:
+   For each pixel:
+     Check 8 neighbors at distance step_size
+     Keep the nearest seed position
+3. Distance field = distance to nearest seed
+```
+
+### WGSL Implementation
+
+```wgsl
+@compute @workgroup_size(16, 16)
+fn jfa_step(@builtin(global_invocation_id) gid: vec3u) {
+  let pos = vec2f(gid.xy);
+  var best_seed = textureLoad(seed_tex, vec2i(gid.xy), 0).xy;
+  var best_dist = distance(pos, best_seed);
+
+  for (var dy = -1; dy <= 1; dy++) {
+    for (var dx = -1; dx <= 1; dx++) {
+      let neighbor = vec2i(gid.xy) + vec2i(dx, dy) * step_size;
+      let seed = textureLoad(seed_tex, neighbor, 0).xy;
+      let d = distance(pos, seed);
+      if (d < best_dist) {
+        best_dist = d;
+        best_seed = seed;
+      }
+    }
+  }
+
+  textureStore(seed_tex, vec2i(gid.xy), vec4f(best_seed, 0, 0));
+  textureStore(sdf_tex, vec2i(gid.xy), vec4f(best_dist, 0, 0, 0));
+}
+```
+
+### Use Case
+
+Bootstrap a field from existing Rex surface elements. Render @panel/@rect to a seed texture, run JFA, get an SDF. Use the SDF as a field source with `:type sdf-texture`. This bridges the gap between Rex's current rectangle-based layout and the field paradigm — you can migrate incrementally.
+
+---
+
+## Haptic Field Extensions
+
+The field gradient contains information that maps directly to haptic feedback on devices that support it (game controllers, Apple Taptic Engine, Android haptic actuators):
+
+| Field Property | Haptic Mapping | User Experience |
+|---|---|---|
+| Gradient magnitude | Vibration intensity | "Feel" the boundary of a UI element |
+| Gradient direction | Directional pulse | Guided toward interactive elements |
+| Field curvature (Laplacian) | Texture/roughness | Distinguish flat regions from curved transitions |
+| Field value at cursor | Continuous pressure | Proportional to "how interactive" the region is |
+| Rate of field change (∂φ/∂t) | Transient buzz | Feedback when crossing evolving boundaries |
+
+### API Integration
+
+```javascript
+// In anchor fiber, when field gradient data is available via readback:
+if (navigator.vibrate) {
+  const gradMag = behaviour.getSlotValue('_field_layout', '_grad_magnitude');
+  if (gradMag > 0.3) {
+    navigator.vibrate(Math.min(gradMag * 20, 50));  // 0-50ms pulse
+  }
+}
+
+// GamepadHapticActuator (Chrome 68+):
+if (gamepad.hapticActuators?.length) {
+  gamepad.hapticActuators[0].pulse(gradMag, 16);  // one-frame pulse
+}
+```
+
+This is speculative — no UI framework does field-driven haptics today. But the data is there (field gradient is computed anyway for rendering and accessibility), and the APIs exist. A field-based UI is the first system where haptic feedback is *mathematically natural* rather than hand-authored.
+
+---
+
+**Total: ~10 days from concept to full field UI system.**
+
+---
+
 ## Key References
 
 ### Core Techniques
@@ -435,6 +661,17 @@ The visual result: the character appears to crystallize out of a fluid perturbat
 - Poisson Equation — smooth interpolation of sparse constraints
 - Hamilton-Jacobi PDE — level-set boundary evolution
 - Fourier Feature Networks — coordinate-based neural representations
+
+### Jump Flooding & Distance Transforms
+- Rong & Tan — Jump Flooding in GPU with Applications to Voronoi Diagram and Distance Transform (2006)
+- Danielsson — Euclidean Distance Mapping (1980)
+- Felzenszwalb & Huttenlocher — Distance Transforms of Sampled Functions (2012)
+
+### Haptic Interaction
+- Web Vibration API — https://developer.mozilla.org/en-US/docs/Web/API/Vibration_API
+- GamepadHapticActuator — https://developer.mozilla.org/en-US/docs/Web/API/GamepadHapticActuator
+- Bau et al. — TeslaTouch: Electrovibration for Touch Surfaces (UIST 2010)
+- Schneider et al. — Haptic Experience Design (CHI 2017)
 
 ### Rendering Reference
 - Vello (Linebender) — GPU compute 2D rendering: https://github.com/linebender/vello
