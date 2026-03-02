@@ -34,12 +34,10 @@ export class TabManager {
   switchTo(id) {
     const prev = this.tabs.find(t => t.id === this.activeTabId);
     if (prev) {
-      // Save state from current DOM
       prev.rexSrc = document.getElementById('rex-src').value;
       prev.formState = {...(window._currentForm?.state || {})};
       prev.messages = document.getElementById('messages').innerHTML;
       prev.active = false;
-      // Cancel rAF — stop GPU work for inactive tab
       if (prev.rafId) { cancelAnimationFrame(prev.rafId); prev.rafId = null; }
     }
 
@@ -48,19 +46,16 @@ export class TabManager {
     if (!tab) return;
     tab.active = true;
 
-    // Restore state to DOM
     document.getElementById('rex-src').value = tab.rexSrc;
     if (tab.messages) document.getElementById('messages').innerHTML = tab.messages;
     if (window._currentForm) window._currentForm.state = {...tab.formState};
 
-    // Restart render loop for this tab
     window._restartRenderLoop?.();
-
     this._renderTabBar();
   }
 
   closeTab(id) {
-    if (this.tabs.length <= 1) return; // Don't close last tab
+    if (this.tabs.length <= 1) return;
     const idx = this.tabs.findIndex(t => t.id === id);
     if (idx === -1) return;
     const tab = this.tabs[idx];
@@ -89,7 +84,6 @@ export class TabManager {
   }
 
   _renderTabBar() {
-    // Remove all tabs (keep the + button)
     const children = Array.from(this.tabBar.children);
     for (const c of children) { if (c !== this.tabAdd) c.remove(); }
 
@@ -107,7 +101,7 @@ export class TabManager {
         e.stopPropagation();
         const input = document.createElement('input');
         input.value = tab.name;
-        input.style.cssText = 'background:var(--bg);color:var(--text);border:1px solid var(--accent);font:inherit;width:80px;padding:0 4px;';
+        input.style.cssText = 'background:rgba(255,255,255,0.06);color:var(--text);border:1px solid var(--accent);font:inherit;width:80px;padding:0 4px;border-radius:4px;outline:none;';
         label.replaceWith(input);
         input.focus(); input.select();
         const done = () => { this.renameTab(tab.id, input.value || tab.name); };

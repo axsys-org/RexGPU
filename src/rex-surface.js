@@ -759,8 +759,15 @@ export class RexSurface {
       }
       const qw = metrics.charW * scale;
       const qh = metrics.charH * scale;
-      const qx = cursorX + metrics.bearingX * scale;
-      const qy = y + (size - metrics.bearingY * scale);
+      // The glyph was rasterized centered in the atlas cell at (drawOffsetX, drawOffsetY).
+      // To align the quad so the glyph's left edge sits at cursorX, we subtract
+      // the draw offset (scaled) from the quad position.
+      const qx = cursorX - metrics.drawOffsetX * scale;
+      // For Y: the glyph's ascent (bearingY) was drawn at drawOffsetY in the atlas cell.
+      // We want the text baseline at y + size (approx), with the ascender above it.
+      // Top of glyph visual = y + (size - bearingY * scale) approximately.
+      // But the glyph lives at drawOffsetY in the cell, so shift up by that amount.
+      const qy = y - metrics.drawOffsetY * scale;
 
       // Skip glyphs outside clip rect
       if (!clip || (qy + qh >= clip.y && qy <= clip.y + clip.h && qx + qw >= clip.x && qx <= clip.x + clip.w)) {
@@ -875,8 +882,9 @@ export class RexSurface {
     const explicitW = this._evalDim(node, 'w', 0, this._width);
     const explicitH = this._evalDim(node, 'h', 0, this._height);
 
-    // Measure flow children (intrinsic sizes)
+    // Measure flow children (intrinsic sizes — margins NOT included)
     const measures = flowChildren.map(c => this._measureElement(c));
+    const margins = flowChildren.map(c => this._getMargin(c));
     const padH = pad.left + pad.right;
     const padV = pad.top + pad.bottom;
 
@@ -889,10 +897,14 @@ export class RexSurface {
     const maxMain = new Float64Array(N);
     const minCross = new Float64Array(N);
     const maxCross = new Float64Array(N);
+    // Per-child main/cross margin totals
+    const marginMain = new Float64Array(N);
+    const marginCross = new Float64Array(N);
 
     for (let i = 0; i < N; i++) {
       const c = flowChildren[i];
       const m = measures[i];
+      const mg = margins[i];
       const fb = this._attr(c, 'flex-basis', null);
       basis[i] = fb != null ? +fb : (isRow ? m.w : m.h);
       grow[i]  = this._numAttr(c, 'flex-grow', this._numAttr(c, 'grow', 0));
@@ -901,11 +913,18 @@ export class RexSurface {
       maxMain[i] = this._numAttr(c, isRow ? 'max-width' : 'max-height', Infinity);
       minCross[i] = this._numAttr(c, isRow ? 'min-height' : 'min-width', 0);
       maxCross[i] = this._numAttr(c, isRow ? 'max-height' : 'max-width', Infinity);
+      marginMain[i] = isRow ? mg.left + mg.right : mg.top + mg.bottom;
+      marginCross[i] = isRow ? mg.top + mg.bottom : mg.left + mg.right;
     }
 
-    // Compute natural content extent for auto-sizing
-    const contentMain = basis.reduce((s, b) => s + b, 0) + Math.max(0, N - 1) * gap;
-    const contentCross = N > 0 ? Math.max(...measures.map(m => isRow ? m.h : m.w)) : 0;
+    // Compute natural content extent for auto-sizing (basis + margins)
+    let contentMain = Math.max(0, N - 1) * gap;
+    for (let i = 0; i < N; i++) contentMain += basis[i] + marginMain[i];
+    let contentCross = 0;
+    for (let i = 0; i < N; i++) {
+      const intrinsicCross = isRow ? measures[i].h : measures[i].w;
+      contentCross = Math.max(contentCross, intrinsicCross + marginCross[i]);
+    }
 
     // Resolve panel dimensions
     const panelW = explicitW || (isRow ? contentMain + padH : contentCross + padH);
@@ -921,7 +940,7 @@ export class RexSurface {
       let lineStart = 0;
       let lineCursor = 0;
       for (let i = 0; i < N; i++) {
-        const itemMain = basis[i];
+        const itemMain = basis[i] + marginMain[i];
         const wouldBe = lineCursor + (i > lineStart ? gap : 0) + itemMain;
         if (i > lineStart && wouldBe > innerMain) {
           // Flush line
@@ -947,10 +966,11 @@ export class RexSurface {
       const count = end - start;
       const gapTotal = Math.max(0, count - 1) * gap;
 
-      // Basis sum for this line
+      // Basis sum for this line (margins consume space but don't participate in grow/shrink)
       let basisSum = 0;
-      for (let i = start; i < end; i++) basisSum += basis[i];
-      const freeSpace = innerMain - basisSum - gapTotal;
+      let marginSum = 0;
+      for (let i = start; i < end; i++) { basisSum += basis[i]; marginSum += marginMain[i]; }
+      const freeSpace = innerMain - basisSum - marginSum - gapTotal;
 
       // Apply grow or shrink
       for (let i = start; i < end; i++) resolvedMain[i] = basis[i];
@@ -1001,12 +1021,12 @@ export class RexSurface {
         resolvedMain[i] = Math.max(minMain[i], Math.min(maxMain[i], resolvedMain[i]));
       }
 
-      // Cross-axis sizing for this line
+      // Cross-axis sizing for this line (resolvedCross = intrinsic, margins tracked separately)
       let lineMaxCross = 0;
       for (let i = start; i < end; i++) {
         const intrinsicCross = isRow ? measures[i].h : measures[i].w;
         resolvedCross[i] = Math.max(minCross[i], Math.min(maxCross[i], intrinsicCross));
-        lineMaxCross = Math.max(lineMaxCross, resolvedCross[i]);
+        lineMaxCross = Math.max(lineMaxCross, resolvedCross[i] + marginCross[i]);
       }
       lineCrossSizes.push(lineMaxCross);
     }
@@ -1053,9 +1073,9 @@ export class RexSurface {
       const count = end - start;
       const lineCross = lineCrossSizes[li];
 
-      // Main-axis: recompute actual used main space after grow/shrink
+      // Main-axis: recompute actual used main space after grow/shrink (content + margins)
       let usedMain = 0;
-      for (let i = start; i < end; i++) usedMain += resolvedMain[i];
+      for (let i = start; i < end; i++) usedMain += resolvedMain[i] + marginMain[i];
       usedMain += Math.max(0, count - 1) * gap;
       const freeMain = innerMain - usedMain;
 
@@ -1085,26 +1105,29 @@ export class RexSurface {
       let mainCursor = mainStart;
       for (let i = start; i < end; i++) {
         const c = flowChildren[i];
-        const margin = this._getMargin(c);
+        const mg = margins[i];
         const itemMain = resolvedMain[i];
         const itemCross = resolvedCross[i];
+        const mMainBefore = isRow ? mg.left : mg.top;
+        const mMainAfter  = isRow ? mg.right : mg.bottom;
+        const mCrossBefore = isRow ? mg.top : mg.left;
 
         // Per-child cross-axis alignment (align-self overrides panel align)
+        // lineCross includes margins, so subtract them for alignment slack
         const selfAlign = this._attr(c, 'align-self', align);
         let crossPos = 0;
+        const itemCrossWithMargin = itemCross + marginCross[i];
         switch (selfAlign) {
-          case 'center': crossPos = (lineCross - itemCross) / 2; break;
-          case 'end': crossPos = lineCross - itemCross; break;
+          case 'center': crossPos = (lineCross - itemCrossWithMargin) / 2; break;
+          case 'end': crossPos = lineCross - itemCrossWithMargin; break;
           case 'stretch':
-            resolvedCross[i] = Math.max(minCross[i], Math.min(maxCross[i], lineCross));
+            resolvedCross[i] = Math.max(minCross[i], Math.min(maxCross[i], lineCross - marginCross[i]));
             break;
           // 'start': crossPos = 0
         }
 
-        const mMainBefore = isRow ? margin.left : margin.top;
-        const mMainAfter  = isRow ? margin.right : margin.bottom;
-        const mCrossBefore = isRow ? margin.top : margin.left;
-
+        // Margins applied externally: cursor advances by content + margin,
+        // child position offset by margin-before
         const px = x + pad.left + (isRow ? mainCursor + mMainBefore : crossPos + crossCursor + mCrossBefore);
         const py = y + pad.top  + (isRow ? crossPos + crossCursor + mCrossBefore : mainCursor + mMainBefore);
 
@@ -1300,8 +1323,8 @@ export class RexSurface {
         for (const ch of numStr) {
           const metrics = this._getGlyphMetrics(ch);
           if (ch === ' ') { nx += metrics.advance * scale; continue; }
-          const qx = nx + metrics.bearingX * scale;
-          const qy = ly + (size - metrics.bearingY * scale);
+          const qx = nx - metrics.drawOffsetX * scale;
+          const qy = ly - metrics.drawOffsetY * scale;
           this._textQuads.push({
             x: qx, y: qy, w: metrics.charW * scale, h: metrics.charH * scale,
             u0: 0, v0: 0, u1: 0, v1: 0,
@@ -1342,8 +1365,8 @@ export class RexSurface {
 
         const qw = metrics.charW * scale;
         const qh = metrics.charH * scale;
-        const qx = cursorX + metrics.bearingX * scale;
-        const qy = ly + (size - metrics.bearingY * scale);
+        const qx = cursorX - metrics.drawOffsetX * scale;
+        const qy = ly - metrics.drawOffsetY * scale;
 
         if (qx + qw >= activeClip.x && qx <= activeClip.x + activeClip.w) {
           this._textQuads.push({
@@ -1381,15 +1404,14 @@ export class RexSurface {
     // Absolute-positioned elements don't contribute to parent layout size
     if (this._attr(node, 'position', '') === 'absolute') return { w: 0, h: 0 };
 
-    const margin = this._getMargin(node);
-    const mw = margin.left + margin.right;
-    const mh = margin.top + margin.bottom;
+    // Margins are handled externally in _collectPanel (use.gpu pattern):
+    // measurement returns intrinsic content size WITHOUT margins.
 
     switch (node.type) {
       case 'rect': {
         const w = this._evalDim(node, 'w', 100, this._width);
         const h = this._evalDim(node, 'h', 100, this._height);
-        return { w: (w || 100) + mw, h: (h || 100) + mh };
+        return { w: w || 100, h: h || 100 };
       }
       case 'text': {
         const text = node.name || '';
@@ -1398,7 +1420,7 @@ export class RexSurface {
         this._measureCtx.font = this._sdfFont;
         const scale = size / SDF_GLYPH_SIZE;
         const measured = this._measureCtx.measureText(text);
-        return { w: measured.width * scale + mw, h: size + mh };
+        return { w: measured.width * scale, h: size };
       }
       case 'panel': {
         const pad = this._getPadding(node);
@@ -1414,18 +1436,27 @@ export class RexSurface {
         );
         const measures = children.map(c => this._measureElement(c));
 
+        // Child margins contribute to the panel's intrinsic size
+        const childMargins = children.map(c => this._getMargin(c));
+
         // Explicit dimensions (support percentages)
         const explicitW = this._evalDim(node, 'w', 0, this._width);
         const explicitH = this._evalDim(node, 'h', 0, this._height);
-        if (explicitW && explicitH) return { w: explicitW + mw, h: explicitH + mh };
+        if (explicitW && explicitH) return { w: explicitW, h: explicitH };
 
         // Use flex-basis when available for main axis measurement
         const mainSizes = children.map((c, i) => {
           const fb = this._attr(c, 'flex-basis', null);
           if (fb != null) return +fb;
-          return isRow ? measures[i].w : measures[i].h;
+          const cm = childMargins[i];
+          const mMain = isRow ? cm.left + cm.right : cm.top + cm.bottom;
+          return (isRow ? measures[i].w : measures[i].h) + mMain;
         });
-        const crossSizes = measures.map(m => isRow ? m.h : m.w);
+        const crossSizes = children.map((c, i) => {
+          const cm = childMargins[i];
+          const mCross = isRow ? cm.top + cm.bottom : cm.left + cm.right;
+          return (isRow ? measures[i].h : measures[i].w) + mCross;
+        });
 
         const mainTotal = mainSizes.reduce((s, m) => s + m, 0) + Math.max(0, mainSizes.length - 1) * gap;
         const crossMax = crossSizes.length > 0 ? Math.max(...crossSizes) : 0;
@@ -1448,19 +1479,19 @@ export class RexSurface {
         w = Math.max(minW, Math.min(maxW, w));
         h = Math.max(minH, Math.min(maxH, h));
 
-        return { w: w + mw, h: h + mh };
+        return { w, h };
       }
       case 'shadow':
         return { w: 0, h: 0 };
       case 'path': {
         const d = node.name || node.attrs.d || '';
         const bbox = this._pathBBox(d);
-        return { w: bbox.maxX - bbox.minX + mw, h: bbox.maxY - bbox.minY + mh };
+        return { w: bbox.maxX - bbox.minX, h: bbox.maxY - bbox.minY };
       }
       case 'text-editor': {
         const w = this._evalDim(node, 'w', 400, this._width) || 400;
         const h = this._evalDim(node, 'h', 300, this._height) || 300;
-        return { w: w + mw, h: h + mh };
+        return { w, h };
       }
       default: {
         const handler = this._elementHandlers.get(node.type);
@@ -1488,11 +1519,13 @@ export class RexSurface {
     const ctx = this._measureCtx;
     ctx.font = this._sdfFont;
     const m = ctx.measureText(ch);
+    const drawX = Math.max(0, (SDF_GLYPH_SIZE - m.width) / 2);
     const metrics = {
       charW: SDF_GLYPH_SIZE,
       charH: SDF_GLYPH_SIZE,
       advance: m.width,
-      bearingX: Math.max(0, -Math.round(m.actualBoundingBoxLeft || 0)),
+      drawOffsetX: drawX,
+      drawOffsetY: 2,
       bearingY: Math.round(m.actualBoundingBoxAscent || SDF_GLYPH_SIZE * 0.75),
       atlasX: 0, atlasY: 0, atlasW: SDF_GLYPH_SIZE, atlasH: SDF_GLYPH_SIZE,
     };
@@ -1557,11 +1590,15 @@ export class RexSurface {
         }
       }
 
-      // Metrics: use actual font metrics, not atlas centering offsets
+      // Metrics: store the centering offset used for rasterization so quad
+      // positioning can undo it and align the glyph with the text cursor.
+      // drawX centers the glyph horizontally in the cell; drawY=2 is the
+      // top baseline offset used above in fillText.
       this._glyphCache.set(ch, {
         charW: gs, charH: gs,
         advance: m.width,
-        bearingX: Math.max(0, -Math.round(m.actualBoundingBoxLeft || 0)),
+        drawOffsetX: drawX,  // how far right glyph was drawn in atlas cell
+        drawOffsetY: 2,      // how far down glyph was drawn in atlas cell
         bearingY: Math.round(m.actualBoundingBoxAscent || gs * 0.75),
         atlasX: ax, atlasY: ay, atlasW: gs, atlasH: gs,
       });

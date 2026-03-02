@@ -9,63 +9,78 @@
 <body>
 <div id="shell">
 
-  <!-- Header -->
-  <div id="header">
-    <h1>RexGPU</h1>
-    <span class="sep">&middot;</span>
-    <span class="sub">natural language &rarr; rex notation &rarr; GPU</span>
-    <span class="pill pill-ai">Claude</span>
-    <span class="pill pill-gpu">WebGPU</span>
-    <span id="gpu-status">initializing&hellip;</span>
-    <div id="key-area">
-      <label for="api-key">API key</label>
-      <input id="api-key" type="password" placeholder="sk-ant-&hellip; (optional in artifact)" autocomplete="off" spellcheck="false">
+  <!-- Full-viewport canvas (layer 0 — behind everything) -->
+  <canvas id="gpu-canvas" tabindex="0"></canvas>
+  <span id="gpu-overlay"></span>
+  <span id="node-count"></span>
+
+  <!-- Top bar (layer 300) -->
+  <div id="topbar">
+    <div id="tb-left">
+      <h1>Rex<span class="h1-dim">GPU</span></h1>
+      <span id="gpu-status">initializing&hellip;</span>
+    </div>
+    <div id="tb-center">
+      <div id="tab-bar">
+        <div id="tab-add" title="New session">+</div>
+      </div>
+    </div>
+    <div id="tb-right">
+      <select id="example-select" title="Load example">
+        <option value="">examples</option>
+      </select>
+      <input id="api-key" type="password" placeholder="sk-ant-&hellip;" autocomplete="off" spellcheck="false">
       <button id="key-show">show</button>
       <div id="key-dot"></div>
     </div>
   </div>
 
-  <!-- Tab bar -->
-  <div id="tab-bar">
-    <div id="tab-add" title="New session">+</div>
-  </div>
-
-  <!-- Top drag handle -->
-  <div class="dh-row" id="dh-row-top"></div>
-
-  <!-- Form sidebar (LEFT — was chat) -->
-  <div class="pane" id="form-sidebar">
-    <div class="ptitle" id="form-title"><span>form controls</span><span class="arrow">&#9662;</span></div>
-    <div id="form-mount"></div>
-  </div>
-
-  <!-- Col handle 1 -->
-  <div class="dh-col" id="dh-col-1"></div>
-
-  <!-- Editor pane -->
-  <div class="pane" id="editor-pane">
-    <div class="ptitle" id="editor-title"><span>rex source <span id="node-count" style="color:var(--accent2)"></span></span><span class="arrow">&#9662;</span></div>
+  <!-- Floating panels (layer 10-100) -->
+  <div class="fp" id="fp-editor" data-panel="editor">
+    <div class="fp-bar">
+      <span class="fp-icon">&#9998;</span><span class="fp-label">Source</span>
+      <div class="fp-spacer"></div>
+      <button class="fp-btn fp-min" title="Minimize">&minus;</button>
+      <button class="fp-btn fp-close" title="Close">&times;</button>
+    </div>
     <textarea id="rex-src" spellcheck="false"></textarea>
   </div>
 
-  <!-- Col handle 2 -->
-  <div class="dh-col" id="dh-col-2"></div>
-
-  <!-- Canvas pane -->
-  <div class="pane" id="canvas-pane">
-    <div class="ptitle" id="canvas-title"><span>GPU output</span><span id="gpu-overlay" style="font-size:10px;color:var(--warn);margin-left:8px;font-weight:normal;"></span><span class="arrow">&#9662;</span></div>
-    <canvas id="gpu-canvas" tabindex="0"></canvas>
+  <div class="fp" id="fp-form" data-panel="form">
+    <div class="fp-bar">
+      <span class="fp-icon">&#9881;</span><span class="fp-label">Properties</span>
+      <div class="fp-spacer"></div>
+      <button class="fp-btn fp-min" title="Minimize">&minus;</button>
+      <button class="fp-btn fp-close" title="Close">&times;</button>
+    </div>
+    <div id="form-mount"></div>
   </div>
 
-  <!-- Bottom drag handle -->
-  <div class="dh-row" id="dh-row-bot"></div>
+  <div class="fp" id="fp-log" data-panel="log">
+    <div class="fp-bar">
+      <span class="fp-icon">&#9656;</span><span class="fp-label">Log</span>
+      <div class="fp-spacer"></div>
+      <button class="fp-btn fp-min" title="Minimize">&minus;</button>
+      <button class="fp-btn fp-close" title="Close">&times;</button>
+    </div>
+    <div id="log-view"></div>
+  </div>
 
-  <!-- Bottom strip — now has Chat, Log, Heap -->
-  <div id="bottom">
-    <div class="bot-pane" id="chat-pane">
-      <div class="ptitle" id="chat-title"><span>Claude &rarr; Rex</span><span class="arrow">&#9662;</span></div>
+  <div class="fp" id="fp-heap" data-panel="heap">
+    <div class="fp-bar">
+      <span class="fp-icon">&#9638;</span><span class="fp-label">Heap</span>
+      <div class="fp-spacer"></div>
+      <button class="fp-btn fp-min" title="Minimize">&minus;</button>
+      <button class="fp-btn fp-close" title="Close">&times;</button>
+    </div>
+    <div id="heap-view"></div>
+  </div>
+
+  <!-- Command bar (layer 200 — bottom center) -->
+  <div id="cmdbar">
+    <div id="cmdbar-inner">
       <div id="messages">
-        <div class="msg msg-sys">Describe what to render. Claude writes Rex. RPE compiles and runs it.</div>
+        <div class="msg msg-sys">Describe what to render. Claude writes Rex notation. RPE compiles it to GPU.</div>
       </div>
       <div class="chips">
         <span class="chip" data-p="Animated plasma wave shader with 2D panel overlay showing time and speed as a live HUD">plasma + HUD</span>
@@ -80,17 +95,13 @@
         <button id="send">Send</button>
       </div>
     </div>
-    <div class="bot-pane" id="log-pane">
-      <div class="ptitle" id="log-title"><span>transduction log</span><span class="arrow">&#9662;</span></div>
-      <div id="log-view"></div>
-    </div>
-    <div class="bot-pane" id="heap-pane">
-      <div class="ptitle" id="heap-title"><span>compiled heap &middot; optics</span><span class="arrow">&#9662;</span></div>
-      <div id="heap-view"></div>
-    </div>
   </div>
 
+  <!-- Panel dock (minimized panels show here) -->
+  <div id="panel-dock"></div>
+
 </div>
+<script>/* __EXAMPLES__ */</script>
 <script>/* __JS__ */</script>
 </body>
 </html>

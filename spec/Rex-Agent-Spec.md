@@ -434,7 +434,129 @@ Guards on tools serve dual purposes:
 - **Budget exhaustion** triggers surprise → recovery → ask user for more budget
 - **ShrubLM tracks** cost patterns — learns which tools are worth the budget
 
-### 4.5 Tool Failure Tracking
+### 4.5 Constrained Decoding
+
+Rex emits `strict: true` on all tool schemas sent to the LLM API, enabling grammar-level constrained decoding — the model's token sampler is physically restricted to valid JSON matching the `@input` schema. No retry needed.
+
+#### Tool Input Constraint
+
+Every `@tool` definition automatically gets `strict: true` on the emitted `input_schema`. The `@input` declarations compile to a JSON Schema with `additionalProperties: false` and all fields in `required`:
+
+```rex
+@tool search-code :shrub agent/coder
+  @input pattern :type string
+  @input glob :type string :default "**/*"
+  @input max-results :type number :default 50
+  @output matches :type string
+  @guard (gt /tool-budget 0)
+  @cost 1
+  ''Search file contents with regex pattern.''
+```
+
+Emits to the API as:
+
+```json
+{
+  "name": "search-code",
+  "description": "Search file contents with regex pattern.",
+  "strict": true,
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "pattern": { "type": "string" },
+      "glob": { "type": "string" },
+      "max-results": { "type": "number" }
+    },
+    "required": ["pattern", "glob", "max-results"],
+    "additionalProperties": false
+  }
+}
+```
+
+#### Response Schema Constraint
+
+`@response` declares a JSON Schema for the agent's non-tool-call responses — the LLM's text output is constrained to match. This uses the API's `output_config.format` parameter.
+
+```rex
+@response agent/coder
+  @field action :type string :enum ["code", "ask", "done", "delegate"]
+  @field reasoning :type string
+  @field files-changed :type array :items string
+  @field confidence :type number
+```
+
+Emits to the API as:
+
+```json
+{
+  "output_config": {
+    "format": {
+      "type": "json_schema",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "action": { "type": "string", "enum": ["code", "ask", "done", "delegate"] },
+          "reasoning": { "type": "string" },
+          "files-changed": { "type": "array", "items": { "type": "string" } },
+          "confidence": { "type": "number" }
+        },
+        "required": ["action", "reasoning", "files-changed", "confidence"],
+        "additionalProperties": false
+      }
+    }
+  }
+}
+```
+
+When `@response` is declared, every API call for that agent includes the `output_config.format` parameter. The response arrives in `response.content[0].text` as valid JSON — parse it, route by `action`, no validation needed.
+
+#### Why Both Layers
+
+| Layer | Mechanism | What It Constrains |
+|---|---|---|
+| `@guard` | Rex compile-time expression | **Whether** the tool can be called (budget, safety, prerequisites) |
+| `strict: true` | LLM constrained decoding | **What** the tool receives (valid JSON, correct types, required fields) |
+| `@response` | LLM output schema | **What** the agent returns (structured action + reasoning) |
+
+Guards prevent unauthorized calls. Constrained decoding prevents malformed calls. Response schemas prevent unstructured output. Three layers, zero overlap.
+
+#### Type Mapping
+
+Rex types compile to JSON Schema types:
+
+| Rex `:type` | JSON Schema | Notes |
+|---|---|---|
+| `string` | `"string"` | |
+| `number` | `"number"` | |
+| `boolean` | `"boolean"` | |
+| `array` | `"array"` | `:items TYPE` sets `items` |
+| `object` | `"object"` | Nested `@field` children set `properties` |
+
+Additional constraints:
+
+| Rex Attribute | JSON Schema | |
+|---|---|---|
+| `:enum [a b c]` | `"enum": ["a", "b", "c"]` | |
+| `:format date` | `"format": "date"` | Supported: `date`, `date-time`, `time`, `email`, `uuid`, `uri`, `ipv4`, `ipv6`, `duration` |
+| `:min-items N` | `"minItems": N` | Arrays only |
+| `:max-items N` | `"maxItems": N` | Arrays only |
+| `:nullable` | Wraps in `"anyOf": [TYPE, {"type": "null"}]` | |
+
+#### `:strict false` Opt-Out
+
+Individual tools can opt out of constrained decoding when the schema is too dynamic for grammar constraint (e.g., free-form JSON tool output that the LLM constructs creatively):
+
+```rex
+@tool generate-config :shrub agent/coder :strict false
+  @input spec :type string
+  @output config :type string
+  @cost 2
+  ''Generate a configuration file from a natural language spec.''
+```
+
+Default is `:strict true` — you only annotate the exception.
+
+### 4.6 Tool Failure Tracking
 
 ```rex
 @talk :shrub agent/coder :name tool-failed
@@ -1030,10 +1152,10 @@ API responses write back into agent slots via readback bridges. This enables @de
 
 ### 10.1 New Node Types
 
-Only two new syntactic sugars (both expand to existing constructs):
+Three new syntactic sugars (all expand to existing constructs):
 
 ```
-tool  ::= '@tool' NAME ':shrub' SHRUB NEWLINE INDENT
+tool  ::= '@tool' NAME ':shrub' SHRUB (':strict' BOOL)? NEWLINE INDENT
             input* output* guard? cost?
             content-block?
           DEDENT
@@ -1045,6 +1167,18 @@ delegate ::= '@delegate' DEP-REF NEWLINE INDENT
                (':on-fail' TALK)?
                (':timeout' NUMBER)?
              DEDENT
+
+response ::= '@response' SHRUB NEWLINE INDENT
+               field+
+             DEDENT
+
+field ::= '@field' NAME ':type' TYPE
+            (':enum' LIST)?
+            (':format' FORMAT)?
+            (':items' TYPE)?
+            (':min-items' NUMBER)?
+            (':max-items' NUMBER)?
+            (':nullable')?
 ```
 
 ### 10.2 New Content Types
@@ -1066,12 +1200,26 @@ These enable inline content blocks (`''...''`) on `@system`, `@task`, `@few-shot
 |---|---|---|---|
 | `:shrub` | string | required | Agent this tool belongs to |
 | `:cost` | number | 1 | Budget units per invocation |
+| `:strict` | boolean | true | Enable constrained decoding on input schema |
 | `@input` | child node | — | Typed input parameter |
 | `@output` | child node | — | Typed output field |
 | `@guard` | expr | true | Pre-invocation condition |
 | Content block | string | — | Tool description for LLM |
 
-### 10.4 @delegate Attributes
+### 10.4 @response Attributes
+
+| Attribute | Type | Default | Purpose |
+|---|---|---|---|
+| Target | shrub ref | required | Agent this response schema belongs to |
+| `@field` | child node | — | Typed response field |
+| `:enum` | list | — | Constrain field to enumerated values |
+| `:format` | string | — | JSON Schema format (`date`, `email`, `uuid`, etc.) |
+| `:items` | type | — | Element type for array fields |
+| `:min-items` | number | — | Minimum array length |
+| `:max-items` | number | — | Maximum array length |
+| `:nullable` | flag | — | Allow null values (`anyOf` wrapping) |
+
+### 10.5 @delegate Attributes
 
 | Attribute | Type | Default | Purpose |
 |---|---|---|---|
@@ -1082,7 +1230,7 @@ These enable inline content blocks (`''...''`) on `@system`, `@task`, `@few-shot
 | `:on-fail` | string | — | Talk in this shrub on failure |
 | `:timeout` | number | 30000 | Max milliseconds |
 
-### 10.5 @context Attributes
+### 10.6 @context Attributes
 
 | Attribute | Type | Default | Purpose |
 |---|---|---|---|

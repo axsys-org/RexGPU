@@ -404,7 +404,7 @@ export class RexGPU {
       c.focus();
     });
     c.addEventListener('mouseup', e => { this.inputState.mouseButtons = e.buttons; });
-    c.addEventListener('click', () => {
+    c.addEventListener('dblclick', () => {
       if (!document.pointerLockElement) c.requestPointerLock();
     });
     document.addEventListener('pointerlockchange', () => {

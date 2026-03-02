@@ -41,6 +41,21 @@ function build() {
   const css = fs.readFileSync(path.join(SRC, 'style.css'), 'utf8');
   html = html.replace('/* __CSS__ */', css);
 
+  // Embed examples from examples/ directory
+  const EXAMPLES_DIR = path.join(__dirname, 'examples');
+  const exampleEntries = [];
+  if (fs.existsSync(EXAMPLES_DIR)) {
+    for (const f of fs.readdirSync(EXAMPLES_DIR).sort()) {
+      if (f.endsWith('.rex')) {
+        const name = f.replace('.rex', '');
+        const src = fs.readFileSync(path.join(EXAMPLES_DIR, f), 'utf8');
+        exampleEntries.push({ name, src });
+      }
+    }
+  }
+  const examplesJson = JSON.stringify(exampleEntries);
+  html = html.replace('/* __EXAMPLES__ */', () => `window.__REX_EXAMPLES__ = ${examplesJson};`);
+
   const jsChunks = [];
   for (const name of SRC_FILES) {
     const file = resolveFile(name);

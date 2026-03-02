@@ -1017,8 +1017,25 @@ function pipeline(src) {
   return parse(joined);
 }
 
+// Cold parse — bypasses incremental cache.
+// Used by internal re-parses (expression snippets, template expansion)
+// so they don't corrupt the editor's line-level cache.
+function pipelineCold(src) {
+  const tokens = lex(src);
+  nestjoin(tokens);
+  const blocks = bsplit(tokens);
+  const joined = quipjoin(blocks);
+  return parse(joined);
+}
+
 function rexParse(src) {
   const nodes = pipeline(src);
+  return { nodes, errors: [] };
+}
+
+// Internal re-parse for expression snippets — never touches _lexCache
+function rexParseCold(src) {
+  const nodes = pipelineCold(src);
   return { nodes, errors: [] };
 }
 
@@ -1520,6 +1537,11 @@ function toShrub(n, d) {
   return [s];
 }
 
+// quipjoin wraps top-level expressions as Np(Paren,'`'). Accept both that and Np(Clear,'').
+function _isOpenNest(n) {
+  return (n.b === BK.Clear && n.r === '') || (n.b === BK.Paren && n.r === '`');
+}
+
 function _decompose(n, s, d) {
   switch (n._) {
     case 'Tp':
@@ -1532,9 +1554,12 @@ function _decompose(n, s, d) {
       else { s.type = 'expr'; s.name = pr(n, 10000); }
       break;
     case 'Np':
-      if (n.r === '' && n.b === BK.Clear && n.ch.length > 0 && n.ch[0]._ === 'Tp' && n.ch[0].r === '@') {
+      if (n.ch.length > 0 && n.ch[0]._ === 'Tp' && n.ch[0].r === '@' && _isOpenNest(n)) {
         _extractAt(n.ch[0].c, s, d);
         _absorbList(n.ch, 1, s, d);
+      } else if (n.ch.length > 0 && n.ch[0]._ === 'Tp' && n.ch[0].r === ':' && _isOpenNest(n)) {
+        // :key value wrapped by quipjoin — mark as kv-expr for tree builder
+        s.type = 'expr'; s.name = pr(n, 10000); s._kvNode = n;
       } else { s.type = 'expr'; s.name = pr(n, 10000); }
       break;
     default:
@@ -1547,7 +1572,7 @@ function _decomposeColon(n, s, d) {
   if (first && first._ === 'Tp' && first.r === '@') {
     _extractAt(first.c, s, d);
     _absorbList(n.ch, 1, s, d);
-  } else if (first && first._ === 'Np' && first.b === BK.Clear && first.r === '' && first.ch.length > 0 && first.ch[0]._ === 'Tp' && first.ch[0].r === '@') {
+  } else if (first && first._ === 'Np' && _isOpenNest(first) && first.ch.length > 0 && first.ch[0]._ === 'Tp' && first.ch[0].r === '@') {
     _extractAt(first.ch[0].c, s, d);
     _absorbList(first.ch, 1, s, d);
     _absorbList(n.ch, 1, s, d);
@@ -1558,13 +1583,13 @@ function _decomposeColon(n, s, d) {
 
 function _extractAt(c, s, d) {
   if (c._ === 'Wd') { s.type = c.v; }
-  else if (c._ === 'Np' && c.b === BK.Clear && c.r === '') {
+  else if (c._ === 'Np' && _isOpenNest(c)) {
     if (c.ch.length > 0 && c.ch[0]._ === 'Wd') s.type = c.ch[0].v;
     _absorbList(c.ch, 1, s, d);
   } else if (c._ === 'Ni' && c.r === ':') {
     const f = c.ch[0];
     if (f && f._ === 'Wd') { s.type = f.v; }
-    else if (f && f._ === 'Np' && f.r === '' && f.b === BK.Clear) {
+    else if (f && f._ === 'Np' && _isOpenNest(f)) {
       if (f.ch.length > 0 && f.ch[0]._ === 'Wd') s.type = f.ch[0].v;
       _absorbList(f.ch, 1, s, d);
     }
@@ -1598,12 +1623,17 @@ function _absorb(n, s, d) {
   if (n._ === 'Tp' && n.r === ':') { _extractKV(n.c, s); return; }
   if (n._ === 'Bk') { for (const c of n.ch) s.children.push(...toShrub(c, d+1)); return; }
   if (n._ === 'Ug') { s.content = (s.content||'') + n.v; return; }
+  if (n._ === 'Bd') {
+    // Poisoned ugly strings from content capture — extract content between '' markers
+    const m = n.v.match(/^''+\n([\s\S]*)\n''+$/);
+    if (m) { s.content = (s.content||'') + m[1]; return; }
+  }
   if (n._ === 'Sl') { s.content = (s.content||'') + n.v.join('\n'); return; }
   if (!s.name && (n._ === 'Wd' || n._ === 'Td' || n._ === 'Qp')) { s.name = n._ === 'Wd' ? n.v : n.v; return; }
   if (!s.name && n._ === 'Ti') { s.name = _str(n); return; }
   if (!s.name && n._ === 'Hr') { s.name = _str(n); return; }
   if (n._ === 'Ni' && n.r === ':') { _absorbList(n.ch, 0, s, d); return; }
-  if (n._ === 'Np' && n.b === BK.Clear && n.r === '' && n.ch.length > 0) {
+  if (n._ === 'Np' && _isOpenNest(n) && n.ch.length > 0) {
     if (n.ch[0]._ === 'Tp' && n.ch[0].r === '@') {
       const child = {type:'',name:null,attrs:{},children:[],content:null,_d:d+1};
       _extractAt(n.ch[0].c, child, d+1);
@@ -1616,7 +1646,7 @@ function _absorb(n, s, d) {
 
 function _extractKV(c, s) {
   if (c._ === 'Wd') { s.attrs[c.v] = true; return; }
-  if (c._ === 'Np' && c.r === '' && c.b === BK.Clear && c.ch.length >= 1) {
+  if (c._ === 'Np' && _isOpenNest(c) && c.ch.length >= 1) {
     const key = _str(c.ch[0]);
     s.attrs[key] = c.ch.length >= 2 ? _val(c.ch[1]) : true;
     return;
@@ -1692,7 +1722,7 @@ function _valueToRex(v) {
   }
   if (v && typeof v === 'object' && v.expr) {
     if (v.rex) return v.rex;
-    const {nodes} = rexParse(v.expr);
+    const {nodes} = rexParseCold(v.expr);
     return nodes.length > 0 ? NestPre(BK.Paren, '', [nodes[0]]) : Word('?');
   }
   return Word(String(v));
@@ -1724,7 +1754,7 @@ function compileExpr(exprObj) {
   }
   if (exprObj && typeof exprObj === 'object' && exprObj.expr !== undefined) {
     if (exprObj.rex) return _compileCanonical(exprObj.rex);
-    const { nodes } = rexParse(exprObj.expr);
+    const { nodes } = rexParseCold(exprObj.expr);
     return nodes.length > 0 ? _compileCanonical(NestPre(BK.Paren, '', [nodes[0]])) : null;
   }
   return null;
@@ -2069,28 +2099,26 @@ export const Rex = {
     const CT = _contentTypes;
     const lines = src.split('\n'), out = [];
     const lineIndents = [];
-    let cap = false, ci = 0, cl = [];
+    const capturedContent = []; // [{type, name, content}] in source order
+    let cap = false, ci = 0, cl = [], capType = '', capName = '';
     for (let i = 0; i < lines.length; i++) {
       const raw = lines[i], s = raw.trimEnd(), t = s.trimStart(), ind = s.length > 0 ? s.search(/\S/) : 0;
       if (cap) {
         if (s.length > 0 && ind <= ci) {
-          const lastIdx = out.length - 1;
-          const content = cl.join('\n');
-          out[lastIdx] = out[lastIdx] + " ''\n" + content + "\n''";
-          lineIndents[lastIdx] = ind;
+          capturedContent.push({type: capType, name: capName, content: cl.join('\n')});
           cl=[]; cap=false;
         } else { cl.push(s.length===0 ? '' : raw.slice(Math.min(ind, ci+2))); continue; }
       }
       if (t.startsWith('@')) {
-        const m = t.match(/^@(\S+)/);
+        const m = t.match(/^@(\S+)\s*(\S*)/);
         if (m && CT.has(m[1])) {
           out.push(raw); lineIndents.push(ind);
-          cap=true; ci=ind; cl=[]; continue;
+          cap=true; ci=ind; cl=[]; capType=m[1]; capName=m[2]||''; continue;
         }
       }
       out.push(raw); lineIndents.push(ind);
     }
-    if (cap && cl.length) { const lastIdx=out.length-1; out[lastIdx]=out[lastIdx]+" ''\n"+cl.join('\n')+"\n''"; }
+    if (cap && cl.length) { capturedContent.push({type: capType, name: capName, content: cl.join('\n')}); }
 
     const stripped = out.map(l => {
       const ci = l.indexOf(';;');
@@ -2122,13 +2150,35 @@ export const Rex = {
 
       if (parent !== root && shrub.type === 'expr') {
         const name = shrub.name || '';
+        // If _decompose tagged this as a kv-expr with preserved canonical node, absorb it
+        // The original (expr) parens are consumed by quipjoin, so we wrap compound values as {expr:...}
+        if (shrub._kvNode) {
+          const ch = shrub._kvNode.ch;
+          for (let ki = 0; ki < ch.length; ki++) {
+            const n = ch[ki];
+            if (n._ === 'Tp' && n.r === ':') {
+              const key = _str(n.c);
+              if (ki + 1 < ch.length) {
+                const next = ch[ki + 1];
+                // Since (expr) parens are consumed by quipjoin, wrap compound values as expr objects
+                const valStr = pr(next, 10000);
+                parent.attrs[key] = {expr: valStr, rex: next};
+                ki++;
+              } else {
+                parent.attrs[key] = true;
+              }
+            }
+          }
+          continue;
+        }
         if (name.startsWith(':')) {
-          const {nodes: kvNodes} = rexParse(name);
+          const {nodes: kvNodes} = rexParseCold(name);
           if (kvNodes.length > 0) {
             for (const kvn of kvNodes) {
+              if (!kvn) continue;
               if (kvn._ === 'Ni' && kvn.r === ':') {
                 _absorbList(kvn.ch, 0, parent, parent._d || 0);
-              } else if (kvn._ === 'Np' && kvn.b === BK.Clear && kvn.r === '') {
+              } else if (kvn._ === 'Np' && _isOpenNest(kvn)) {
                 _absorbList(kvn.ch, 0, parent, parent._d || 0);
               } else {
                 _absorb(kvn, parent, parent._d || 0);
@@ -2169,6 +2219,25 @@ export const Rex = {
     const cleanIndent = n => { delete n._indent; for (const c of n.children) cleanIndent(c); };
     cleanIndent(root);
 
+    // Inject captured content into matching content-type nodes
+    if (capturedContent.length > 0) {
+      const ctNodes = [];
+      const collectCT = n => { if (CT.has(n.type)) ctNodes.push(n); for (const c of n.children) collectCT(c); };
+      collectCT(root);
+      // Match by type+name in source order
+      const used = new Set();
+      for (const cap of capturedContent) {
+        for (let j = 0; j < ctNodes.length; j++) {
+          if (used.has(j)) continue;
+          if (ctNodes[j].type === cap.type && (ctNodes[j].name === cap.name || (!ctNodes[j].name && !cap.name))) {
+            ctNodes[j].content = (ctNodes[j].content || '') + cap.content;
+            used.add(j);
+            break;
+          }
+        }
+      }
+    }
+
     return root;
   },
 
@@ -2187,7 +2256,7 @@ export const Rex = {
     function sub(s,px,pm){if(typeof s!=='string')return s;for(const k of pmKeys(pm))s=s.replaceAll('$'+k,String(pm[k]));
       return s.replace(/\$(\w[\w.-]*)/g,(m,id)=>RUNTIME_BINDINGS.has(m)||m.startsWith('$item.')?m:px+'_'+id)}
     function coerce(v){if(typeof v==='string'){if(v==='true')return true;if(v==='false')return false;if(/^-?\d+(\.\d+)?$/.test(v))return+v;}return v;}
-    function sv(v,px,pm){if(typeof v==='string')return coerce(sub(v,px,pm));if(Array.isArray(v))return v.map(x=>sv(x,px,pm));if(v&&typeof v==='object'&&v.expr){const ne=sub(v.expr,px,pm);const{nodes}=rexParse(ne);return{expr:ne,rex:nodes[0]||null}}return v}
+    function sv(v,px,pm){if(typeof v==='string')return coerce(sub(v,px,pm));if(Array.isArray(v))return v.map(x=>sv(x,px,pm));if(v&&typeof v==='object'&&v.expr){const ne=sub(v.expr,px,pm);const{nodes}=rexParseCold(ne);return{expr:ne,rex:nodes[0]||null}}return v}
     function rw(n,px,pm){if(n.name)n.name=sub(n.name,px,pm);for(const[k,v]of Object.entries(n.attrs))n.attrs[k]=sv(v,px,pm);if(n.content)n.content=sub(n.content,px,pm);for(const c of n.children)rw(c,px,pm)}
     function ex(n,d){if(d>16)return;const out=[];for(const ch of n.children){if(ch.type==='use'){
       const t=ts.get(ch.name);if(!t){out.push(ch);continue}const px=ch.attrs.as||ch.name;const pm={};
