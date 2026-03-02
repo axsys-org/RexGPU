@@ -118,6 +118,12 @@ export class RexGPU {
     this._deriveBindGroup = null;
     this._deriveFieldCount = 0;
     this._deriveFields = [];   // [{name, wgslField}] — maps field index → derive name
+
+    // ── Shader module linking ──
+    this._shaderHashCache = new Map();   // hash → GPUShaderModule
+    this._wgslLibSymbols = new Map();    // libName → Set<symbolName>
+    this._libHashes = new Map();         // libName → hash (invalidation tracking)
+    this._nsCounter = 0;                 // namespace counter for this compile cycle
   }
 
   registerCompileType(typeName, handler) { this._compileHandlers.set(typeName, handler); }
@@ -1149,31 +1155,221 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     if (outName) filterOutputs.set(outName, finalOut);
   }
 
+  // ── Shader Module Linking ──
+  // Namespace isolation, selective imports, tree-shaking, structural hash caching.
+  // Adapted from use.gpu link.ts.
+
+  _hashWgsl(code) {
+    // FNV-1a 32-bit hash
+    let h = 0x811c9dc5;
+    for (let i = 0; i < code.length; i++) {
+      h ^= code.charCodeAt(i);
+      h = Math.imul(h, 0x01000193);
+    }
+    return h >>> 0;
+  }
+
+  _resolveImports(code) {
+    // Parse #import directives, returning clean code + import list
+    // Supports: #import name          (whole module)
+    //           #import name { a, b } (selective)
+    const imports = [];
+    const cleanCode = code.replace(/^[ \t]*#import\s+(\S+)(?:\s*\{([^}]+)\})?\s*$/gm, (_, name, selectors) => {
+      const symbols = selectors ? selectors.split(',').map(s => s.trim()).filter(Boolean) : null;
+      imports.push({ name, symbols });
+      return ''; // remove directive from code
+    });
+    return { imports, cleanCode };
+  }
+
+  _parseWgslDeclarations(code) {
+    // Extract top-level WGSL declarations: fn, var, const, struct, let
+    // Returns Map<name, {kind, start, end, body}>
+    const decls = new Map();
+    // Match fn declarations with body
+    const fnRe = /^(fn\s+(\w+)\s*\([^)]*\)(?:\s*->\s*[^{]+)?\s*\{)/gm;
+    let m;
+    while ((m = fnRe.exec(code)) !== null) {
+      const name = m[2];
+      const start = m.index;
+      // Find matching closing brace
+      let depth = 1, pos = m.index + m[1].length;
+      while (pos < code.length && depth > 0) {
+        if (code[pos] === '{') depth++;
+        else if (code[pos] === '}') depth--;
+        pos++;
+      }
+      decls.set(name, { kind: 'fn', start, end: pos, body: code.slice(start, pos) });
+    }
+    // Match var/const/let/override declarations
+    const varRe = /^((?:var|const|let|override)\s*(?:<[^>]+>)?\s+(\w+)\s*(?::\s*[^=;]+)?(?:\s*=[^;]*)?;)/gm;
+    while ((m = varRe.exec(code)) !== null) {
+      const name = m[2];
+      if (!decls.has(name)) {
+        decls.set(name, { kind: 'var', start: m.index, end: m.index + m[1].length, body: m[1] });
+      }
+    }
+    // Match struct declarations
+    const structRe = /^(struct\s+(\w+)\s*\{[^}]*\})/gm;
+    while ((m = structRe.exec(code)) !== null) {
+      const name = m[2];
+      if (!decls.has(name)) {
+        decls.set(name, { kind: 'struct', start: m.index, end: m.index + m[1].length, body: m[1] });
+      }
+    }
+    return decls;
+  }
+
+  _buildUsageGraph(decls) {
+    // For each declaration, find which other declarations it references
+    const graph = new Map(); // name → Set<name>
+    const allNames = [...decls.keys()];
+    for (const [name, decl] of decls) {
+      const refs = new Set();
+      for (const other of allNames) {
+        if (other === name) continue;
+        // Check if `other` appears as a word in this declaration's body
+        const re = new RegExp('\\b' + other.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\b');
+        if (re.test(decl.body)) refs.add(other);
+      }
+      graph.set(name, refs);
+    }
+    return graph;
+  }
+
+  _shakeModule(code, decls, usedSymbols) {
+    // Remove unused top-level declarations via reachability from usedSymbols
+    const graph = this._buildUsageGraph(decls);
+    const reachable = new Set();
+    const walk = (name) => {
+      if (reachable.has(name)) return;
+      reachable.add(name);
+      const refs = graph.get(name);
+      if (refs) for (const r of refs) walk(r);
+    };
+    for (const s of usedSymbols) walk(s);
+
+    // Remove unreachable declarations (in reverse order to preserve offsets)
+    const toRemove = [];
+    for (const [name, decl] of decls) {
+      if (!reachable.has(name)) toRemove.push(decl);
+    }
+    toRemove.sort((a, b) => b.start - a.start); // reverse order
+    let result = code;
+    for (const decl of toRemove) {
+      result = result.slice(0, decl.start) + result.slice(decl.end);
+    }
+    return result;
+  }
+
+  _namespaceModule(code, ns, decls, globalTypes) {
+    // Prefix all non-global symbols with namespace _XX_
+    let result = code;
+    for (const [name] of decls) {
+      if (globalTypes.has(name)) continue; // struct types shared globally
+      const re = new RegExp('\\b' + name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\b', 'g');
+      result = result.replace(re, ns + name);
+    }
+    return result;
+  }
+
+  _linkShader(code, shaderName) {
+    const { imports, cleanCode } = this._resolveImports(code);
+    if (imports.length === 0) return code; // no imports, pass through
+
+    let linked = cleanCode;
+    let uniformEmitted = false;
+    const hasManualU = /var\s*<\s*uniform\s*>\s*u\s*:/.test(code);
+    const preambles = [];
+    const aliases = []; // [{from, to}] — rename namespaced symbols for selective imports
+
+    // Collect all struct type names as globals (shared, not namespaced)
+    const globalTypes = new Set();
+    for (const [name] of this._wgslStructs) globalTypes.add(name);
+
+    for (const imp of imports) {
+      // Struct import (from @struct nodes)
+      if (this._wgslStructs.has(imp.name)) {
+        const structWgsl = this._wgslStructs.get(imp.name);
+        if (!uniformEmitted && !hasManualU) {
+          uniformEmitted = true;
+          preambles.push(`${structWgsl}\n@group(0) @binding(0) var<uniform> u: ${imp.name};`);
+        } else {
+          preambles.push(structWgsl);
+        }
+        continue;
+      }
+
+      // Lib import (from @lib nodes)
+      if (this._wgslLibs.has(imp.name)) {
+        let libCode = this._wgslLibs.get(imp.name);
+        const decls = this._parseWgslDeclarations(libCode);
+
+        // Tree-shake if selective import
+        if (imp.symbols) {
+          libCode = this._shakeModule(libCode, decls, new Set(imp.symbols));
+        }
+
+        // Namespace isolation
+        const ns = `_${(this._nsCounter++).toString(36).padStart(2, '0')}_`;
+        const namespacedDecls = this._parseWgslDeclarations(libCode); // re-parse after shaking
+        const namespacedCode = this._namespaceModule(libCode, ns, namespacedDecls, globalTypes);
+
+        // Build aliases for imported symbols → namespaced versions
+        if (imp.symbols) {
+          for (const sym of imp.symbols) {
+            if (namespacedDecls.has(sym)) {
+              aliases.push({ from: ns + sym, to: sym });
+            }
+          }
+        } else {
+          // Whole-module import: alias all declarations back to original names
+          for (const [name] of namespacedDecls) {
+            if (!globalTypes.has(name)) {
+              aliases.push({ from: ns + name, to: name });
+            }
+          }
+        }
+
+        preambles.push(namespacedCode);
+        continue;
+      }
+
+      // Not found
+      this.log(`shader "${shaderName}": #import ${imp.name} not found`, 'warn');
+      preambles.push(`// #import ${imp.name} \u2014 NOT FOUND`);
+    }
+
+    // Apply aliases: replace original symbol names in the shader body with namespaced versions
+    for (const { from, to } of aliases) {
+      const re = new RegExp('\\b' + to.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\b', 'g');
+      linked = linked.replace(re, from);
+    }
+
+    return preambles.join('\n\n') + '\n\n' + linked;
+  }
+
   _compileShaders(tree) {
     this._shaderEntries = new Map();
+    this._nsCounter = 0; // reset namespace counter per compile cycle
+
+    // Pre-parse lib symbols for diagnostics
+    this._wgslLibSymbols = new Map();
+    for (const [name, code] of this._wgslLibs) {
+      const decls = this._parseWgslDeclarations(code);
+      this._wgslLibSymbols.set(name, new Set(decls.keys()));
+      // Track lib content hash for cache invalidation
+      this._libHashes.set(name, this._hashWgsl(code));
+    }
+
     for (const s of Rex.findAll(tree,'shader')) {
       const key = s.name || s.type;
       let code = s.content?.trim();
       if (!code) { this.log(`shader "${key}" has no content`,'warn'); continue; }
-      // Resolve #import — structs, libs, or shared shaders
-      // Only the first struct import emits var<uniform> u (binding 0).
-      // Subsequent struct imports just emit the struct body (for use in storage bindings etc).
-      let uniformEmitted = false;
-      // Also skip if the shader manually declares 'var<uniform> u' already
-      const hasManualU = /var\s*<\s*uniform\s*>\s*u\s*:/.test(code);
-      code = code.replace(/^[ \t]*#import\s+(\S+).*$/gm, (_, name) => {
-        if (this._wgslStructs.has(name)) {
-          const structWgsl = this._wgslStructs.get(name);
-          if (!uniformEmitted && !hasManualU) {
-            uniformEmitted = true;
-            return `${structWgsl}\n@group(0) @binding(0) var<uniform> u: ${name};`;
-          }
-          return structWgsl; // struct body only — binding declared manually in shader
-        }
-        if (this._wgslLibs.has(name)) return this._wgslLibs.get(name);
-        this.log(`shader "${key}": #import ${name} not found`,'warn');
-        return `// #import ${name} \u2014 NOT FOUND`;
-      });
+
+      // Link: resolve imports with namespace isolation + tree-shaking
+      code = this._linkShader(code, key);
+
       // Auto-inject WGSL feature enables
       const enables = [];
       if (this._features.has('shader-f16') && /\bf16\b/.test(code)) enables.push('enable f16;');
@@ -1181,6 +1377,17 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
       if (this._features.has('clip-distances') && /clip_distances/.test(code)) enables.push('enable clip_distances;');
       if (this._features.has('dual-source-blending') && /blend_src/.test(code)) enables.push('enable dual_source_blending;');
       if (enables.length > 0) code = enables.join('\n') + '\n' + code;
+
+      // Structural hash cache — reuse GPUShaderModule if WGSL unchanged
+      const hash = this._hashWgsl(code);
+      const cached = this._shaderHashCache.get(hash);
+      if (cached) {
+        this.shaderModules.set(key, cached);
+        this._lastGoodShaders.set(key, code);
+        this.log(`shader: ${key} \u2713 (cached)`,'ok');
+        continue;
+      }
+
       try {
         const mod = this.device.createShaderModule({code});
         // Catch async WGSL compile errors (deferred by the browser)
@@ -1193,6 +1400,7 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
           });
         }
         this.shaderModules.set(key, mod);
+        this._shaderHashCache.set(hash, mod);
         this._lastGoodShaders.set(key, code);
         this.log(`shader: ${key} \u2713`,'ok');
       } catch(e) {
@@ -1621,11 +1829,152 @@ struct VSOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
   }
 
   // ── Resource scopes: @resources → shared GPUBindGroupLayout + GPUBindGroup ──
+  // ── Bind Group Auto-Generation ──
+  // Parse WGSL binding declarations to auto-generate GPUBindGroupLayout + GPUBindGroup.
+  // Adapted from use.gpu bindgroup.ts — duck-types binding sources by WGSL var type.
+
+  _autoResourceScope(res) {
+    // Find which shader(s) this resource scope serves
+    const shaderNames = [];
+    for (const child of res.children) {
+      if (child.type === 'shader' || child.type === 'pipeline') {
+        const sn = child.name || child.attrs.shader || child.attrs.vertex || child.attrs.fragment || child.attrs.compute;
+        if (sn) shaderNames.push(sn);
+      }
+    }
+    // Also check :shader attribute on the @resources node itself
+    const attrShader = res.attrs.shader;
+    if (attrShader) {
+      if (Array.isArray(attrShader)) shaderNames.push(...attrShader);
+      else shaderNames.push(attrShader);
+    }
+
+    if (shaderNames.length === 0) {
+      this.log(`resources "${res.name}": :auto requires @shader children or :shader attr`, 'warn');
+      return;
+    }
+
+    // Parse WGSL binding declarations from all referenced shaders
+    const bindingRe = /@group\(\d+\)\s*@binding\((\d+)\)\s*var\s*<([^>]+)>\s*(\w+)\s*:\s*([^;]+);/g;
+    const bindingMap = new Map(); // slot → {varType, varName, wgslType}
+    let visibility = 0;
+
+    for (const sn of shaderNames) {
+      const wgsl = this._lastGoodShaders.get(sn);
+      if (!wgsl) {
+        this.log(`resources "${res.name}": shader "${sn}" not found for auto-gen`, 'warn');
+        continue;
+      }
+
+      // Detect shader stages for visibility
+      if (/@vertex\s+fn\b/.test(wgsl)) visibility |= GPUShaderStage.VERTEX;
+      if (/@fragment\s+fn\b/.test(wgsl)) visibility |= GPUShaderStage.FRAGMENT;
+      if (/@compute\s+fn\b/.test(wgsl)) visibility |= GPUShaderStage.COMPUTE;
+
+      let m;
+      bindingRe.lastIndex = 0;
+      while ((m = bindingRe.exec(wgsl)) !== null) {
+        const slot = parseInt(m[1]);
+        const varType = m[2].trim();
+        const varName = m[3];
+        const wgslType = m[4].trim();
+        if (!bindingMap.has(slot)) {
+          bindingMap.set(slot, { varType, varName, wgslType });
+        }
+      }
+    }
+
+    if (visibility === 0) visibility = GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT | GPUShaderStage.COMPUTE;
+
+    // Sort by binding slot
+    const slots = [...bindingMap.entries()].sort((a, b) => a[0] - b[0]);
+    const entries = [];
+    const layoutEntries = [];
+    let hasVideo = false;
+
+    for (const [slot, { varType, varName, wgslType }] of slots) {
+      // Duck-type by WGSL var type
+      if (varType === 'uniform') {
+        // Uniform buffer — resolve from heap layout or structs
+        const hl = this._heapLayout.get(varName);
+        const structName = wgslType.trim();
+        const sd = this._structs.get(structName);
+        const size = hl ? hl.size : (sd ? sd.size : 256);
+
+        if (hl && this._heapBuffer) {
+          layoutEntries.push({ binding: slot, visibility, buffer: { type: 'uniform', minBindingSize: size } });
+          entries.push({ binding: slot, resource: { buffer: this._heapBuffer, offset: hl.offset, size: hl.size } });
+        } else {
+          this.log(`resources "${res.name}": uniform "${varName}" not found in heap`, 'warn');
+        }
+      } else if (varType.startsWith('storage')) {
+        // Storage buffer
+        const isReadOnly = varType.includes('read') && !varType.includes('read_write');
+        const bufType = isReadOnly ? 'read-only-storage' : 'storage';
+        const sb = this._storageBuffers.get(varName);
+        if (sb) {
+          layoutEntries.push({ binding: slot, visibility, buffer: { type: bufType } });
+          entries.push({ binding: slot, resource: { buffer: sb } });
+        } else {
+          this.log(`resources "${res.name}": storage buffer "${varName}" not found`, 'warn');
+        }
+      } else if (wgslType.startsWith('texture_storage')) {
+        // Storage texture
+        const fmtMatch = wgslType.match(/texture_storage_\w+<(\w+),\s*(\w+)>/);
+        const storageFmt = fmtMatch ? fmtMatch[1] : 'rgba8unorm';
+        const access = fmtMatch ? fmtMatch[2].replace('_', '-') : 'write-only';
+        const tex = this._textures.get(varName);
+        if (tex) {
+          layoutEntries.push({ binding: slot, visibility: GPUShaderStage.COMPUTE, storageTexture: { access, format: storageFmt } });
+          entries.push({ binding: slot, resource: (this._textureViews?.get(varName)) || tex.createView() });
+        }
+      } else if (wgslType.startsWith('texture')) {
+        // Sampled texture
+        const tex = this._textures.get(varName);
+        if (tex) {
+          const isDepth = (tex.format || '').startsWith('depth');
+          layoutEntries.push({ binding: slot, visibility, texture: isDepth ? { sampleType: 'depth' } : {} });
+          entries.push({ binding: slot, resource: (this._textureViews?.get(varName)) || tex.createView() });
+        }
+      } else if (wgslType === 'sampler' || wgslType === 'sampler_comparison') {
+        // Sampler
+        const isComparison = wgslType === 'sampler_comparison';
+        // Try to match sampler to a texture with similar name
+        const samp = this._samplers.get(varName) || this._samplers.get(varName.replace(/[-_]sampler$/, ''));
+        if (samp) {
+          layoutEntries.push({ binding: slot, visibility, sampler: { type: isComparison ? 'comparison' : 'filtering' } });
+          entries.push({ binding: slot, resource: samp.sampler });
+        } else {
+          // Create default filtering sampler
+          const defaultSamp = this.device.createSampler({ magFilter: 'linear', minFilter: 'linear' });
+          layoutEntries.push({ binding: slot, visibility, sampler: { type: 'filtering' } });
+          entries.push({ binding: slot, resource: defaultSamp });
+        }
+      } else {
+        this.log(`resources "${res.name}": unknown var type "${varType}" for "${varName}"`, 'warn');
+      }
+    }
+
+    if (layoutEntries.length > 0) {
+      const layout = this.device.createBindGroupLayout({ entries: layoutEntries });
+      const bindGroup = this.device.createBindGroup({ layout, entries });
+      this._resourceScopes.set(res.name, { layout, bindGroup, entries: layoutEntries.length, hasVideo, _layoutEntries: layoutEntries, _entries: entries });
+      this.log(`resources: "${res.name}" ${layoutEntries.length} bindings (auto)`, 'ok');
+    }
+  }
+
   _compileResourceScopes(tree) {
     this._resourceScopes = new Map();
     for (const res of Rex.findAll(tree, 'resources')) {
       const name = res.name;
       if (!name) continue;
+
+      // Auto-generation: derive layout from shader WGSL declarations
+      if (res.attrs.auto === true || res.attrs.auto === 'true') {
+        this._autoResourceScope(res);
+        continue;
+      }
+
       const entries = [];
       const layoutEntries = [];
       let binding = 0;

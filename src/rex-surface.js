@@ -1575,13 +1575,13 @@ export class RexSurface {
       const drawX = Math.max(0, (gs - m.width) / 2);
       ctx.fillText(ch, drawX, 2);
 
-      // Read pixels
+      // Read pixels — keep full alpha for ESDT subpixel offsets
       const imgData = ctx.getImageData(0, 0, gs, gs);
-      const binary = new Uint8Array(gs * gs);
-      for (let j = 0; j < gs * gs; j++) binary[j] = imgData.data[j * 4 + 3]; // alpha channel
+      const alpha = new Uint8Array(gs * gs);
+      for (let j = 0; j < gs * gs; j++) alpha[j] = imgData.data[j * 4 + 3];
 
-      // Generate SDF
-      const sdf = this._generateSDF(binary, gs, gs, SDF_SPREAD);
+      // Generate SDF via Extended Subpixel Distance Transform
+      const sdf = this._generateESDT(alpha, gs, gs, SDF_SPREAD);
 
       // Write to atlas
       for (let sy = 0; sy < gs; sy++) {
@@ -1638,48 +1638,183 @@ export class RexSurface {
     }
   }
 
-  _generateSDF(binary, w, h, spread) {
-    // Separable distance transform: O(w*h*spread) instead of O(w*h*spread²)
-    // Pass 1: horizontal — minimum distance to boundary in each row
-    const INF = spread + 1;
-    const hDist = new Float32Array(w * h);
+  // ── ESDT: Extended Subpixel Distance Transform ──
+  // Adapted from use.gpu (unconed) — Felzenszwalb & Huttenlocher with subpixel offsets
+  // Produces dramatically sharper SDF text at small pixel sizes.
+
+  _generateESDT(alpha, w, h, radius) {
+    const INF = 1e10;
+    const np = w * h;
+    const sp = Math.max(w, h);
+
+    // Scratch workspace (reuse across glyphs via lazy init)
+    if (!this._esdtStage || this._esdtStage.size < sp) {
+      const n = sp * sp;
+      this._esdtStage = {
+        outer: new Float32Array(n), inner: new Float32Array(n),
+        xo: new Float32Array(n), yo: new Float32Array(n),
+        xi: new Float32Array(n), yi: new Float32Array(n),
+        f: new Float32Array(sp), z: new Float32Array(sp + 1),
+        b: new Float32Array(sp), t: new Float32Array(sp), v: new Uint16Array(sp),
+        size: sp,
+      };
+    }
+    const { outer, inner, xo, yo, xi, yi, f, z, b, t, v } = this._esdtStage;
+
+    // ── Step 1: Paint alpha into stage (squared distance seeds) ──
+    outer.fill(INF, 0, np);
+    inner.fill(0, 0, np);
+    for (let i = 0; i < np; i++) {
+      const a = alpha[i];
+      if (!a) continue;
+      if (a >= 254) { outer[i] = 0; inner[i] = INF; }
+      else          { outer[i] = 0; inner[i] = 0; }
+    }
+
+    // ── Step 2: Compute subpixel offsets at boundary pixels ──
+    xo.fill(0, 0, np);
+    yo.fill(0, 0, np);
+    xi.fill(0, 0, np);
+    yi.fill(0, 0, np);
+
+    const get = (x, y) => (x >= 0 && x < w && y >= 0 && y < h) ? alpha[y * w + x] / 255 : 0;
+    const _isBlack = (v) => !v;
+    const _isWhite = (v) => v === 1;
+    const _isSolid = (v) => !(v && 1 - v); // true if 0 or 1 (binary), false if gray
+
     for (let y = 0; y < h; y++) {
-      const inside0 = binary[y * w] > 128;
-      // Forward pass
-      hDist[y * w] = INF;
-      for (let x = 1; x < w; x++) {
-        const cur = binary[y * w + x] > 128;
-        const prev = binary[y * w + x - 1] > 128;
-        hDist[y * w + x] = cur !== prev ? 0.5 : Math.min(hDist[y * w + x - 1] + 1, INF);
-      }
-      // Backward pass
-      for (let x = w - 2; x >= 0; x--) {
-        const cur = binary[y * w + x] > 128;
-        const next = binary[y * w + x + 1] > 128;
-        const backDist = cur !== next ? 0.5 : hDist[y * w + x + 1] + 1;
-        if (backDist < hDist[y * w + x]) hDist[y * w + x] = backDist;
+      for (let x = 0; x < w; x++) {
+        const c = get(x, y);
+        const j = y * w + x;
+
+        if (!_isSolid(c)) {
+          // Gray pixel — compute gradient via 8-neighbor Sobel kernel
+          const dc = c - 0.5;
+          const l = get(x-1, y), r = get(x+1, y);
+          const tt2 = get(x, y-1), bb2 = get(x, y+1);
+          const tl = get(x-1, y-1), tr = get(x+1, y-1);
+          const bl = get(x-1, y+1), br = get(x+1, y+1);
+
+          const ll = (tl + l*2 + bl) / 4;
+          const rr = (tr + r*2 + br) / 4;
+          const ttw = (tl + tt2*2 + tr) / 4;
+          const bbw = (bl + bb2*2 + br) / 4;
+
+          const mn = Math.min(l, r, tt2, bb2, tl, tr, bl, br);
+          const mx = Math.max(l, r, tt2, bb2, tl, tr, bl, br);
+
+          if (mn > 0) { inner[j] = INF; continue; }  // interior crease
+          if (mx < 1) { outer[j] = INF; continue; }  // exterior crease
+
+          let dx = rr - ll;
+          let dy = bbw - ttw;
+          const dl = 1 / Math.sqrt(dx * dx + dy * dy);
+          dx *= dl; dy *= dl;
+
+          xo[j] = -dc * dx;
+          yo[j] = -dc * dy;
+        } else if (_isWhite(c)) {
+          // White pixel adjacent to black — set 0.4999 offset on neighbor
+          const l = get(x-1, y), r = get(x+1, y);
+          const tt2 = get(x, y-1), bb2 = get(x, y+1);
+          if (_isBlack(l) && j-1 >= 0) { xo[j-1] = 0.4999; outer[j-1] = 0; inner[j-1] = 0; }
+          if (_isBlack(r) && j+1 < np) { xo[j+1] = -0.4999; outer[j+1] = 0; inner[j+1] = 0; }
+          if (_isBlack(tt2) && j-w >= 0) { yo[j-w] = 0.4999; outer[j-w] = 0; inner[j-w] = 0; }
+          if (_isBlack(bb2) && j+w < np) { yo[j+w] = -0.4999; outer[j+w] = 0; inner[j+w] = 0; }
+        }
       }
     }
 
-    // Pass 2: vertical — combine with horizontal distances using sqrt(dx²+dy²)
-    const sdf = new Float32Array(w * h);
-    for (let x = 0; x < w; x++) {
-      for (let y = 0; y < h; y++) {
-        const inside = binary[y * w + x] > 128;
-        let minDist = hDist[y * w + x]; // distance from horizontal pass
-        const yMin = Math.max(0, y - spread);
-        const yMax = Math.min(h - 1, y + spread);
-        for (let sy = yMin; sy <= yMax; sy++) {
-          const dy = Math.abs(y - sy);
-          const dx = hDist[sy * w + x];
-          const d = Math.sqrt(dx * dx + dy * dy);
-          if (d < minDist) minDist = d;
-        }
-        sdf[y * w + x] = inside
-          ? Math.min(0.5 + minDist / (2 * spread), 1.0)
-          : Math.max(0.5 - minDist / (2 * spread), 0.0);
+    // ── Step 3: Split subpixel offsets into outer/inner at ±0.5 boundary ──
+    for (let i = 0; i < np; i++) {
+      const nx = xo[i], ny = yo[i];
+      if (!nx && !ny) continue;
+
+      const nn = Math.sqrt(nx * nx + ny * ny);
+      const sx = (Math.abs(nx / nn) - 0.5) > 0 ? Math.sign(nx) : 0;
+      const sy = (Math.abs(ny / nn) - 0.5) > 0 ? Math.sign(ny) : 0;
+
+      const ix = i % w, iy = (i / w) | 0;
+      const c = get(ix, iy);
+      const d = get(ix + sx, iy + sy);
+      const s = Math.sign(d - c);
+
+      let dlo = (nn + 0.4999 * s);
+      let dli = (nn - 0.4999 * s);
+      dlo /= nn; dli /= nn;
+
+      xo[i] = nx * dlo; yo[i] = ny * dlo;
+      xi[i] = nx * dli; yi[i] = ny * dli;
+    }
+
+    // ── Step 4: 2D ESDT (Felzenszwalb & Huttenlocher + subpixel) ──
+    // Column pass then row pass for both outer and inner
+    const esdt1d = (mask, xs, ys, offset, stride, length) => {
+      v[0] = 0;
+      b[0] = xs[offset];
+      t[0] = ys[offset];
+      z[0] = -INF; z[1] = INF;
+      f[0] = mask[offset] ? INF : ys[offset] * ys[offset];
+
+      let k = 0;
+      for (let q = 1, s2 = 0; q < length; q++) {
+        const o = offset + q * stride;
+        const dx2 = xs[o], dy2 = ys[o];
+        const fq = f[q] = mask[o] ? INF : dy2 * dy2;
+        t[q] = dy2;
+        const qs = q + dx2;
+        const q2 = qs * qs;
+        b[q] = qs;
+
+        do {
+          const r2 = v[k]; const rs = b[r2];
+          s2 = (fq - f[r2] + q2 - rs * rs) / (qs - rs) / 2;
+        } while (s2 <= z[k] && --k > -1);
+
+        k++;
+        v[k] = q; z[k] = s2; z[k + 1] = INF;
+      }
+
+      for (let q = 0, k2 = 0; q < length; q++) {
+        while (z[k2 + 1] < q) k2++;
+        const r2 = v[k2];
+        const rs = b[r2];
+        const dy2 = t[r2];
+        const rq = rs - q;
+        const o = offset + q * stride;
+        xs[o] = rq; ys[o] = dy2;
+        if (r2 !== q) mask[o] = 0;
+      }
+    };
+
+    const esdt2d = (mask, xs, ys) => {
+      for (let x = 0; x < w; x++) esdt1d(mask, ys, xs, x, w, h);  // columns
+      for (let y = 0; y < h; y++) esdt1d(mask, xs, ys, y * w, 1, w);  // rows
+    };
+
+    esdt2d(outer, xo, yo);
+    esdt2d(inner, xi, yi);
+
+    // ── Step 5: Combine into normalized SDF [0, 1], 0.5 = boundary ──
+    const cutoff = 0.25;
+    const sdf = new Float32Array(np);
+    for (let i = 0; i < np; i++) {
+      const outerD = Math.max(0, Math.sqrt(xo[i] * xo[i] + yo[i] * yo[i]) - 0.5);
+      const innerD = Math.max(0, Math.sqrt(xi[i] * xi[i] + yi[i] * yi[i]) - 0.5);
+      const d = outerD >= innerD ? outerD : -innerD;
+      // Map to [0, 1] with 0.5 at boundary
+      sdf[i] = Math.max(0, Math.min(1, (255 - 255 * (d / radius + cutoff)) / 255));
+    }
+
+    // Paint original alpha back at boundary pixels (preserves rasterizer antialiasing)
+    for (let i = 0; i < np; i++) {
+      const a = alpha[i] / 255;
+      if (a > 0 && a < 1) {
+        const d = 0.5 - a;
+        sdf[i] = Math.max(0, Math.min(1, (255 - 255 * (d / radius + cutoff)) / 255));
       }
     }
+
     return sdf;
   }
 

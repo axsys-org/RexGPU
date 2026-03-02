@@ -1034,6 +1034,103 @@ export class RexBehaviour {
         }
         break;
       }
+
+      // ── Declarative mutation operators (use.gpu-inspired) ──
+
+      case 'merge': {
+        // @merge /path — shallow merge child @slot values into existing slot
+        const path = node.name;
+        const slotName = path.startsWith('/') ? path.slice(1) : path;
+        const shrub = this._shrubs.get(ctx.shrub);
+        if (!shrub) break;
+        const current = shrub.slots.get(slotName);
+        if (current && typeof current === 'object' && !(current instanceof Map)) {
+          // Object merge
+          const merged = { ...current };
+          for (const child of node.children.filter(c => c.type === 'slot')) {
+            const val = this._evalExpr(this._extractExpr(child), ctx);
+            const key = child.name;
+            if (val !== undefined && typeof val === 'object' && typeof merged[key] === 'object' && merged[key] !== null) {
+              merged[key] = { ...merged[key], ...val }; // recursive one level
+            } else {
+              merged[key] = val;
+            }
+          }
+          this._setSlot(ctx.shrub, path, merged);
+        } else if (current instanceof Map) {
+          // Map merge
+          for (const child of node.children.filter(c => c.type === 'slot')) {
+            current.set(child.name, this._evalExpr(this._extractExpr(child), ctx));
+          }
+          this._setSlot(ctx.shrub, path, current);
+        } else {
+          // No existing value — create object from children
+          const obj = {};
+          for (const child of node.children.filter(c => c.type === 'slot')) {
+            obj[child.name] = this._evalExpr(this._extractExpr(child), ctx);
+          }
+          this._setSlot(ctx.shrub, path, obj);
+        }
+        break;
+      }
+      case 'delete': {
+        // @delete /path — remove slot entirely
+        const path = node.name;
+        const slotName = path.startsWith('/') ? path.slice(1) : path;
+        const shrub = this._shrubs.get(ctx.shrub);
+        if (shrub) {
+          shrub.slots.delete(slotName);
+          if (this.onSlotChange) this.onSlotChange(ctx.shrub, slotName, undefined);
+        }
+        break;
+      }
+      case 'apply': {
+        // @apply /path EXPR — transform slot in-place; $current = current value
+        const path = node.name;
+        const slotName = path.startsWith('/') ? path.slice(1) : path;
+        const shrub = this._shrubs.get(ctx.shrub);
+        if (!shrub) break;
+        const currentVal = shrub.slots.get(slotName);
+        const applyCtx = { ...ctx, currentSlotValue: currentVal };
+        const val = this._evalExpr(this._extractExpr(node), applyCtx);
+        this._setSlot(ctx.shrub, path, val);
+        break;
+      }
+      case 'inc': {
+        // @inc /path EXPR — add EXPR to current numeric slot
+        const path = node.name;
+        const slotName = path.startsWith('/') ? path.slice(1) : path;
+        const shrub = this._shrubs.get(ctx.shrub);
+        if (!shrub) break;
+        const currentVal = Number(shrub.slots.get(slotName)) || 0;
+        const delta = this._evalExpr(this._extractExpr(node), ctx);
+        this._setSlot(ctx.shrub, path, currentVal + (Number(delta) || 0));
+        break;
+      }
+      case 'toggle': {
+        // @toggle /path — flip boolean slot
+        const path = node.name;
+        const slotName = path.startsWith('/') ? path.slice(1) : path;
+        const shrub = this._shrubs.get(ctx.shrub);
+        if (!shrub) break;
+        const currentVal = shrub.slots.get(slotName);
+        this._setSlot(ctx.shrub, path, !currentVal);
+        break;
+      }
+      case 'push': {
+        // @push /path EXPR — append value to array-typed slot
+        const path = node.name;
+        const slotName = path.startsWith('/') ? path.slice(1) : path;
+        const shrub = this._shrubs.get(ctx.shrub);
+        if (!shrub) break;
+        let arr = shrub.slots.get(slotName);
+        if (!Array.isArray(arr)) arr = [];
+        const val = this._evalExpr(this._extractExpr(node), ctx);
+        arr.push(val);
+        this._setSlot(ctx.shrub, path, arr);
+        break;
+      }
+
       default: {
         const h = this._mutationHandlers.get(node.type);
         if (h) h(node, ctx, this);
@@ -1219,7 +1316,10 @@ export class RexBehaviour {
         switch (op) {
           case 'slot': return self._readSlot(ctx.shrub, key, ctx);
           case 'dep': return self._readEnv('%' + key, ctx);
-          case 'binding': return self._readBinding('$' + key, ctx);
+          case 'binding':
+            // $current — special binding for @apply mutation context
+            if (key === 'current' && ctx.currentSlotValue !== undefined) return ctx.currentSlotValue;
+            return self._readBinding('$' + key, ctx);
           case 'ident': return undefined; // fall through to string in evalExpr
           case 'collection': return self._resolveCollection(ctx.shrub, key, ctx);
           case 'call': {
@@ -1321,7 +1421,8 @@ export class RexBehaviour {
   _getMutTypes() {
     if (this._mutTypeCache) return this._mutTypeCache;
     this._mutTypeCache = new Set(['slot','input','guard','dead','test','where',
-      'set','create','update','remove','each','when','dep','shrub','kids','def','derive','talk']);
+      'set','create','update','remove','each','when','merge','delete','apply','inc','toggle','push',
+      'dep','shrub','kids','def','derive','talk']);
     for (const t of this._schemaHandlers.keys()) this._mutTypeCache.add(t);
     for (const t of this._mutationHandlers.keys()) this._mutTypeCache.add(t);
     return this._mutTypeCache;

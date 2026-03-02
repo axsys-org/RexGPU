@@ -197,7 +197,7 @@ These enable `''...''` content block capture on those node types, identical to h
 @tool read-file :shrub agent/coder :cost 1
   @input path :type string :description "File path to read"
   @input max-lines :type number :min 1 :max 10000
-  @output content :type string
+  @output content :type string :to /last-output
   @guard (gt /tool-budget 0)
   ''
   Read the contents of a file at the given path.
@@ -229,9 +229,20 @@ Synthetic node pushed to `tree.children`:
 
 The `_expr` attribute uses pre-compiled expression AST format recognized by `behaviour._extractExpr` (rex-behaviour.js:1332).
 
-### §4.3 — @delegate Mutation Type
+**Tool fiber mount (v2):** Each tool invocation is also tracked as a keyed fiber via `rexKeyed` (rex-fiber.js:212). During agent execution, tool calls expand to:
 
-Registered via `behaviour.registerMutationType('delegate', handler)` (rex-behaviour.js:48).
+```js
+// Inside agentFiber render:
+rexKeyed(toolFiber, toolCall.id, toolCall.name, toolCall.inputs);
+```
+
+This provides individual cancellation, profiling via `CommandRing.submit/complete` (rex-fiber.js:933), and keyed reconciliation for deduplication.
+
+**Backward optic (v2):** The `@output :to /slot` attribute compiles to a slot write on tool completion — the backward half of the profunctor optic (Rex-Agent-Spec §4.2). If `:to` is omitted, the output is returned to the LLM but not written to a slot.
+
+### §4.3 — @delegate as Fiber Spawn
+
+In v1, delegation was registered via `behaviour.registerMutationType('delegate', handler)` (rex-behaviour.js:48). In v2, `@delegate` expands to `rexKeyed(delegateFiber, ...)` (rex-fiber.js:212):
 
 ```rex
 @talk :shrub agent/manager :name assign-review
@@ -244,10 +255,29 @@ Registered via `behaviour.registerMutationType('delegate', handler)` (rex-behavi
     :timeout 30000
 ```
 
-Handler receives `(node, ctx, behaviour)`:
-1. Extract `:target`, `:talk`, `:input` attrs
-2. `behaviour.fireTalk(target, talk, inputs)` — invoke target agent's talk
-3. Watch target `/status` slot for completion routing via dep system
+**v2 expansion:**
+```js
+rexKeyed(delegateFiber, 'reviewer-review-code', {
+  target: 'agent/reviewer',
+  talk: 'review-code',
+  inputs: { code: getSlotValue('last-output') },
+  onComplete: 'handle-review-done',
+  onFail: 'handle-review-error',
+  timeout: 30000
+});
+```
+
+The delegate fiber:
+1. `behaviour.fireTalk(target, talk, inputs)` — invoke target agent's talk
+2. Watch target `/status` slot for completion (via derive, not ad-hoc polling)
+3. On complete → fire `:on-complete` talk in parent shrub
+4. On error → fire `:on-fail` talk in parent shrub
+5. On timeout → unmount fiber → fire `:on-fail` with `{error: "timeout"}`
+6. On parent fiber unmount → natural cancellation of in-flight delegation
+
+**Parallel delegation:** When multiple `@delegate` nodes carry `:parallel true`, they expand to `rexGather` (rex-fiber.js:200) for join semantics.
+
+**Backward compatibility:** `registerMutationType('delegate')` still works — the fiber path is an optimization over the mutation type.
 
 ### §4.4 — Tool Schema Builder
 
@@ -255,13 +285,15 @@ Handler receives `(node, ctx, behaviour)`:
 
 | Rex `:type` | JSON Schema | Additional attrs |
 |---|---|---|
-| `string` | `"string"` | `:enum`, `:format` |
-| `number` | `"number"` | `:min` → minimum, `:max` → maximum |
+| `string` | `"string"` | `:enum` (static list or expression), `:format` |
+| `number` | `"number"` | `:min` → minimum, `:max` → maximum (static or expression) |
 | `boolean` | `"boolean"` | |
 | `array` | `"array"` | `:items TYPE`, `:min-items`, `:max-items` |
 | `object` | `"object"` | nested `@field` children |
 
 Always: `additionalProperties: false`, all fields in `required`, `strict: true` (opt-out via `:strict false`).
+
+**Dynamic constraints (v2):** Expression values on `:enum`, `:min`, `:max` are evaluated at prompt-assembly time via `compileExprToJsonSchema(node, ctx)` — same expression AST, different backend target (JSON Schema instead of WGSL). See Rex-Agent-Spec §11.
 
 ### §4.5 — Prompt Assembly
 
@@ -271,7 +303,17 @@ Always: `additionalProperties: false`, all fields in `required`, `strict: true` 
 2. **Assembly order**: system → context → few-shot → task
 3. Returns `{system: string, task: string}`
 
-Prompts are extracted from nodes during `expandAgentSugar()` — their `.content` field was captured by the parser's content-type preprocessor.
+**v2 derive integration:** Prompt assembly is now a `@derive` expression (Rex-Agent-Spec §3.5). The `assemblePrompt()` function wraps derive evaluation for backward compatibility:
+
+```js
+function assemblePrompt(agentName, taskParams) {
+  behaviour.pushFormValue(`agent/${agentName}`, 'task-description', taskParams.description);
+  behaviour._flushDerives();
+  return behaviour.getSlotValue(`agent/${agentName}`, 'assembled-prompt');
+}
+```
+
+Prompts are extracted from nodes during `expandAgentSugar()` — their `.content` field was captured by the parser's content-type preprocessor. Crystallized few-shot examples from ShrubLM are auto-injected when `:source [static crystallized]` is declared.
 
 ### §4.6 — callLLM
 
@@ -295,7 +337,15 @@ async function callLLM(config, onToken) {
 }
 ```
 
-Tool use blocks in the response are parsed and returned for the caller to dispatch via `behaviour.fireTalk()`.
+**v2 CommandRing integration:** Each `callLLM` invocation is tracked via the agent's CommandRing (rex-fiber.js:933):
+
+```js
+const sqeId = ring.submit('llm-call', { model, tokens_in, system_hash });
+// ... SSE streaming ...
+ring.complete(sqeId, { tokens_out, finish_reason, latency_ms });
+```
+
+Tool use blocks in the response are parsed and returned for the caller to dispatch via `behaviour.fireTalk()`. Each tool call is subsequently tracked as its own ring entry.
 
 ### §4.7 — Exported API
 
@@ -304,10 +354,13 @@ Tool use blocks in the response are parsed and returned for the caller to dispat
 
 // Functions:
 expandAgentSugar(tree, log)    → {prompts: Map, toolSchemas: Map}
-registerDelegate(behaviour)     → void
+registerDelegate(behaviour)     → void  // v1 compat; v2 uses fiber spawn
 buildToolSchema(toolNode)       → JSON Schema object
-assemblePrompt(name, prompts, slots, params) → {system, task}
+assemblePrompt(name, prompts, slots, params) → {system, task}  // wraps derive eval in v2
 callLLM(config, onToken)        → Promise<{text, toolCalls}>
+
+// v2 additions:
+compileExprToJsonSchema(node, ctx)  → JSON Schema fragment
 ```
 
 ---
@@ -347,14 +400,17 @@ Ordering rationale:
 ### Instantiation (after behaviour, ~line 420)
 
 ```js
-// Agent sugar — register delegate mutation type
+// Agent sugar — register delegate mutation type (v1 compat)
 registerDelegate(behaviour);
+
+// Agent fiber host — persistent across recompiles (v2)
+const agentFiberHost = new RexFiberHost(65536);  // 64KB heap for agent fibers
 
 // Media sugar — fiber-based resource lifecycle
 const mediaSugar = new RexMediaSugar(gpuOk ? gpu.device : null, audio._ctx, log);
 if (gpuOk) gpu._media = mediaSugar;  // media replaces textures via gpu._textures
 
-window._agent = { assemblePrompt, callLLM, buildToolSchema };
+window._agent = { assemblePrompt, callLLM, buildToolSchema, agentFiberHost };
 window._media = mediaSugar;
 ```
 
@@ -363,8 +419,14 @@ window._media = mediaSugar;
 After `Rex.expandTemplates`, before `form.transduce`:
 ```js
 currentTree = Rex.expandTemplates(currentTree);
-mediaSugar.expand(currentTree);                    // NEW — @media → @texture/@samples/@shrub
-const agentCompiled = expandAgentSugar(currentTree, log);  // NEW — @tool → @def/@talk
+mediaSugar.expand(currentTree);                    // @media → @texture/@samples/@shrub
+const agentCompiled = expandAgentSugar(currentTree, log);  // @tool → @def/@talk, @agent → @shrub
+
+// v2: Mount root fibers for each @agent node
+for (const [agentName, config] of agentCompiled.agents) {
+  agentFiberHost.mount(agentFiber, [agentName, config]);
+}
+
 form.transduce(currentTree);                       // existing — sees synthetic nodes
 behaviour.transduce(currentTree, true);            // existing — compiles synthetic @talk/@def
 ```
@@ -375,6 +437,11 @@ Before `gpu.transduce`:
 ```js
 if (mediaSugar) {
   try { mediaSugar.tick(gpu); } catch(em) { log(`media: ${em.message}`, 'err'); }
+}
+
+// v2: Flush agent fibers (resource lifecycle, pending tool completions)
+if (agentFiberHost) {
+  try { agentFiberHost.flush(); } catch(ea) { log(`agent: ${ea.message}`, 'err'); }
 }
 ```
 
