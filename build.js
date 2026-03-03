@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 const fs = require('fs');
 const path = require('path');
+const http = require('http');
 const { transformSync } = require('esbuild');
 
 const SRC = path.join(__dirname, 'src');
@@ -13,9 +14,11 @@ const SRC_FILES = [
   'rex-surface',
   'rex-form',
   'rex-behaviour',
+  'rex-agent',        // module scope: Rex.registerContentType x4 (before parse)
   'rex-pcn',
   'rex-audio',
   'rex-fiber',
+  'rex-media',        // class uses RexFiberHost (from rex-fiber)
   'plan-bridge',
   'tab-manager',
   'claude-api',
@@ -95,16 +98,51 @@ function build() {
   }
 }
 
-if (process.argv.includes('--watch')) {
+const MIME = {
+  '.html': 'text/html',
+  '.js':   'application/javascript',
+  '.css':  'text/css',
+  '.json': 'application/json',
+  '.wasm': 'application/wasm',
+  '.png':  'image/png',
+  '.jpg':  'image/jpeg',
+  '.svg':  'image/svg+xml',
+};
+
+function serve(port = 3000) {
+  const server = http.createServer((req, res) => {
+    const url = req.url.split('?')[0];
+    const filePath = path.join(DIST, url === '/' ? 'rexgpu.html' : url);
+    if (!filePath.startsWith(DIST)) { res.writeHead(403); res.end(); return; }
+    fs.readFile(filePath, (err, data) => {
+      if (err) { res.writeHead(404); res.end('Not found'); return; }
+      const ext = path.extname(filePath);
+      res.writeHead(200, { 'Content-Type': MIME[ext] || 'application/octet-stream' });
+      res.end(data);
+    });
+  });
+  server.on('error', (e) => {
+    if (e.code === 'EADDRINUSE') {
+      console.log(`Port ${port} in use, trying ${port + 1}...`);
+      serve(port + 1);
+    } else throw e;
+  });
+  server.listen(port, () => console.log(`Serving http://localhost:${port}`));
+}
+
+if (process.argv.includes('--watch') || process.argv.includes('--dev')) {
   build();
-  console.log('Watching src/ for changes...');
+  const EXAMPLES_DIR = path.join(__dirname, 'examples');
   let debounce = null;
-  fs.watch(SRC, { recursive: true }, () => {
+  const rebuild = () => {
     clearTimeout(debounce);
     debounce = setTimeout(() => {
       try { build(); } catch (e) { console.error('Build error:', e.message); }
     }, 100);
-  });
+  };
+  fs.watch(SRC, { recursive: true }, rebuild);
+  if (fs.existsSync(EXAMPLES_DIR)) fs.watch(EXAMPLES_DIR, rebuild);
+  serve();
 } else {
   build();
 }

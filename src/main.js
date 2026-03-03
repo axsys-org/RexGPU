@@ -12,6 +12,8 @@ import { PLANBridge } from './plan-bridge.js';
 import { TabManager } from './tab-manager.js';
 import { callClaude } from './claude-api.js';
 import { RexAudio } from './rex-audio.js';
+import { expandAgentSugar, registerDelegate, assemblePrompt, callLLM, buildToolSchema } from './rex-agent.js';
+import { RexMediaSugar } from './rex-media.js';
 
 (async()=>{ try {
   const canvas  = document.getElementById('gpu-canvas');
@@ -449,6 +451,16 @@ import { RexAudio } from './rex-audio.js';
   const bridge = new PLANBridge(log);
   window._bridge = bridge;
 
+  // ── Agent sugar (v1 compat: register delegate mutation type) ──
+  registerDelegate(behaviour);
+
+  // ── Media sugar (fiber-based resource lifecycle) ──
+  const mediaSugar = new RexMediaSugar(gpuOk ? gpu.device : null, audio._ctx, log);
+  mediaSugar._behaviour = behaviour;  // for audio shrub slot writes
+  if (gpuOk) gpu._media = mediaSugar;
+  window._agent = { assemblePrompt, callLLM, buildToolSchema };
+  window._media = mediaSugar;
+
   // ── Undo/Redo (Ctrl+Z / Ctrl+Shift+Z) ──
   document.addEventListener('keydown', e => {
     if ((e.metaKey || e.ctrlKey) && e.key === 'z' && !e.shiftKey) {
@@ -485,6 +497,9 @@ import { RexAudio } from './rex-audio.js';
     try{
       currentTree=Rex.parse(src);
       currentTree=Rex.expandTemplates(currentTree);
+      // Sugar expansion (SugarFiber-Spec §2 steps 3-4)
+      mediaSugar.expand(currentTree);                              // @media → @texture/@samples/@shrub
+      const agentCompiled = expandAgentSugar(currentTree, log);    // @tool → @talk, @agent → @shrub
       const nc=(function count(n){let c=1;for(const ch of n.children)c+=count(ch);return c;})(currentTree);
       ncEl.textContent=`\u2713 ${nc}`;
       interactAttrs=Rex.find(currentTree,'interact')?.attrs||null;
@@ -713,6 +728,10 @@ import { RexAudio } from './rex-audio.js';
   function frame(){
     if(currentTree&&gpuOk){
       try{
+        // Media per-frame update (importExternalTexture lifetime = current JS task)
+        if (mediaSugar) {
+          try { mediaSugar.tick(gpu); } catch(em) { log(`media: ${em.message}`, 'err'); }
+        }
         const sc=gpu._structureChanged; gpu._structureChanged=false;
         try {
           gpu.transduce(currentTree,sc);

@@ -1661,10 +1661,10 @@ function _val(n) {
   if (n._ === 'Qp') return n.v;
   if (n._ === 'Sl') return n.v.join('\n');
   if (n._ === 'Ug') return n.v;
-  if (n._ === 'Np' && n.b === BK.Brack && n.r === '') return n.ch.map(_val);
+  if (n._ === 'Np' && n.b === BK.Brack && (n.r === '' || n.r === '`')) return n.ch.map(_val);
   if (n._ === 'Np' && n.b === BK.Paren) { const inner = pr(n,10000); return {expr:inner.slice(1,-1), rex:n}; }
   if (n._ === 'Tp' && n.r === '-' && n.c._ === 'Wd' && /^\d+(\.\d+)?$/.test(n.c.v)) return -Number(n.c.v);
-  if (n._ === 'Ti' && (n.r === '/' || n.r === '.')) return pr(n, 10000);
+  if (n._ === 'Ti' && (n.r === '/' || n.r === '.')) { const s2 = pr(n, 10000); return /^-?\d+(\.\d+)?$/.test(s2) ? +s2 : s2; }
   const s = pr(n, 10000);
   if (/^-?\d+(\.\d+)?$/.test(s)) return +s;
   return s;

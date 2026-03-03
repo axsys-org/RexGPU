@@ -335,6 +335,9 @@ export class RexGPU {
         maxBufferSize: ad.limits.maxBufferSize,
       }
     });
+    this.device.addEventListener('uncapturederror', (e) => {
+      this.log(`GPU ERROR: ${e.error.message}`, 'err');
+    });
     this.context = this.canvas.getContext('webgpu');
     this.format = navigator.gpu.getPreferredCanvasFormat();
     this.context.configure({ device:this.device, format:this.format, alphaMode:'premultiplied' });
@@ -541,6 +544,9 @@ export class RexGPU {
 
     // 1.5. Filters — expand @filter nodes into synthetic textures/shaders/pipelines/dispatches
     this._compileFilters(tree);
+
+    // 1.5b. Fields — expand @field nodes into synthetic textures/shaders/pipelines/dispatches
+    this._compileFields(tree);
 
     // 2. Shaders (resolve #import for structs AND libs, auto-inject WGSL enables)
     this._compileShaders(tree);
@@ -1155,6 +1161,578 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     if (outName) filterOutputs.set(outName, finalOut);
   }
 
+  // ════════════════════════════════════════════════════════════════
+  // SCALAR FIELD SYSTEM — @field sugar expansion
+  // Same pattern as @filter: find @field nodes → emit synthetic
+  // @texture + @shader + @resources + @pipeline + @dispatch.
+  // ════════════════════════════════════════════════════════════════
+
+  _compileFields(tree) {
+    // Remove previously emitted synthetic field nodes
+    tree.children = tree.children.filter(c => {
+      if (c.name && String(c.name).startsWith('_field_')) return false;
+      // Also remove anonymous dispatches/passes that reference _field_ pipelines
+      if (!c.name && c.attrs && typeof c.attrs.pipeline === 'string' && c.attrs.pipeline.startsWith('_field_')) return false;
+      return true;
+    });
+
+    const fields = Rex.findAll(tree, 'field');
+    // Disambiguate: @field inside @struct (struct fields) vs top-level @field (scalar fields)
+    const realFields = fields.filter(f =>
+      f.children.some(c => c.type === 'source' || c.type === 'visualize') ||
+      f.attrs.resolution || f.attrs.composition
+    );
+    if (!realFields.length) return;
+    this._fieldConfigs = new Map();
+
+    for (let i = 0; i < realFields.length; i++) {
+      this._emitField(realFields[i], i, tree);
+    }
+    this.log(`fields: ${realFields.length} expanded`, 'ok');
+  }
+
+  // Resolve attr value that may be a string, number, or {expr: "..."} object from Rex parser
+  _fieldAttr(attrs, key, fallback) {
+    let v = attrs[key];
+    if (v === undefined || v === null) return fallback;
+    if (typeof v === 'object' && v.expr) return v.expr;
+    return v;
+  }
+
+  _parseFieldColor(value) {
+    if (!value) return [1, 1, 1, 1];
+    if (Array.isArray(value)) return value.map(Number);
+    if (typeof value === 'string' && value.startsWith('#')) {
+      const hex = value.slice(1);
+      if (hex.length === 8) return [
+        parseInt(hex.slice(0,2),16)/255, parseInt(hex.slice(2,4),16)/255,
+        parseInt(hex.slice(4,6),16)/255, parseInt(hex.slice(6,8),16)/255,
+      ];
+      if (hex.length === 6) return [
+        parseInt(hex.slice(0,2),16)/255, parseInt(hex.slice(2,4),16)/255,
+        parseInt(hex.slice(4,6),16)/255, 1,
+      ];
+    }
+    return [1, 1, 1, 1];
+  }
+
+  _colorToWgsl(c) {
+    return `${c[0].toFixed(4)}, ${c[1].toFixed(4)}, ${c[2].toFixed(4)}, ${c[3].toFixed(4)}`;
+  }
+
+  _parseFieldSourceParam(value) {
+    // Returns { static: bool, value: number|null, expr: string|null }
+    if (value === undefined || value === null) return { static: true, value: 0, expr: null };
+    if (typeof value === 'number') return { static: true, value, expr: null };
+    if (typeof value === 'string') {
+      const n = Number(value);
+      if (!isNaN(n)) return { static: true, value: n, expr: null };
+      // It's a builtin name like "mouse-x"
+      return { static: false, value: 0, expr: value };
+    }
+    if (typeof value === 'object' && value.expr) return { static: false, value: 0, expr: value.expr };
+    return { static: true, value: +value || 0, expr: null };
+  }
+
+  _falloffTypeIndex(name) {
+    switch (name) {
+      case 'inverse-square': return 0;
+      case 'gaussian': return 1;
+      case 'exponential': return 2;
+      case 'linear': return 3;
+      default: return 1; // default gaussian
+    }
+  }
+
+  _emitField(node, idx, tree) {
+    const name = node.name || `field_${idx}`;
+
+    // Parse field config
+    let resAttr = node.attrs.resolution;
+    // Handle expression objects from paren syntax, e.g. (512 512) → {expr: "512 512"}
+    if (resAttr && typeof resAttr === 'object' && resAttr.expr) {
+      const parts = resAttr.expr.trim().split(/\s+/).map(Number);
+      resAttr = parts.length >= 2 ? parts : parts[0] || 512;
+    }
+    const resX = (Array.isArray(resAttr) ? +resAttr[0] : (resAttr ? +resAttr : 512)) || 512;
+    const resY = (Array.isArray(resAttr) ? +resAttr[1] : (resAttr ? +resAttr : 512)) || 512;
+    // Composition may be string or {expr:"smooth-min"} depending on parser hyphen handling
+    let rawComp = node.attrs.composition || 'smooth-min';
+    if (typeof rawComp === 'object' && rawComp.expr) rawComp = rawComp.expr;
+    const composition = String(rawComp);
+    // blend-k: Rex parser may split hyphenated keys — try multiple key forms
+    const blendKRaw = node.attrs['blend-k'] ?? node.attrs.blendK ?? node.attrs.blend?.k ?? 0.3;
+    const blendK = +(typeof blendKRaw === 'object' && blendKRaw.expr ? blendKRaw.expr : blendKRaw) || 0.3;
+
+    // Parse sources
+    const sourceNodes = node.children.filter(c => c.type === 'source');
+    const sources = sourceNodes.map((s, si) => {
+      const posAttr = s.attrs.pos;
+      let posX, posY, posXExpr, posYExpr, posDynamic;
+      if (Array.isArray(posAttr)) {
+        // Bracket syntax: [150 256]
+        const px = this._parseFieldSourceParam(posAttr[0]);
+        const py = this._parseFieldSourceParam(posAttr[1]);
+        posX = px.value; posY = py.value;
+        posXExpr = px.expr; posYExpr = py.expr;
+        posDynamic = !px.static || !py.static;
+      } else if (posAttr && typeof posAttr === 'object' && posAttr.expr) {
+        // Paren syntax: (150 256) or (mouse-x mouse-y) — parsed as {expr: "150 256"} or {expr: "mouse-x mouse-y"}
+        const parts = posAttr.expr.trim().split(/\s+/);
+        const px = this._parseFieldSourceParam(parts[0]);
+        const py = this._parseFieldSourceParam(parts[1] ?? parts[0]);
+        posX = px.value; posY = py.value;
+        posXExpr = px.expr; posYExpr = py.expr;
+        posDynamic = !px.static || !py.static;
+      } else if (posAttr !== undefined && posAttr !== null) {
+        // Single value or other — treat as static
+        const v = +posAttr || 0;
+        posX = v; posY = v; posXExpr = null; posYExpr = null; posDynamic = false;
+      } else {
+        posX = 0; posY = 0; posXExpr = null; posYExpr = null; posDynamic = false;
+      }
+
+      const strengthParam = this._parseFieldSourceParam(s.attrs.strength ?? 1.0);
+      const radiusParam = this._parseFieldSourceParam(s.attrs.radius ?? s.attrs.sigma ?? 50);
+      const falloffType = this._falloffTypeIndex(s.attrs.falloff);
+
+      return {
+        name: s.name || `source_${si}`,
+        posX, posY, posXExpr, posYExpr,
+        strength: strengthParam.value, strengthExpr: strengthParam.expr,
+        radius: radiusParam.value, radiusExpr: radiusParam.expr,
+        falloffType,
+        dynamic: posDynamic,
+        dynamicStrength: !strengthParam.static,
+        dynamicRadius: !radiusParam.static,
+      };
+    });
+
+    const hasDynamic = sources.some(s => s.dynamic || s.dynamicStrength || s.dynamicRadius);
+    const sourceCount = sources.length;
+
+    // Parse visualize nodes
+    const vizNodes = node.children.filter(c => c.type === 'visualize');
+    if (vizNodes.length === 0) {
+      vizNodes.push({ type: 'visualize', name: null, attrs: { mode: 'isosurface' }, children: [], content: null });
+    }
+
+    // ── Emit source storage buffer ──
+    const srcBufName = `_field_${name}_sources`;
+    const srcBufSize = Math.max(64, sourceCount * 24); // 6 floats × 4 bytes each
+    tree.children.push({
+      type: 'buffer', name: srcBufName,
+      attrs: { size: srcBufSize, usage: ['storage'] },
+      children: [], content: null, _d: 1,
+    });
+
+    // ── Emit field grid texture (rgba16float — filterable, HDR precision) ──
+    const gridTexName = `_field_${name}_grid`;
+    tree.children.push({
+      type: 'texture', name: gridTexName,
+      attrs: { width: resX, height: resY, format: 'rgba16float', storage: true, filter: 'linear' },
+      children: [], content: null, _d: 1,
+    });
+
+    // ── Emit eval compute shader ──
+    const evalShaderName = `_field_${name}_eval`;
+    const evalShaderCode = this._generateFieldEvalShader(name, sourceCount, composition, blendK, resX, resY);
+    tree.children.push({
+      type: 'shader', name: evalShaderName,
+      attrs: {}, children: [], content: evalShaderCode, _d: 1,
+    });
+
+    // ── Emit eval resources ──
+    const evalResName = `_field_${name}_eval_res`;
+    tree.children.push({
+      type: 'resources', name: evalResName, attrs: {}, children: [
+        { type: 'buffer', name: srcBufName, attrs: { usage: ['storage'], access: 'read' }, children: [], content: null, _d: 2 },
+        { type: 'texture', name: gridTexName, attrs: { storage: true, format: 'rgba16float' }, children: [], content: null, _d: 2 },
+      ], content: null, _d: 1,
+    });
+
+    // ── Emit eval pipeline ──
+    const evalPipeName = `_field_${name}_eval_pipe`;
+    tree.children.push({
+      type: 'pipeline', name: evalPipeName,
+      attrs: { compute: evalShaderName, resources: evalResName },
+      children: [], content: null, _d: 1,
+    });
+
+    // ── Emit eval dispatch ──
+    const wgEvalX = Math.ceil(resX / 16) | 0, wgEvalY = Math.ceil(resY / 16) | 0;
+    tree.children.push({
+      type: 'dispatch', name: null,
+      attrs: { pipeline: evalPipeName, grid: [wgEvalX, wgEvalY, 1] },
+      children: [], content: null, _d: 1,
+    });
+
+    // ── Per @visualize: emit viz shader + resources + pipeline + dispatch ──
+    const vizOutputNames = [];
+    for (let vi = 0; vi < vizNodes.length; vi++) {
+      const viz = vizNodes[vi];
+      const vizName = viz.name || `${vi}`;
+      const outName = viz.attrs.out || `_field_${name}_viz_${vizName}`;
+      vizOutputNames.push(outName);
+
+      // Viz output texture
+      tree.children.push({
+        type: 'texture', name: outName,
+        attrs: { width: resX, height: resY, format: 'rgba8unorm', storage: true },
+        children: [], content: null, _d: 1,
+      });
+
+      // Viz shader
+      const vizShaderName = `_field_${name}_viz_${vizName}`;
+      const vizShaderCode = this._generateFieldVizShader(name, viz.attrs, resX, resY);
+      tree.children.push({
+        type: 'shader', name: vizShaderName,
+        attrs: {}, children: [], content: vizShaderCode, _d: 1,
+      });
+
+      // Viz resources: sampler + grid (sampled) + output (storage)
+      const vizResName = `_field_${name}_viz_${vizName}_res`;
+      tree.children.push({
+        type: 'resources', name: vizResName, attrs: {}, children: [
+          { type: 'texture', name: gridTexName, attrs: {}, children: [], content: null, _d: 2 },
+          { type: 'texture', name: outName, attrs: { storage: true, format: 'rgba8unorm' }, children: [], content: null, _d: 2 },
+        ], content: null, _d: 1,
+      });
+
+      // Viz pipeline
+      const vizPipeName = `_field_${name}_viz_${vizName}_pipe`;
+      tree.children.push({
+        type: 'pipeline', name: vizPipeName,
+        attrs: { compute: vizShaderName, resources: vizResName },
+        children: [], content: null, _d: 1,
+      });
+
+      // Viz dispatch
+      const wgVizX = Math.ceil(resX / 8) | 0, wgVizY = Math.ceil(resY / 8) | 0;
+      tree.children.push({
+        type: 'dispatch', name: null,
+        attrs: { pipeline: vizPipeName, grid: [wgVizX, wgVizY, 1] },
+        children: [], content: null, _d: 1,
+      });
+    }
+
+    // ── Emit blit pass: draw field viz to canvas ──
+    const blitShaderName = `_field_${name}_blit`;
+    const blitPipeName = `_field_${name}_blit_pipe`;
+    const blitResName = `_field_${name}_blit_res`;
+    const primaryViz = vizOutputNames[0];
+
+    // Blit shader — fullscreen vertex+fragment, samples viz texture
+    const blitShaderCode = `
+@group(0) @binding(0) var blit_samp: sampler;
+@group(0) @binding(1) var blit_tex: texture_2d<f32>;
+struct VSOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f, }
+@vertex fn vs_main(@builtin(vertex_index) vi: u32) -> VSOut {
+  let uv = vec2f(f32((vi << 1u) & 2u), f32(vi & 2u));
+  var out: VSOut;
+  out.pos = vec4f(uv * 2.0 - 1.0, 0.0, 1.0);
+  out.uv = vec2f(uv.x, 1.0 - uv.y);
+  return out;
+}
+@fragment fn fs_main(in: VSOut) -> @location(0) vec4f {
+  return textureSample(blit_tex, blit_samp, in.uv);
+}
+`;
+    tree.children.push({ type: 'shader', name: blitShaderName, attrs: {}, children: [], content: blitShaderCode, _d: 1 });
+
+    // Blit resources
+    tree.children.push({
+      type: 'resources', name: blitResName, attrs: {}, children: [
+        { type: 'texture', name: primaryViz, attrs: {}, children: [], content: null, _d: 2 },
+      ], content: null, _d: 1,
+    });
+
+    // Blit pipeline (render, not compute)
+    tree.children.push({
+      type: 'pipeline', name: blitPipeName,
+      attrs: { vertex: blitShaderName, fragment: blitShaderName, resources: blitResName,
+               blend: 'alpha', format: 'canvas' },
+      children: [], content: null, _d: 1,
+    });
+
+    // Blit pass — fullscreen draw to canvas
+    tree.children.push({
+      type: 'pass', name: `_field_${name}_blit_pass`,
+      attrs: { clear: [0, 0, 0, 0], load: 'clear' },
+      children: [{
+        type: 'draw', name: null,
+        attrs: { pipeline: blitPipeName, vertices: 3 },
+        children: [], content: null, _d: 2,
+      }],
+      content: null, _d: 1,
+    });
+
+    // ── Store config for per-frame dynamic updates ──
+    this._fieldConfigs.set(name, {
+      sources, resX, resY,
+      dynamicSources: sources.filter(s => s.dynamic || s.dynamicStrength || s.dynamicRadius),
+      bufferName: srcBufName,
+      vizOutputs: vizOutputNames,
+      hasDynamic,
+    });
+
+    this.log(`field "${name}": ${sourceCount} sources, ${vizNodes.length} viz, ${resX}×${resY} ${composition}`, 'ok');
+  }
+
+  _generateFieldEvalShader(name, sourceCount, composition, blendK, resX, resY) {
+    // Composition logic
+    let compositionCode;
+    switch (composition) {
+      case 'additive': compositionCode = '    val += c;'; break;
+      case 'max': compositionCode = '    val = max(val, c);'; break;
+      case 'min': compositionCode = '    if (i == 0u) { val = c; } else { val = min(val, c); }'; break;
+      case 'blend': compositionCode = `    val += c / f32(SOURCE_COUNT);`; break;
+      case 'smooth-min':
+      default:
+        // For field sources (positive contributions), smooth-min gives merging behavior
+        // We accumulate additively — this IS the metaball model
+        // smooth-min would be for SDF composition; additive is correct for field strengths
+        compositionCode = '    val += c;';
+        break;
+    }
+
+    return `struct FieldSource {
+  pos: vec2f,
+  strength: f32,
+  radius: f32,
+  falloff_type: f32,
+  _pad: f32,
+}
+
+const FIELD_RES = vec2u(${resX}u, ${resY}u);
+const SOURCE_COUNT = ${sourceCount}u;
+const BLEND_K: f32 = ${blendK.toFixed(6)};
+
+@group(0) @binding(0) var<storage, read> sources: array<FieldSource>;
+@group(0) @binding(1) var grid: texture_storage_2d<rgba16float, write>;
+
+fn eval_source(pixel: vec2f, src: FieldSource) -> f32 {
+  let d = distance(pixel, src.pos);
+  let ft = u32(src.falloff_type);
+  if (ft == 0u) { return src.strength / (d * d + 0.001); }
+  if (ft == 1u) { return src.strength * exp(-(d * d) / (2.0 * src.radius * src.radius + 0.001)); }
+  if (ft == 2u) { return src.strength * exp(-d / max(src.radius, 0.001)); }
+  return src.strength * max(0.0, 1.0 - d / max(src.radius, 0.001));
+}
+
+fn smin(a: f32, b: f32, k: f32) -> f32 {
+  let h = max(k - abs(a - b), 0.0);
+  return min(a, b) - h * h / (4.0 * k + 0.0001);
+}
+
+@compute @workgroup_size(16, 16)
+fn main(@builtin(global_invocation_id) gid: vec3u) {
+  if (gid.x >= FIELD_RES.x || gid.y >= FIELD_RES.y) { return; }
+  let pixel = vec2f(f32(gid.x), f32(gid.y));
+
+  var val: f32 = 0.0;
+  for (var i = 0u; i < SOURCE_COUNT; i++) {
+    let c = eval_source(pixel, sources[i]);
+${compositionCode}
+  }
+
+  textureStore(grid, vec2i(gid.xy), vec4f(val, 0.0, 0.0, 0.0));
+}`;
+  }
+
+  _generateFieldVizShader(name, vizAttrs, resX, resY) {
+    const A = (k, fb) => this._fieldAttr(vizAttrs, k, fb);
+    const mode = A('mode', 'isosurface');
+    let vizBody = '';
+    let extraConsts = '';
+
+    switch (mode) {
+      case 'isosurface': {
+        const threshold = +(A('threshold', 0.5));
+        const feather = +(A('feather', 2.0));
+        const colorIn = this._parseFieldColor(A('color-inside', '#ffffffff'));
+        const colorOut = this._parseFieldColor(A('color-outside', '#00000000'));
+        extraConsts = `const THRESHOLD: f32 = ${threshold.toFixed(6)};
+const FEATHER: f32 = ${(feather * 0.01).toFixed(6)};
+const COLOR_IN = vec4f(${this._colorToWgsl(colorIn)});
+const COLOR_OUT = vec4f(${this._colorToWgsl(colorOut)});`;
+        vizBody = `  let edge = smoothstep(THRESHOLD - FEATHER, THRESHOLD + FEATHER, d);
+  var color = mix(COLOR_OUT, COLOR_IN, edge);`;
+        break;
+      }
+      case 'heatmap': {
+        const rangeMin = +(A('range-min', 0.0));
+        const rangeMax = +(A('range-max', 1.0));
+        extraConsts = `const RANGE_MIN: f32 = ${rangeMin.toFixed(6)};
+const RANGE_MAX: f32 = ${rangeMax.toFixed(6)};`;
+        vizBody = `  let t = clamp((d - RANGE_MIN) / (RANGE_MAX - RANGE_MIN + 0.0001), 0.0, 1.0);
+  let r = smoothstep(0.4, 0.7, t) + smoothstep(0.85, 1.0, t) * 0.5;
+  let g = smoothstep(0.2, 0.5, t) - smoothstep(0.7, 0.9, t) * 0.5 + smoothstep(0.9, 1.0, t) * 0.5;
+  let b = smoothstep(0.0, 0.3, t) - smoothstep(0.5, 0.7, t);
+  var color = vec4f(r, g, b, 1.0);`;
+        break;
+      }
+      case 'contour': {
+        const density = +(A('density', 5.0));
+        const lineColor = this._parseFieldColor(A('line-color', '#ffffffff'));
+        const bgColor = this._parseFieldColor(A('bg-color', '#00000044'));
+        extraConsts = `const DENSITY: f32 = ${density.toFixed(6)};
+const LINE_COLOR = vec4f(${this._colorToWgsl(lineColor)});
+const BG_COLOR = vec4f(${this._colorToWgsl(bgColor)});`;
+        vizBody = `  let contour = fract(d * DENSITY);
+  let line = smoothstep(0.02, 0.0, abs(contour - 0.5));
+  var color = mix(BG_COLOR, LINE_COLOR, line);`;
+        break;
+      }
+      case 'dot-grid': {
+        const gridSpacing = +(A('grid-spacing', 8.0));
+        const baseRadius = +(A('base-radius', 2.0));
+        const response = +(A('response', 3.0));
+        const scale = +(A('scale', 0.5));
+        const dotColor = this._parseFieldColor(A('dot-color', '#888888ff'));
+        extraConsts = `const GRID_SPACING: f32 = ${gridSpacing.toFixed(6)};
+const BASE_RADIUS: f32 = ${baseRadius.toFixed(6)};
+const RESPONSE: f32 = ${response.toFixed(6)};
+const SCALE: f32 = ${scale.toFixed(6)};
+const DOT_COLOR = vec4f(${this._colorToWgsl(dotColor)});`;
+        // dot-grid uses textureLoad instead of textureSampleLevel
+        return `const FIELD_RES = vec2u(${resX}u, ${resY}u);
+${extraConsts}
+
+@group(0) @binding(0) var grid_samp: sampler;
+@group(0) @binding(1) var grid: texture_2d<f32>;
+@group(0) @binding(2) var output: texture_storage_2d<rgba8unorm, write>;
+
+@compute @workgroup_size(8, 8)
+fn main(@builtin(global_invocation_id) gid: vec3u) {
+  if (gid.x >= FIELD_RES.x || gid.y >= FIELD_RES.y) { return; }
+  let grid_pos = vec2f(gid.xy);
+  let cell = floor(grid_pos / GRID_SPACING);
+  let center = (cell + 0.5) * GRID_SPACING;
+  let center_i = clamp(vec2i(center), vec2i(0), vec2i(FIELD_RES) - 1);
+  let fv = textureLoad(grid, center_i, 0).r;
+  let gx = textureLoad(grid, clamp(center_i + vec2i(1,0), vec2i(0), vec2i(FIELD_RES)-1), 0).r
+         - textureLoad(grid, clamp(center_i - vec2i(1,0), vec2i(0), vec2i(FIELD_RES)-1), 0).r;
+  let gy = textureLoad(grid, clamp(center_i + vec2i(0,1), vec2i(0), vec2i(FIELD_RES)-1), 0).r
+         - textureLoad(grid, clamp(center_i - vec2i(0,1), vec2i(0), vec2i(FIELD_RES)-1), 0).r;
+  let grad = vec2f(gx, gy) * 0.5;
+  let displaced = center + grad * fv * RESPONSE;
+  let dist_to_dot = distance(grid_pos, displaced);
+  let dot_radius = BASE_RADIUS * (1.0 + fv * SCALE);
+  let alpha = smoothstep(dot_radius, dot_radius - 1.0, dist_to_dot);
+  var color = DOT_COLOR * alpha;
+  textureStore(output, vec2i(gid.xy), color);
+}`;
+      }
+      case 'refraction': {
+        const refractStrength = +(A('refract-strength', 5.0));
+        const glowColor = this._parseFieldColor(A('glow-color', '#88ccffaa'));
+        extraConsts = `const REFRACT_STRENGTH: f32 = ${refractStrength.toFixed(6)};
+const GLOW_COLOR = vec4f(${this._colorToWgsl(glowColor)});`;
+        vizBody = `  let gx = textureSampleLevel(grid, grid_samp, uv + vec2f(1.0/f32(FIELD_RES.x), 0.0), 0.0).r
+         - textureSampleLevel(grid, grid_samp, uv - vec2f(1.0/f32(FIELD_RES.x), 0.0), 0.0).r;
+  let gy = textureSampleLevel(grid, grid_samp, uv + vec2f(0.0, 1.0/f32(FIELD_RES.y)), 0.0).r
+         - textureSampleLevel(grid, grid_samp, uv - vec2f(0.0, 1.0/f32(FIELD_RES.y)), 0.0).r;
+  let grad = vec2f(gx, gy) * 0.5;
+  let mag = length(grad);
+  let normal = select(vec2f(0.0), grad / mag, mag > 0.001);
+  let view_dot = abs(normal.y);
+  let fresnel = pow(1.0 - view_dot, 3.0);
+  var color = GLOW_COLOR * fresnel * smoothstep(0.0, 0.3, d);`;
+        break;
+      }
+      case 'gradient':
+      default: {
+        vizBody = `  let gx = textureSampleLevel(grid, grid_samp, uv + vec2f(1.0/f32(FIELD_RES.x), 0.0), 0.0).r
+         - textureSampleLevel(grid, grid_samp, uv - vec2f(1.0/f32(FIELD_RES.x), 0.0), 0.0).r;
+  let gy = textureSampleLevel(grid, grid_samp, uv + vec2f(0.0, 1.0/f32(FIELD_RES.y)), 0.0).r
+         - textureSampleLevel(grid, grid_samp, uv - vec2f(0.0, 1.0/f32(FIELD_RES.y)), 0.0).r;
+  let grad = vec2f(gx, gy) * 0.5;
+  let angle = atan2(grad.y, grad.x);
+  let mag = length(grad);
+  var color = vec4f(cos(angle)*0.5+0.5, sin(angle)*0.5+0.5, mag, 1.0);`;
+        break;
+      }
+    }
+
+    return `const FIELD_RES = vec2u(${resX}u, ${resY}u);
+${extraConsts}
+
+@group(0) @binding(0) var grid_samp: sampler;
+@group(0) @binding(1) var grid: texture_2d<f32>;
+@group(0) @binding(2) var output: texture_storage_2d<rgba8unorm, write>;
+
+@compute @workgroup_size(8, 8)
+fn main(@builtin(global_invocation_id) gid: vec3u) {
+  if (gid.x >= FIELD_RES.x || gid.y >= FIELD_RES.y) { return; }
+  let uv = (vec2f(gid.xy) + 0.5) / vec2f(FIELD_RES);
+  let d = textureSampleLevel(grid, grid_samp, uv, 0.0).r;
+
+${vizBody}
+
+  textureStore(output, vec2i(gid.xy), color);
+}`;
+  }
+
+  _resolveFieldExpr(expr, cfg) {
+    if (expr === null || expr === undefined) return 0;
+    if (typeof expr === 'number') return expr;
+    // Known builtins — scale from normalized [0,1] to field pixel coords
+    switch (expr) {
+      case 'mouse-x': return this.inputState.mouseX * cfg.resX;
+      case 'mouse-y': return this.inputState.mouseY * cfg.resY;
+      case 'mouse-dx': return this.inputState.mouseDX;
+      case 'mouse-dy': return this.inputState.mouseDY;
+      case 'pointer-pressure': return this.inputState.pointerPressure ?? 1.0;
+      case 'elapsed': return (performance.now()/1000) - this.startTime;
+      default: {
+        // Try form state
+        if (expr.startsWith('form/')) return +(this.formState[expr.slice(5)] ?? 0);
+        return +expr || 0;
+      }
+    }
+  }
+
+  _updateFieldSources() {
+    if (!this._fieldConfigs) return;
+    for (const [name, cfg] of this._fieldConfigs) {
+      if (!cfg.hasDynamic) continue;
+      const sb = this._storageBuffers.get(cfg.bufferName);
+      if (!sb) continue;
+      const data = new Float32Array(cfg.sources.length * 6);
+      for (let i = 0; i < cfg.sources.length; i++) {
+        const s = cfg.sources[i];
+        const off = i * 6;
+        data[off]     = s.dynamic ? (s.posXExpr ? this._resolveFieldExpr(s.posXExpr, cfg) : s.posX) : s.posX;
+        data[off + 1] = s.dynamic ? (s.posYExpr ? this._resolveFieldExpr(s.posYExpr, cfg) : s.posY) : s.posY;
+        data[off + 2] = s.dynamicStrength ? this._resolveFieldExpr(s.strengthExpr, cfg) : s.strength;
+        data[off + 3] = s.dynamicRadius ? this._resolveFieldExpr(s.radiusExpr, cfg) : s.radius;
+        data[off + 4] = s.falloffType;
+        data[off + 5] = 0;
+      }
+      this.device.queue.writeBuffer(sb, 0, data);
+    }
+  }
+
+  _writeFieldDefaults() {
+    if (!this._fieldConfigs) return;
+    for (const [name, cfg] of this._fieldConfigs) {
+      const sb = this._storageBuffers.get(cfg.bufferName);
+      if (!sb) continue;
+      const data = new Float32Array(cfg.sources.length * 6);
+      for (let i = 0; i < cfg.sources.length; i++) {
+        const s = cfg.sources[i];
+        data[i*6]     = s.posX;
+        data[i*6 + 1] = s.posY;
+        data[i*6 + 2] = s.strength;
+        data[i*6 + 3] = s.radius;
+        data[i*6 + 4] = s.falloffType;
+        data[i*6 + 5] = 0;
+      }
+      this.device.queue.writeBuffer(sb, 0, data);
+    }
+  }
+
   // ── Shader Module Linking ──
   // Namespace isolation, selective imports, tree-shaking, structural hash caching.
   // Adapted from use.gpu link.ts.
@@ -1519,6 +2097,7 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     for (const [,sb] of this._storageBuffers) sb.destroy();
     this._storageBuffers.clear();
     for (const b of Rex.findAll(tree,'buffer')) {
+      if (b._d >= 2) continue; // Skip resource-scope children — they're binding references, not definitions
       const usage = b.attrs.usage;
       if (!usage || !Array.isArray(usage) || !usage.includes('storage')) continue;
       const size = b.attrs.size || 1024;
@@ -1539,6 +2118,7 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
       }
       this.log(`storage buffer: "${b.name}" ${size}B${usage.includes('indirect')?' [indirect]':''}`,'ok');
     }
+    this.log(`storage buffers compiled: [${[...this._storageBuffers.keys()].join(', ')}]`,'ok');
   }
 
   // ── Textures ──
@@ -1550,6 +2130,8 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     const generation = ++this._loadGeneration;
 
     for (const tex of Rex.findAll(tree, 'texture')) {
+      // Skip resource-scope children (_d >= 2) — they're binding references, not definitions
+      if (tex._d >= 2) continue;
       const name = tex.name;
 
       // View-of: create a view referencing another texture
@@ -1990,7 +2572,12 @@ struct VSOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
           if (isStorage) {
             const sb = this._storageBuffers.get(bufName);
             if (sb) {
-              layoutEntries.push({ binding, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT | GPUShaderStage.COMPUTE, buffer: { type: 'storage', hasDynamicOffset: dynamic } });
+              const readOnly = child.attrs.access === 'read' || child.attrs.access === 'read-only';
+              const bufType = readOnly ? 'read-only-storage' : 'storage';
+              const vis = readOnly
+                ? (GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT | GPUShaderStage.COMPUTE)
+                : (GPUShaderStage.FRAGMENT | GPUShaderStage.COMPUTE);
+              layoutEntries.push({ binding, visibility: vis, buffer: { type: bufType, hasDynamicOffset: dynamic } });
               entries.push({ binding, resource: { buffer: sb } });
               if (dynamic) this.log(`resources "${name}": buffer "${bufName}" has dynamic offset`,'ok');
               binding++;
@@ -2075,6 +2662,9 @@ struct VSOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
     this._dirtyMin = 0;
     this._dirtyMax = this._heapSize;
     this._frameDirty = true;
+
+    // Write initial field source data to storage buffers
+    this._writeFieldDefaults();
   }
 
   _compileCommandList(tree) {
@@ -2816,7 +3406,16 @@ ${assignments}
           if (c.changeKind === 'attrs-only') phases.add(1.5); // may be hot-patchable
           else { phases.add(1.5); phases.add(2); phases.add(9); phases.add(12); }
           break;
+        case 'source': case 'visualize':
+          phases.add(1.5); phases.add(2); phases.add(7); phases.add(8.5); phases.add(9); phases.add(12);
+          break;
         case 'heap': phases.add(1.1); phases.add(3); phases.add(4); phases.add(5); break;
+        // Sugar node types — route to correct phase or skip GPU entirely
+        case 'media': phases.add(7); break;           // texture phase only
+        case 'tool': break;                            // behaviour-only, no GPU phase
+        case 'agent': break;                           // behaviour-only
+        case 'system': case 'task':
+        case 'few-shot': case 'context': break;        // prompt changes don't affect GPU
         default: // Unknown type — full recompile
           for (let p = 0; p <= 15; p++) phases.add(p);
       }
@@ -2847,7 +3446,7 @@ ${assignments}
     if (phases.has(0)) this._compileLibs(tree);
     if (phases.has(1)) this._compileStructs(tree);
     if (phases.has(1.1)) this._compileHeap(tree);
-    if (phases.has(1.5)) this._compileFilters(tree);
+    if (phases.has(1.5)) { this._compileFilters(tree); this._compileFields(tree); }
     if (phases.has(2)) this._compileShaders(tree);
     // phases 3,4,5 require full recompile (caught by _canIncrementalCompile)
     if (phases.has(7)) this._compileTextures(tree);
@@ -3003,9 +3602,17 @@ ${assignments}
       const pipeOverrides = pNode.attrs._overrides || {};
       const computeDesc = { module: mod, entryPoint: pNode.attrs.entry || 'main' };
       if (Object.keys(pipeOverrides).length > 0) computeDesc.constants = pipeOverrides;
-      const pipeline = this.device.createComputePipeline({ layout: explicitLayout, compute: computeDesc });
-      this.pipelines.set(key, { pipeline, type: 'compute', resourceScope: resName || null, overrides: { ...pipeOverrides }, shaderKey: compName });
-      this.log(`pipeline "${key}": compute \u2713${resScope ? ` [resources: ${resName}]` : ''}`,'ok');
+      try {
+        this.device.pushErrorScope('validation');
+        const pipeline = this.device.createComputePipeline({ layout: explicitLayout, compute: computeDesc });
+        this.device.popErrorScope().then(err => {
+          if (err) this.log(`pipeline "${key}": compute VALIDATION ERROR: ${err.message}`, 'err');
+        });
+        this.pipelines.set(key, { pipeline, type: 'compute', resourceScope: resName || null, overrides: { ...pipeOverrides }, shaderKey: compName, _name: key });
+        this.log(`pipeline "${key}": compute \u2713${resScope ? ` [resources: ${resName}]` : ''}`,'ok');
+      } catch(e) {
+        this.log(`pipeline "${key}": compute FAILED: ${e.message}`,'err');
+      }
       return;
     }
     const vn = pNode.attrs.vertex, fn = pNode.attrs.fragment || vn;
@@ -3131,8 +3738,12 @@ ${assignments}
     }
 
     try {
+      this.device.pushErrorScope('validation');
       const newPipeline = this.device.createRenderPipeline(desc);
-      this.pipelines.set(key, {pipeline:newPipeline, type:'render', format, resourceScope: resName || null, sampleCount});
+      this.device.popErrorScope().then(err => {
+        if (err) this.log(`pipeline "${key}": render VALIDATION ERROR: ${err.message}`, 'err');
+      });
+      this.pipelines.set(key, {pipeline:newPipeline, type:'render', format, resourceScope: resName || null, sampleCount, _name: key});
       this.log(`pipeline "${key}": render \u2713${sampleCount > 1 ? ` [${sampleCount}x MSAA]` : ''}${resScope ? ` [resources: ${resName}]` : ''}`,'ok');
     } catch(e) {
       this.log(`pipeline "${key}": ${e.message} \u2014 keeping last-good`,'err');
@@ -3151,6 +3762,7 @@ ${assignments}
     this._frameDT = dt;
     this._updateInputBuiltins();
     this._applyBuiltins(time);
+    this._updateFieldSources();
 
     if (this._frameDirty && this._heapBuffer) {
       const alignedMin = this._dirtyMin & ~3;
@@ -3495,6 +4107,7 @@ ${assignments}
         if (pe.resourceScope && this._resourceScopes?.has(pe.resourceScope)) {
           cp.setBindGroup(0, this._resourceScopes.get(pe.resourceScope).bindGroup);
         }
+        if (this.frameCount < 2) this.log(`dispatch ${dispKey}: ${cmd.binds.length} binds: ${JSON.stringify(cmd.binds)}`,'cmd');
         for (const b of cmd.binds) {
           this._setBindGroup(cp, pe, b);
         }
@@ -3522,6 +4135,8 @@ ${assignments}
   _setBindGroup(pass, pe, bindDef) {
     const group = bindDef.group || 0;
     const entries = [];
+    // Include pipeline name in cache to prevent cross-pipeline layout mismatch
+    const pipeKey = pe._name || '';
 
     // Uniform buffer from heap
     if (bindDef.buffer) {
@@ -3538,6 +4153,8 @@ ${assignments}
         const sb = this._storageBuffers.get(sName);
         if (sb) {
           entries.push({ binding: entries.length, resource: { buffer: sb } });
+        } else {
+          this.log(`bind: storage buffer "${sName}" not found (available: ${[...this._storageBuffers.keys()].join(', ')})`,'err');
         }
       }
     }
@@ -3555,34 +4172,40 @@ ${assignments}
       if (bindDef.buffer) {
         const hl = this._heapLayout.get(bindDef.buffer);
         if (!hl || !this._heapBuffer) { this.log(`bind: buffer "${bindDef.buffer}" not in heap`,'err'); return; }
-        const bgKey = `${group}_${bindDef.buffer}`;
+        const bgKey = `${pipeKey}_${group}_${bindDef.buffer}`;
         let bg = this._bindGroups.get(bgKey);
         if (!bg) {
-          try {
-            bg = this.device.createBindGroup({
-              layout: pe.pipeline.getBindGroupLayout(group),
-              entries: [{ binding: 0, resource: { buffer: this._heapBuffer, offset: hl.offset, size: hl.size } }]
-            });
-            this._bindGroups.set(bgKey, bg);
-          } catch(e) { this.log(`bind group ${group}: ${e.message}`,'err'); return; }
+          this.log(`createBG: pipe=${pipeKey} group=${group} buf=${bindDef.buffer} heapOff=${hl.offset} heapSz=${hl.size} heapBufSz=${this._heapBuffer.size}`,'cmd');
+          this.device.pushErrorScope('validation');
+          bg = this.device.createBindGroup({
+            layout: pe.pipeline.getBindGroupLayout(group),
+            entries: [{ binding: 0, resource: { buffer: this._heapBuffer, offset: hl.offset, size: hl.size } }]
+          });
+          this.device.popErrorScope().then(err => {
+            if (err) this.log(`BG VALIDATION: pipe=${pipeKey} group=${group} buf=${bindDef.buffer}: ${err.message}`, 'err');
+          });
+          this._bindGroups.set(bgKey, bg);
         }
         pass.setBindGroup(group, bg);
       }
       return;
     }
 
-    // Build bind group from entries (use pre-computed key or deterministic string key)
-    const bgKey = bindDef._bgKey || (bindDef._bgKey = `bg_${group}_${bindDef.buffer||''}_${bindDef.storage||''}_${bindDef.texture||''}`);
+    // Build bind group from entries — key includes pipeline to prevent cross-pipeline reuse
+    const bgKey = `bg_${pipeKey}_${group}_${bindDef.buffer||''}_${bindDef.storage||''}_${bindDef.texture||''}`;
     let bg = this._bindGroups.get(bgKey);
     if (!bg) {
       try {
-        bg = this.device.createBindGroup({
-          layout: pe.pipeline.getBindGroupLayout(group),
-          entries,
+        const layout = pe.pipeline.getBindGroupLayout(group);
+        this.log(`createBG: pipe=${pipeKey} group=${group} entries=${entries.length} buf=${bindDef.buffer||'-'} sto=${bindDef.storage||'-'}`,'cmd');
+        this.device.pushErrorScope('validation');
+        bg = this.device.createBindGroup({ layout, entries });
+        this.device.popErrorScope().then(err => {
+          if (err) this.log(`BG VALIDATION [${pipeKey}] group=${group}: ${err.message}`, 'err');
         });
         this._bindGroups.set(bgKey, bg);
       } catch(e) {
-        this.log(`bind group ${group}: ${e.message}`, 'err');
+        this.log(`bind group ${group} THROW [${pipeKey}]: ${e.message}`, 'err');
         return;
       }
     }

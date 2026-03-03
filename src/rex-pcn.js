@@ -1206,7 +1206,7 @@ export class RexPCN {
 
       struct Connection {
         source: u32,
-        target: u32,
+        dst:    u32,
         gate:   f32,
         weight: f32,
         sign:   f32,
@@ -1235,7 +1235,7 @@ export class RexPCN {
 
         // Accumulate as fixed-point i32 to use atomicAdd (no f32 atomics in WGSL)
         let delta_fixed = i32(transmitted * FIXED_SCALE);
-        atomicAdd(&deltas[conn.target], delta_fixed);
+        atomicAdd(&deltas[conn.dst], delta_fixed);
       }
     `;
 
