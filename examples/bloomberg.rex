@@ -322,17 +322,17 @@
 
       ;; Portfolio summary
       @rect psep :h 2 :fill [1 0.4 0 0.35]
-      @panel portfolio :layout column :fill [0.03 0.025 0.065 1] :padding 12 :gap 8 :flex-grow 1
+      @panel portfolio :layout column :fill [0.03 0.025 0.065 1] :padding 12 :gap 6 :flex-grow 1 :align stretch
         @text PORTFOLIO :size 16 :color [1 0.45 0 1]
-        @panel pr1 :h 20 :layout row :justify space-between
-          @text Cash :size 14 :color [0.4 0.4 0.52 1]
-          @text "$100,000" :size 14 :color [0.67 0.67 0.73 1]
-        @panel pr2 :h 20 :layout row :justify space-between
-          @text Positions :size 14 :color [0.4 0.4 0.52 1]
-          @text "0 shares" :size 14 :color [0.67 0.67 0.73 1]
-        @panel pr3 :h 20 :layout row :justify space-between
-          @text "P&L" :size 14 :color [0.4 0.4 0.52 1]
-          @text "$0.00" :size 14 :color [0.13 0.67 0.27 1]
+        @panel pr1 :h 18 :layout row :justify space-between
+          @text Cash :size 13 :color [0.4 0.4 0.52 1]
+          @text "$100,000" :size 13 :color [0.67 0.67 0.73 1]
+        @panel pr2 :h 18 :layout row :justify space-between
+          @text Positions :size 13 :color [0.4 0.4 0.52 1]
+          @text "0 shares" :size 13 :color [0.67 0.67 0.73 1]
+        @panel pr3 :h 18 :layout row :justify space-between
+          @text "P&L" :size 13 :color [0.4 0.4 0.52 1]
+          @text "$0.00" :size 13 :color [0.13 0.67 0.27 1]
 
     ;; Left border
     @rect lborder :w 2 :fill [0.08 0.08 0.16 1]
@@ -393,63 +393,63 @@
       @rect ob_hdr_b :h 1 :fill [0.12 0.12 0.22 1]
 
       ;; Column headers
-      @panel ob_cols :h 24 :layout row :fill [0.03 0.025 0.055 1] :align center :padding-left 8 :padding-right 8
+      @panel ob_cols :h 24 :layout row :fill [0.03 0.025 0.055 1] :align center :padding-left 8 :padding-right 8 :gap 6
         @text QTY :size 12 :color [0.35 0.35 0.47 1] :flex-grow 1
         @text PRICE :size 12 :color [0.35 0.35 0.47 1] :flex-grow 1
         @text SIDE :size 12 :color [0.35 0.35 0.47 1]
 
       ;; Asks (sellers) — compact rows
       @panel asks :layout column :padding-left 8 :padding-right 8 :padding-top 4 :padding-bottom 4 :gap 2
-        @panel a5 :layout row :h 22 :align center
-          @text "1,243" :size 14 :color [0.7 0.18 0.25 0.7] :flex-grow 1
-          @text 188.56 :size 14 :color [0.8 0.2 0.27 0.75] :flex-grow 1
-          @text ASK :size 12 :color [0.7 0.18 0.25 0.5]
-        @panel a4 :layout row :h 22 :align center
-          @text 876 :size 14 :color [0.75 0.2 0.27 0.7] :flex-grow 1
-          @text 188.52 :size 14 :color [0.8 0.2 0.27 0.8] :flex-grow 1
-          @text ASK :size 12 :color [0.75 0.2 0.27 0.5]
-        @panel a3 :layout row :h 22 :align center
-          @text "2,108" :size 14 :color [0.82 0.2 0.27 0.7] :flex-grow 1
-          @text 188.49 :size 14 :color [0.87 0.2 0.27 0.8] :flex-grow 1
-          @text ASK :size 12 :color [0.82 0.2 0.27 0.5]
-        @panel a2 :layout row :h 22 :align center
-          @text "1,567" :size 14 :color [0.88 0.2 0.27 0.7] :flex-grow 1
-          @text 188.46 :size 14 :color [0.93 0.2 0.27 0.87] :flex-grow 1
-          @text ASK :size 12 :color [0.88 0.2 0.27 0.55]
-        @panel a1 :layout row :h 22 :align center
-          @text "3,412" :size 14 :color [1 0.27 0.33 0.8] :flex-grow 1
-          @text 188.44 :size 14 :color [1 0.27 0.33 1] :flex-grow 1
-          @text ASK :size 12 :color [1 0.27 0.33 0.7]
+        @panel a5 :layout row :h 22 :align center :gap 4
+          @text "1,243" :size 13 :color [0.7 0.18 0.25 0.7] :flex-grow 1
+          @text 188.56 :size 13 :color [0.8 0.2 0.27 0.75] :flex-grow 1
+          @text ASK :size 11 :color [0.7 0.18 0.25 0.5]
+        @panel a4 :layout row :h 22 :align center :gap 4
+          @text 876 :size 13 :color [0.75 0.2 0.27 0.7] :flex-grow 1
+          @text 188.52 :size 13 :color [0.8 0.2 0.27 0.8] :flex-grow 1
+          @text ASK :size 11 :color [0.75 0.2 0.27 0.5]
+        @panel a3 :layout row :h 22 :align center :gap 4
+          @text "2,108" :size 13 :color [0.82 0.2 0.27 0.7] :flex-grow 1
+          @text 188.49 :size 13 :color [0.87 0.2 0.27 0.8] :flex-grow 1
+          @text ASK :size 11 :color [0.82 0.2 0.27 0.5]
+        @panel a2 :layout row :h 22 :align center :gap 4
+          @text "1,567" :size 13 :color [0.88 0.2 0.27 0.7] :flex-grow 1
+          @text 188.46 :size 13 :color [0.93 0.2 0.27 0.87] :flex-grow 1
+          @text ASK :size 11 :color [0.88 0.2 0.27 0.55]
+        @panel a1 :layout row :h 22 :align center :gap 4
+          @text "3,412" :size 13 :color [1 0.27 0.33 0.8] :flex-grow 1
+          @text 188.44 :size 13 :color [1 0.27 0.33 1] :flex-grow 1
+          @text ASK :size 11 :color [1 0.27 0.33 0.7]
 
       ;; Spread line
-      @panel spread :h 30 :layout row :fill [0.05 0.04 0.10 1] :align center :padding-left 8 :padding-right 8
-        @text SPREAD :size 13 :color [0.4 0.4 0.52 1]
-        @text "$0.04" :size 16 :color [1 0.8 0 1] :margin-left 8
+      @panel spread :h 26 :layout row :fill [0.05 0.04 0.10 1] :align center :padding-left 8 :padding-right 8
+        @text SPREAD :size 12 :color [0.4 0.4 0.52 1]
+        @text "$0.04" :size 14 :color [1 0.8 0 1] :margin-left 6
         @panel spc :flex-grow 1
-        @text 188.42 :size 16 :color [0.6 0.6 0.67 1]
+        @text 188.42 :size 14 :color [0.6 0.6 0.67 1]
 
       ;; Bids (buyers) — compact rows
       @panel bids :layout column :padding-left 8 :padding-right 8 :padding-top 4 :padding-bottom 4 :gap 2
-        @panel b1 :layout row :h 22 :align center
-          @text "4,891" :size 14 :color [0.13 0.75 0.25 0.8] :flex-grow 1
-          @text 188.40 :size 14 :color [0.13 0.93 0.33 1] :flex-grow 1
-          @text BID :size 12 :color [0.13 0.75 0.25 0.7]
-        @panel b2 :layout row :h 22 :align center
-          @text "2,234" :size 14 :color [0.13 0.7 0.25 0.67] :flex-grow 1
-          @text 188.37 :size 14 :color [0.13 0.93 0.33 0.87] :flex-grow 1
-          @text BID :size 12 :color [0.13 0.7 0.25 0.6]
-        @panel b3 :layout row :h 22 :align center
-          @text "1,788" :size 14 :color [0.13 0.65 0.25 0.55] :flex-grow 1
-          @text 188.34 :size 14 :color [0.13 0.93 0.33 0.73] :flex-grow 1
-          @text BID :size 12 :color [0.13 0.65 0.25 0.5]
-        @panel b4 :layout row :h 22 :align center
-          @text 943 :size 14 :color [0.13 0.6 0.25 0.4] :flex-grow 1
-          @text 188.31 :size 14 :color [0.13 0.93 0.33 0.6] :flex-grow 1
-          @text BID :size 12 :color [0.13 0.6 0.25 0.35]
-        @panel b5 :layout row :h 22 :align center
-          @text 612 :size 14 :color [0.13 0.55 0.25 0.33] :flex-grow 1
-          @text 188.28 :size 14 :color [0.13 0.93 0.33 0.47] :flex-grow 1
-          @text BID :size 12 :color [0.13 0.55 0.25 0.3]
+        @panel b1 :layout row :h 22 :align center :gap 4
+          @text "4,891" :size 13 :color [0.13 0.75 0.25 0.8] :flex-grow 1
+          @text 188.40 :size 13 :color [0.13 0.93 0.33 1] :flex-grow 1
+          @text BID :size 11 :color [0.13 0.75 0.25 0.7]
+        @panel b2 :layout row :h 22 :align center :gap 4
+          @text "2,234" :size 13 :color [0.13 0.7 0.25 0.67] :flex-grow 1
+          @text 188.37 :size 13 :color [0.13 0.93 0.33 0.87] :flex-grow 1
+          @text BID :size 11 :color [0.13 0.7 0.25 0.6]
+        @panel b3 :layout row :h 22 :align center :gap 4
+          @text "1,788" :size 13 :color [0.13 0.65 0.25 0.55] :flex-grow 1
+          @text 188.34 :size 13 :color [0.13 0.93 0.33 0.73] :flex-grow 1
+          @text BID :size 11 :color [0.13 0.65 0.25 0.5]
+        @panel b4 :layout row :h 22 :align center :gap 4
+          @text 943 :size 13 :color [0.13 0.6 0.25 0.4] :flex-grow 1
+          @text 188.31 :size 13 :color [0.13 0.93 0.33 0.6] :flex-grow 1
+          @text BID :size 11 :color [0.13 0.6 0.25 0.35]
+        @panel b5 :layout row :h 22 :align center :gap 4
+          @text 612 :size 13 :color [0.13 0.55 0.25 0.33] :flex-grow 1
+          @text 188.28 :size 13 :color [0.13 0.93 0.33 0.47] :flex-grow 1
+          @text BID :size 11 :color [0.13 0.55 0.25 0.3]
 
       ;; Trade blotter
       @rect bsep :h 1 :fill [0.08 0.08 0.16 1]

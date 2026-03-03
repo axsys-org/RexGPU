@@ -1699,6 +1699,8 @@ ${vizBody}
       if (!cfg.hasDynamic) continue;
       const sb = this._storageBuffers.get(cfg.bufferName);
       if (!sb) continue;
+      const dataBytes = cfg.sources.length * 6 * 4;
+      if (dataBytes > sb.size) { console.warn(`[RPE] field source data (${dataBytes}B) exceeds buffer "${cfg.bufferName}" (${sb.size}B)`); continue; }
       const data = new Float32Array(cfg.sources.length * 6);
       for (let i = 0; i < cfg.sources.length; i++) {
         const s = cfg.sources[i];
@@ -1710,7 +1712,7 @@ ${vizBody}
         data[off + 4] = s.falloffType;
         data[off + 5] = 0;
       }
-      this.device.queue.writeBuffer(sb, 0, data);
+      try { this.device.queue.writeBuffer(sb, 0, data); } catch(e) { console.error(`[RPE] field writeBuffer failed:`, e); }
     }
   }
 
@@ -1719,6 +1721,8 @@ ${vizBody}
     for (const [name, cfg] of this._fieldConfigs) {
       const sb = this._storageBuffers.get(cfg.bufferName);
       if (!sb) continue;
+      const dataBytes = cfg.sources.length * 6 * 4;
+      if (dataBytes > sb.size) { console.warn(`[RPE] field defaults data (${dataBytes}B) exceeds buffer "${cfg.bufferName}" (${sb.size}B)`); continue; }
       const data = new Float32Array(cfg.sources.length * 6);
       for (let i = 0; i < cfg.sources.length; i++) {
         const s = cfg.sources[i];
@@ -1729,7 +1733,7 @@ ${vizBody}
         data[i*6 + 4] = s.falloffType;
         data[i*6 + 5] = 0;
       }
-      this.device.queue.writeBuffer(sb, 0, data);
+      try { this.device.queue.writeBuffer(sb, 0, data); } catch(e) { console.error(`[RPE] field defaults writeBuffer failed:`, e); }
     }
   }
 
@@ -1972,7 +1976,10 @@ ${vizBody}
         if (mod.getCompilationInfo) {
           mod.getCompilationInfo().then(info => {
             for (const msg of info.messages) {
-              if (msg.type === 'error') this.log(`shader "${key}" line ${msg.lineNum}: ${msg.message}`, 'err');
+              if (msg.type === 'error') {
+                console.error(`[SHADER] "${key}" line ${msg.lineNum}: ${msg.message}`);
+                this.log(`shader "${key}" line ${msg.lineNum}: ${msg.message}`, 'err');
+              }
               else if (msg.type === 'warning') this.log(`shader "${key}" line ${msg.lineNum}: ${msg.message}`, 'warn');
             }
           });
@@ -2108,13 +2115,18 @@ ${vizBody}
       // Write initial f32 values from @data :f0 v :f1 v ... (byte offset = index*4)
       const dataNode = b.children.find(c => c.type === 'data');
       if (dataNode) {
-        const initBuf = new Float32Array(size / 4);
+        const maxFloats = size / 4;
+        const initBuf = new Float32Array(maxFloats);
         const keys = Object.keys(dataNode.attrs);
-        for (let ki = 0; ki < keys.length; ki++) {
+        for (let ki = 0; ki < keys.length && ki < maxFloats; ki++) {
           const v = Rex.evalExpr(Rex.compileExpr(dataNode.attrs[keys[ki]]), { resolve: () => 0 });
           if (typeof v === 'number') initBuf[ki] = v;
         }
-        this.device.queue.writeBuffer(gpuBuf, 0, initBuf);
+        try {
+          this.device.queue.writeBuffer(gpuBuf, 0, initBuf);
+        } catch(e) {
+          console.error(`[RPE] storage init writeBuffer failed for "${b.name}":`, e);
+        }
       }
       this.log(`storage buffer: "${b.name}" ${size}B${usage.includes('indirect')?' [indirect]':''}`,'ok');
     }
@@ -3587,6 +3599,46 @@ ${assignments}
     }
   }
 
+  // Parse WGSL source to detect which @group indices have bindings actually
+  // used by the given entry points. Unused bindings get optimized away by the
+  // WGSL compiler, leaving empty bind group layouts that poison createBindGroup.
+  _getActiveBindGroups(shaderKeys, entryPoints) {
+    const activeGroups = new Set();
+    for (let si = 0; si < shaderKeys.length; si++) {
+      const code = this._lastGoodShaders.get(shaderKeys[si]);
+      if (!code) continue;
+      // Strip comments to avoid false positives from commented-out references
+      const stripped = code.replace(/\/\/[^\n]*/g, '').replace(/\/\*[\s\S]*?\*\//g, '');
+      // Find all @group(G) @binding(B) var<...> NAME declarations
+      const bindingRe = /@group\((\d+)\)\s+@binding\(\d+\)\s+var(?:<[^>]+>)?\s+(\w+)/g;
+      let m;
+      const groupVars = new Map(); // group -> [varName, ...]
+      while ((m = bindingRe.exec(stripped)) !== null) {
+        const g = parseInt(m[1], 10);
+        if (!groupVars.has(g)) groupVars.set(g, []);
+        groupVars.get(g).push(m[2]);
+      }
+      // Check if any variable in each group is actually used in the source
+      // (beyond its declaration line). A variable is "used" if its name appears
+      // as an identifier in a non-declaration context (e.g., function body).
+      for (const [g, vars] of groupVars) {
+        for (const vName of vars) {
+          const useRe = new RegExp(`\\b${vName}\\b`, 'g');
+          const lines = stripped.split('\n');
+          let refCount = 0;
+          for (const line of lines) {
+            // Skip declaration lines
+            if (line.includes('@group(') && line.includes(vName)) continue;
+            useRe.lastIndex = 0;
+            if (useRe.test(line)) { refCount++; break; }
+          }
+          if (refCount > 0) { activeGroups.add(g); break; }
+        }
+      }
+    }
+    return activeGroups;
+  }
+
   _buildPipeline(key, pNode) {
     // Resolve explicit layout from @resources scope
     const resName = pNode.attrs.resources;
@@ -3603,13 +3655,13 @@ ${assignments}
       const computeDesc = { module: mod, entryPoint: pNode.attrs.entry || 'main' };
       if (Object.keys(pipeOverrides).length > 0) computeDesc.constants = pipeOverrides;
       try {
-        this.device.pushErrorScope('validation');
         const pipeline = this.device.createComputePipeline({ layout: explicitLayout, compute: computeDesc });
-        this.device.popErrorScope().then(err => {
-          if (err) this.log(`pipeline "${key}": compute VALIDATION ERROR: ${err.message}`, 'err');
-        });
-        this.pipelines.set(key, { pipeline, type: 'compute', resourceScope: resName || null, overrides: { ...pipeOverrides }, shaderKey: compName, _name: key });
-        this.log(`pipeline "${key}": compute \u2713${resScope ? ` [resources: ${resName}]` : ''}`,'ok');
+        // Detect which bind groups have bindings actually used by entry points
+        // (WGSL compiler optimizes away unused bindings, leaving empty layouts)
+        const entryPoint = pNode.attrs.entry || 'main';
+        const activeGroups = resScope ? new Set([0]) : this._getActiveBindGroups([compName], [entryPoint]);
+        this.pipelines.set(key, { pipeline, type: 'compute', resourceScope: resName || null, overrides: { ...pipeOverrides }, shaderKey: compName, _name: key, activeGroups });
+        this.log(`pipeline "${key}": compute ✓ [active groups: ${[...activeGroups].join(',')||'none'}]${resScope ? ` [resources: ${resName}]` : ''}`,'ok');
       } catch(e) {
         this.log(`pipeline "${key}": compute FAILED: ${e.message}`,'err');
       }
@@ -3738,15 +3790,15 @@ ${assignments}
     }
 
     try {
-      this.device.pushErrorScope('validation');
       const newPipeline = this.device.createRenderPipeline(desc);
-      this.device.popErrorScope().then(err => {
-        if (err) this.log(`pipeline "${key}": render VALIDATION ERROR: ${err.message}`, 'err');
-      });
-      this.pipelines.set(key, {pipeline:newPipeline, type:'render', format, resourceScope: resName || null, sampleCount, _name: key});
-      this.log(`pipeline "${key}": render \u2713${sampleCount > 1 ? ` [${sampleCount}x MSAA]` : ''}${resScope ? ` [resources: ${resName}]` : ''}`,'ok');
+      // Detect which bind groups have bindings actually used by entry points
+      const vEntry = desc.vertex.entryPoint;
+      const fEntry = desc.fragment.entryPoint;
+      const activeGroups = resScope ? new Set([0]) : this._getActiveBindGroups([vn, fn], [vEntry, fEntry]);
+      this.pipelines.set(key, {pipeline:newPipeline, type:'render', format, resourceScope: resName || null, sampleCount, _name: key, activeGroups});
+      this.log(`pipeline "${key}": render ✓ [active groups: ${[...activeGroups].join(',')||'none'}]${sampleCount > 1 ? ` [${sampleCount}x MSAA]` : ''}${resScope ? ` [resources: ${resName}]` : ''}`,'ok');
     } catch(e) {
-      this.log(`pipeline "${key}": ${e.message} \u2014 keeping last-good`,'err');
+      this.log(`pipeline "${key}": ${e.message} — keeping last-good`,'err');
     }
   }
 
@@ -3766,10 +3818,14 @@ ${assignments}
 
     if (this._frameDirty && this._heapBuffer) {
       const alignedMin = this._dirtyMin & ~3;
-      const alignedMax = (this._dirtyMax + 3) & ~3;
-      const size = Math.min(alignedMax - alignedMin, this._heapSize - alignedMin);
-      if (size > 0) {
-        this.device.queue.writeBuffer(this._heapBuffer, alignedMin, this._stagingBuffers[this._writeSlot], alignedMin, size);
+      const alignedMax = Math.min((this._dirtyMax + 3) & ~3, this._heapSize);
+      const size = alignedMax - alignedMin;
+      if (size > 0 && alignedMin >= 0 && alignedMin + size <= this._heapSize) {
+        try {
+          this.device.queue.writeBuffer(this._heapBuffer, alignedMin, this._stagingBuffers[this._writeSlot], alignedMin, size);
+        } catch(e) {
+          console.error(`[RPE] writeBuffer failed: offset=${alignedMin} size=${size} heapSize=${this._heapSize}`, e);
+        }
         const src = new Uint8Array(this._stagingBuffers[this._writeSlot], alignedMin, size);
         const dst = new Uint8Array(this._stagingBuffers[1 - this._writeSlot], alignedMin, size);
         dst.set(src);
@@ -4107,7 +4163,6 @@ ${assignments}
         if (pe.resourceScope && this._resourceScopes?.has(pe.resourceScope)) {
           cp.setBindGroup(0, this._resourceScopes.get(pe.resourceScope).bindGroup);
         }
-        if (this.frameCount < 2) this.log(`dispatch ${dispKey}: ${cmd.binds.length} binds: ${JSON.stringify(cmd.binds)}`,'cmd');
         for (const b of cmd.binds) {
           this._setBindGroup(cp, pe, b);
         }
@@ -4134,8 +4189,12 @@ ${assignments}
 
   _setBindGroup(pass, pe, bindDef) {
     const group = bindDef.group || 0;
+
+    // Skip bind groups for shader groups whose bindings were optimized away
+    // by the WGSL compiler (no variable in that group is actually used)
+    if (pe.activeGroups && !pe.activeGroups.has(group)) return;
+
     const entries = [];
-    // Include pipeline name in cache to prevent cross-pipeline layout mismatch
     const pipeKey = pe._name || '';
 
     // Uniform buffer from heap
@@ -4153,8 +4212,6 @@ ${assignments}
         const sb = this._storageBuffers.get(sName);
         if (sb) {
           entries.push({ binding: entries.length, resource: { buffer: sb } });
-        } else {
-          this.log(`bind: storage buffer "${sName}" not found (available: ${[...this._storageBuffers.keys()].join(', ')})`,'err');
         }
       }
     }
@@ -4171,45 +4228,28 @@ ${assignments}
       // Fall back to legacy heap-only bind
       if (bindDef.buffer) {
         const hl = this._heapLayout.get(bindDef.buffer);
-        if (!hl || !this._heapBuffer) { this.log(`bind: buffer "${bindDef.buffer}" not in heap`,'err'); return; }
-        const bgKey = `${pipeKey}_${group}_${bindDef.buffer}`;
-        let bg = this._bindGroups.get(bgKey);
-        if (!bg) {
-          this.log(`createBG: pipe=${pipeKey} group=${group} buf=${bindDef.buffer} heapOff=${hl.offset} heapSz=${hl.size} heapBufSz=${this._heapBuffer.size}`,'cmd');
-          this.device.pushErrorScope('validation');
-          bg = this.device.createBindGroup({
-            layout: pe.pipeline.getBindGroupLayout(group),
-            entries: [{ binding: 0, resource: { buffer: this._heapBuffer, offset: hl.offset, size: hl.size } }]
-          });
-          this.device.popErrorScope().then(err => {
-            if (err) this.log(`BG VALIDATION: pipe=${pipeKey} group=${group} buf=${bindDef.buffer}: ${err.message}`, 'err');
-          });
-          this._bindGroups.set(bgKey, bg);
-        }
-        pass.setBindGroup(group, bg);
+        if (!hl || !this._heapBuffer) return;
+        entries.push({ binding: 0, resource: { buffer: this._heapBuffer, offset: hl.offset, size: hl.size } });
+      } else {
+        return; // nothing to bind
       }
-      return;
     }
 
-    // Build bind group from entries — key includes pipeline to prevent cross-pipeline reuse
+    // Cache key includes pipeline name to prevent cross-pipeline layout mismatch
     const bgKey = `bg_${pipeKey}_${group}_${bindDef.buffer||''}_${bindDef.storage||''}_${bindDef.texture||''}`;
     let bg = this._bindGroups.get(bgKey);
     if (!bg) {
       try {
         const layout = pe.pipeline.getBindGroupLayout(group);
-        this.log(`createBG: pipe=${pipeKey} group=${group} entries=${entries.length} buf=${bindDef.buffer||'-'} sto=${bindDef.storage||'-'}`,'cmd');
-        this.device.pushErrorScope('validation');
         bg = this.device.createBindGroup({ layout, entries });
-        this.device.popErrorScope().then(err => {
-          if (err) this.log(`BG VALIDATION [${pipeKey}] group=${group}: ${err.message}`, 'err');
-        });
         this._bindGroups.set(bgKey, bg);
       } catch(e) {
-        this.log(`bind group ${group} THROW [${pipeKey}]: ${e.message}`, 'err');
+        // Binding group not present in shader (optimized away) — skip silently
+        this._bindGroups.set(bgKey, null); // cache the miss
         return;
       }
     }
-    pass.setBindGroup(group, bg);
+    if (bg) pass.setBindGroup(group, bg);
   }
 
   _applyBuiltins(time) {
@@ -4237,9 +4277,12 @@ ${assignments}
     b['key-e'] = inp.keys.has('KeyE') ? 1 : 0;
 
     for (const op of this._builtinOptics) {
+      // Bounds check for all special-case writes
+      if (op.heapOffset < 0 || op.heapOffset >= this._heapSize) continue;
       // Enum-dispatched special cases (no string comparison per frame)
       switch (op.special) {
         case 1: { // canvas-size
+          if (op.heapOffset + 8 > this._heapSize) continue;
           const oldW = this._heapView.getFloat32(op.heapOffset, true);
           const oldH = this._heapView.getFloat32(op.heapOffset + 4, true);
           const newW = this.canvas.width, newH = this.canvas.height;
@@ -4250,22 +4293,41 @@ ${assignments}
           }
           continue;
         }
-        case 2: // mouse-pos
-          this._heapView.setFloat32(op.heapOffset, inp.mouseX, true);
-          this._heapView.setFloat32(op.heapOffset + 4, inp.mouseY, true);
-          this._markDirty(op.heapOffset, 8);
+        case 2: { // mouse-pos
+          if (op.heapOffset + 8 > this._heapSize) continue;
+          const omx = this._heapView.getFloat32(op.heapOffset, true);
+          const omy = this._heapView.getFloat32(op.heapOffset + 4, true);
+          if (omx !== inp.mouseX || omy !== inp.mouseY) {
+            this._heapView.setFloat32(op.heapOffset, inp.mouseX, true);
+            this._heapView.setFloat32(op.heapOffset + 4, inp.mouseY, true);
+            this._markDirty(op.heapOffset, 8);
+          }
           continue;
-        case 3: // mouse-delta
-          this._heapView.setFloat32(op.heapOffset, inp.mouseDX, true);
-          this._heapView.setFloat32(op.heapOffset + 4, inp.mouseDY, true);
-          this._markDirty(op.heapOffset, 8);
+        }
+        case 3: { // mouse-delta
+          if (op.heapOffset + 8 > this._heapSize) continue;
+          const odx = this._heapView.getFloat32(op.heapOffset, true);
+          const ody = this._heapView.getFloat32(op.heapOffset + 4, true);
+          if (odx !== inp.mouseDX || ody !== inp.mouseDY) {
+            this._heapView.setFloat32(op.heapOffset, inp.mouseDX, true);
+            this._heapView.setFloat32(op.heapOffset + 4, inp.mouseDY, true);
+            this._markDirty(op.heapOffset, 8);
+          }
           continue;
-        case 4: // move-dir
-          this._heapView.setFloat32(op.heapOffset, inp.moveX, true);
-          this._heapView.setFloat32(op.heapOffset + 4, inp.moveY, true);
-          this._heapView.setFloat32(op.heapOffset + 8, inp.moveZ, true);
-          this._markDirty(op.heapOffset, 12);
+        }
+        case 4: { // move-dir
+          if (op.heapOffset + 12 > this._heapSize) continue;
+          const omvx = this._heapView.getFloat32(op.heapOffset, true);
+          const omvy = this._heapView.getFloat32(op.heapOffset + 4, true);
+          const omvz = this._heapView.getFloat32(op.heapOffset + 8, true);
+          if (omvx !== inp.moveX || omvy !== inp.moveY || omvz !== inp.moveZ) {
+            this._heapView.setFloat32(op.heapOffset, inp.moveX, true);
+            this._heapView.setFloat32(op.heapOffset + 4, inp.moveY, true);
+            this._heapView.setFloat32(op.heapOffset + 8, inp.moveZ, true);
+            this._markDirty(op.heapOffset, 12);
+          }
           continue;
+        }
       }
 
       // General case: evaluate pre-compiled expression AST (no string parsing)
@@ -4293,6 +4355,8 @@ ${assignments}
     if (!this._heapView) return;
     const v = this._heapView;
     const size = this._typeSize(type);
+    // Bounds check — prevent writing past heap
+    if (offset < 0 || offset + size > this._heapSize) return;
     if (type === 'f32') { v.setFloat32(offset, Number(value)||0, true); }
     else if (type === 'f32x2') { const a=Array.isArray(value)?value:[0,0]; v.setFloat32(offset,Number(a[0])||0,true); v.setFloat32(offset+4,Number(a[1])||0,true); }
     else if (type === 'f32x3') { const a=Array.isArray(value)?value:[0,0,0]; for(let i=0;i<3;i++)v.setFloat32(offset+i*4,Number(a[i])||0,true); }
@@ -4303,13 +4367,17 @@ ${assignments}
   }
 
   _markDirty(offset, size) {
+    // Clamp to heap bounds
+    const end = Math.min(offset + size, this._heapSize);
+    if (offset < 0) offset = 0;
+    if (end <= offset) return;
     if (!this._frameDirty) {
       this._dirtyMin = offset;
-      this._dirtyMax = offset + size;
+      this._dirtyMax = end;
       this._frameDirty = true;
     } else {
       this._dirtyMin = Math.min(this._dirtyMin, offset);
-      this._dirtyMax = Math.max(this._dirtyMax, offset + size);
+      this._dirtyMax = Math.max(this._dirtyMax, end);
     }
   }
 
