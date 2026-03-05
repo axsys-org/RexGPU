@@ -309,6 +309,64 @@ export class RexGPU {
     + vec3f(PARAM_hr, PARAM_hg, PARAM_hb) * cb_highlights, color.a);`,
       params: { sr:0,sg:0,sb:0, mr:0,mg:0,mb:0, hr:0,hg:0,hb:0 }, passes: 1, needsNeighbors: false,
     }],
+    ['ssao', {
+      wgsl: `// Screen-space ambient occlusion (8-tap kernel)
+  let ssao_px = vec2i(i32(px.x), i32(px.y));
+  let ssao_lum = dot(color.rgb, vec3f(0.2126, 0.7152, 0.0722));
+  var ao = 0.0;
+  let ssao_r = i32(PARAM_radius);
+  let ssao_offsets = array<vec2i, 8>(
+    vec2i(-1,-1), vec2i(0,-1), vec2i(1,-1), vec2i(-1,0),
+    vec2i(1,0), vec2i(-1,1), vec2i(0,1), vec2i(1,1)
+  );
+  for (var si = 0; si < 8; si++) {
+    let sp = ssao_px + ssao_offsets[si] * ssao_r;
+    let sc = textureLoad(src, clamp(sp, vec2i(0), dims - vec2i(1)));
+    let sl = dot(sc.rgb, vec3f(0.2126, 0.7152, 0.0722));
+    ao += select(0.0, 1.0, sl > ssao_lum + PARAM_bias);
+  }
+  ao = ao / 8.0;
+  let occlusion = 1.0 - ao * PARAM_strength;
+  color = vec4f(color.rgb * occlusion, color.a);`,
+      params: { radius: 4.0, strength: 0.5, bias: 0.025 }, passes: 1, needsNeighbors: true,
+    }],
+    ['oit-resolve', {
+      wgsl: `// Order-independent transparency resolve (weighted blended)
+  // Expects pre-multiplied alpha accumulation in RGB, weight sum in A
+  let oit_a = max(color.a, 1e-5);
+  let oit_rgb = color.rgb / oit_a;
+  let oit_alpha = clamp(1.0 - pow(max(0.0, 1.0 - oit_a / PARAM_weight_scale), PARAM_power), 0.0, 1.0);
+  color = vec4f(oit_rgb * oit_alpha, oit_alpha);`,
+      params: { weight_scale: 1.0, power: 3.0 }, passes: 1, needsNeighbors: false,
+    }],
+    ['tone-map', {
+      wgsl: `// ACES filmic tone mapping
+  let tm_a = 2.51; let tm_b = 0.03; let tm_c = 2.43; let tm_d = 0.59; let tm_e = 0.14;
+  let tm_x = color.rgb * PARAM_exposure;
+  let tm_mapped = clamp((tm_x * (tm_a * tm_x + tm_b)) / (tm_x * (tm_c * tm_x + tm_d) + tm_e), vec3f(0.0), vec3f(1.0));
+  let tm_gamma = pow(tm_mapped, vec3f(1.0 / PARAM_gamma));
+  color = vec4f(tm_gamma, color.a);`,
+      params: { exposure: 1.0, gamma: 2.2 }, passes: 1, needsNeighbors: false,
+    }],
+    ['outline', {
+      wgsl: `// Edge-based outline
+  let ol_px = vec2i(i32(px.x), i32(px.y));
+  var ol_edge = 0.0;
+  let ol_w = i32(PARAM_width);
+  for (var oi = -ol_w; oi <= ol_w; oi++) {
+    for (var oj = -ol_w; oj <= ol_w; oj++) {
+      if (oi == 0 && oj == 0) { continue; }
+      let sp = ol_px + vec2i(oi, oj);
+      let sc = textureLoad(src, clamp(sp, vec2i(0), dims - vec2i(1)));
+      let diff = length(sc.rgb - color.rgb);
+      ol_edge = max(ol_edge, diff);
+    }
+  }
+  let ol_t = smoothstep(PARAM_threshold - 0.1, PARAM_threshold + 0.1, ol_edge);
+  let ol_color = vec3f(PARAM_r, PARAM_g, PARAM_b);
+  color = vec4f(mix(color.rgb, ol_color, ol_t * PARAM_strength), color.a);`,
+      params: { width: 1.0, threshold: 0.1, strength: 1.0, r: 0.0, g: 0.0, b: 0.0 }, passes: 1, needsNeighbors: true,
+    }],
   ]);
 
   async init() {
@@ -322,8 +380,8 @@ export class RexGPU {
       'indirect-first-instance','bgra8unorm-storage',
       'rg11b10ufloat-renderable','depth-clip-control',
       'float32-blendable','dual-source-blending',
-      'subgroups','clip-distances',
-      'depth32float-stencil8',
+      'subgroups','subgroups-f16','clip-distances',
+      'depth32float-stencil8','chromium-experimental-subgroups',
     ];
     const available = DESIRED.filter(f => ad.features.has(f));
     this._features = new Set(available);
@@ -353,9 +411,15 @@ export class RexGPU {
       maxBindingsPerBindGroup: dl.maxBindingsPerBindGroup,
       maxComputeWorkgroupSizeX: dl.maxComputeWorkgroupSizeX,
       maxComputeWorkgroupSizeY: dl.maxComputeWorkgroupSizeY,
+      maxComputeWorkgroupSizeZ: dl.maxComputeWorkgroupSizeZ,
+      maxComputeInvocationsPerWorkgroup: dl.maxComputeInvocationsPerWorkgroup,
+      maxComputeWorkgroupStorageSize: dl.maxComputeWorkgroupStorageSize,
       maxComputeWorkgroupsPerDimension: dl.maxComputeWorkgroupsPerDimension,
       maxStorageBuffersPerShaderStage: dl.maxStorageBuffersPerShaderStage,
       maxUniformBufferBindingSize: dl.maxUniformBufferBindingSize,
+      maxSamplersPerShaderStage: dl.maxSamplersPerShaderStage,
+      maxDynamicUniformBuffersPerPipelineLayout: dl.maxDynamicUniformBuffersPerPipelineLayout,
+      maxDynamicStorageBuffersPerPipelineLayout: dl.maxDynamicStorageBuffersPerPipelineLayout,
     };
 
     if (available.length > 0) this.log('GPU features: '+available.join(', '),'ok');
@@ -367,6 +431,45 @@ export class RexGPU {
 
   hasFeature(name) { return this._features.has(name); }
   getLimit(name) { return this._limits?.[name] ?? 0; }
+  getLimits() { return { ...this._limits }; }
+
+  // Pipeline reflection — get bind group layouts and compilation info
+  getPipelineInfo(name) {
+    const entry = this.pipelines.get(name);
+    if (!entry) return null;
+    const info = { name, type: entry.type, activeGroups: [...(entry.activeGroups || [])] };
+    // Reflect bind group layouts
+    try {
+      const layouts = [];
+      for (const g of (entry.activeGroups || [])) {
+        layouts.push({ group: g, layout: entry.pipeline.getBindGroupLayout(g) });
+      }
+      info.bindGroupLayouts = layouts;
+    } catch (e) { /* some pipelines may not support reflection */ }
+    if (entry.type === 'render') {
+      info.format = entry.format;
+      info.sampleCount = entry.sampleCount;
+    }
+    if (entry.type === 'compute') {
+      info.shaderKey = entry.shaderKey;
+    }
+    info.resourceScope = entry.resourceScope;
+    return info;
+  }
+
+  // Get shader compilation info (async)
+  async getShaderCompilationInfo(name) {
+    const mod = this.shaderModules.get(name);
+    if (!mod) return null;
+    if (!mod.getCompilationInfo) return { messages: [] };
+    const info = await mod.getCompilationInfo();
+    return {
+      messages: info.messages.map(m => ({
+        type: m.type, lineNum: m.lineNum, linePos: m.linePos,
+        offset: m.offset, length: m.length, message: m.message,
+      })),
+    };
+  }
 
   // ════════════════════════════════════════════════════════════════
   // INPUT SYSTEM — WASD, mouse, pointer lock
@@ -548,11 +651,11 @@ export class RexGPU {
     // 1.5b. Fields — expand @field nodes into synthetic textures/shaders/pipelines/dispatches
     this._compileFields(tree);
 
-    // 2. Shaders (resolve #import for structs AND libs, auto-inject WGSL enables)
-    this._compileShaders(tree);
-
-    // 3. Heap layout
+    // 2. Heap layout (before shaders so #import heap / #link get_* resolves)
     this._compileHeapLayout(tree);
+
+    // 3. Shaders (resolve #import for structs AND libs, auto-inject WGSL enables)
+    this._compileShaders(tree);
 
     // 4. Optics
     this._compileOptics(tree);
@@ -1752,51 +1855,77 @@ ${vizBody}
   }
 
   _resolveImports(code) {
-    // Parse #import directives, returning clean code + import list
+    // Parse #import and #link directives, returning clean code + import list + link list
     // Supports: #import name          (whole module)
     //           #import name { a, b } (selective)
+    //           #link symbolName       (cross-module symbol resolution — search all libs for exported symbol)
     const imports = [];
-    const cleanCode = code.replace(/^[ \t]*#import\s+(\S+)(?:\s*\{([^}]+)\})?\s*$/gm, (_, name, selectors) => {
-      const symbols = selectors ? selectors.split(',').map(s => s.trim()).filter(Boolean) : null;
-      imports.push({ name, symbols });
-      return ''; // remove directive from code
+    const links = [];
+    const cleanCode = code.replace(/^[ \t]*#(import|link)\s+(\S+)(?:\s*\{([^}]+)\})?\s*$/gm, (_, directive, name, selectors) => {
+      if (directive === 'link') {
+        // #link symbolName — resolve from any lib that exports it
+        links.push(name);
+      } else {
+        const symbols = selectors ? selectors.split(',').map(s => s.trim()).filter(Boolean) : null;
+        imports.push({ name, symbols });
+      }
+      return '';
     });
-    return { imports, cleanCode };
+    return { imports, links, cleanCode };
   }
 
   _parseWgslDeclarations(code) {
     // Extract top-level WGSL declarations: fn, var, const, struct, let
-    // Returns Map<name, {kind, start, end, body}>
+    // Returns Map<name, {kind, start, end, body, exported, link, optional, infer, global}>
+    // Attribute prefixes: @export (visible for cross-module #link), @link (slot to be filled),
+    //   @optional (link slot with fallback body), @infer (type inferred from linked module),
+    //   @global (no namespace prefixing)
     const decls = new Map();
-    // Match fn declarations with body
-    const fnRe = /^(fn\s+(\w+)\s*\([^)]*\)(?:\s*->\s*[^{]+)?\s*\{)/gm;
+    // Match fn declarations with body (optional attribute prefixes)
+    const attrPat = '(?:@(?:export|link|optional|infer|global)\\s+)*';
+    const fnRe = new RegExp('^(' + attrPat + ')(fn\\s+(\\w+)\\s*\\([^)]*\\)(?:\\s*->\\s*[^{]+)?\\s*\\{)', 'gm');
     let m;
     while ((m = fnRe.exec(code)) !== null) {
-      const name = m[2];
+      const attrs = m[1].trim();
+      const exported = attrs.includes('@export');
+      const link = attrs.includes('@link');
+      const optional = attrs.includes('@optional');
+      const infer = attrs.includes('@infer');
+      const global = attrs.includes('@global');
+      const name = m[3];
       const start = m.index;
       // Find matching closing brace
-      let depth = 1, pos = m.index + m[1].length;
+      let depth = 1, pos = m.index + m[0].length;
       while (pos < code.length && depth > 0) {
         if (code[pos] === '{') depth++;
         else if (code[pos] === '}') depth--;
         pos++;
       }
-      decls.set(name, { kind: 'fn', start, end: pos, body: code.slice(start, pos) });
+      const body = code.slice(start, pos);
+      // Store body without attribute prefixes for clean emission
+      const cleanBody = body.replace(/^(?:@(?:export|link|optional|infer|global)\s+)+/, '');
+      decls.set(name, { kind: 'fn', start, end: pos, body: cleanBody, exported, link, optional, infer, global });
     }
-    // Match var/const/let/override declarations
-    const varRe = /^((?:var|const|let|override)\s*(?:<[^>]+>)?\s+(\w+)\s*(?::\s*[^=;]+)?(?:\s*=[^;]*)?;)/gm;
+    // Match var/const/let/override declarations (optional attribute prefixes)
+    const varRe = new RegExp('^(' + attrPat + ')((?:var|const|let|override)\\s*(?:<[^>]+>)?\\s+(\\w+)\\s*(?::\\s*[^=;]+)?(?:\\s*=[^;]*)?;)', 'gm');
     while ((m = varRe.exec(code)) !== null) {
-      const name = m[2];
+      const attrs = m[1].trim();
+      const exported = attrs.includes('@export');
+      const global = attrs.includes('@global');
+      const name = m[3];
       if (!decls.has(name)) {
-        decls.set(name, { kind: 'var', start: m.index, end: m.index + m[1].length, body: m[1] });
+        decls.set(name, { kind: 'var', start: m.index, end: m.index + m[0].length, body: m[2], exported, global });
       }
     }
-    // Match struct declarations
-    const structRe = /^(struct\s+(\w+)\s*\{[^}]*\})/gm;
+    // Match struct declarations (optional attribute prefixes)
+    const structRe = new RegExp('^(' + attrPat + ')(struct\\s+(\\w+)\\s*\\{[^}]*\\})', 'gm');
     while ((m = structRe.exec(code)) !== null) {
-      const name = m[2];
+      const attrs = m[1].trim();
+      const exported = attrs.includes('@export');
+      const global = attrs.includes('@global');
+      const name = m[3];
       if (!decls.has(name)) {
-        decls.set(name, { kind: 'struct', start: m.index, end: m.index + m[1].length, body: m[1] });
+        decls.set(name, { kind: 'struct', start: m.index, end: m.index + m[0].length, body: m[2], exported, global });
       }
     }
     return decls;
@@ -1841,14 +1970,17 @@ ${vizBody}
     for (const decl of toRemove) {
       result = result.slice(0, decl.start) + result.slice(decl.end);
     }
+    // Strip @export markers from output (they're metadata, not valid WGSL)
+    result = result.replace(/^@export\s+/gm, '');
     return result;
   }
 
   _namespaceModule(code, ns, decls, globalTypes) {
     // Prefix all non-global symbols with namespace _XX_
     let result = code;
-    for (const [name] of decls) {
+    for (const [name, decl] of decls) {
       if (globalTypes.has(name)) continue; // struct types shared globally
+      if (decl.global) continue; // @global vars skip namespace prefixing
       const re = new RegExp('\\b' + name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\b', 'g');
       result = result.replace(re, ns + name);
     }
@@ -1856,8 +1988,9 @@ ${vizBody}
   }
 
   _linkShader(code, shaderName) {
-    const { imports, cleanCode } = this._resolveImports(code);
-    if (imports.length === 0) return code; // no imports, pass through
+    const { imports, links, cleanCode } = this._resolveImports(code);
+    const hasSlotDecls = /@(?:link|optional|infer)\s+fn\s/.test(code);
+    if (imports.length === 0 && links.length === 0 && !hasSlotDecls) return code; // no imports/links/slots, pass through
 
     let linked = cleanCode;
     let uniformEmitted = false;
@@ -1870,12 +2003,17 @@ ${vizBody}
     for (const [name] of this._wgslStructs) globalTypes.add(name);
 
     for (const imp of imports) {
-      // Struct import (from @struct nodes)
+      // Struct import (from @struct nodes) — auto-generates binding boilerplate
       if (this._wgslStructs.has(imp.name)) {
         const structWgsl = this._wgslStructs.get(imp.name);
         if (!uniformEmitted && !hasManualU) {
           uniformEmitted = true;
-          preambles.push(`${structWgsl}\n@group(0) @binding(0) var<uniform> u: ${imp.name};`);
+          // Support custom group/binding via import syntax: #import StructName { @group=1, @binding=2 }
+          const groupIdx = imp.symbols?.find(s => s.startsWith('@group='));
+          const bindIdx = imp.symbols?.find(s => s.startsWith('@binding='));
+          const group = groupIdx ? groupIdx.split('=')[1] : '0';
+          const binding = bindIdx ? bindIdx.split('=')[1] : '0';
+          preambles.push(`${structWgsl}\n@group(${group}) @binding(${binding}) var<uniform> u: ${imp.name};`);
         } else {
           preambles.push(structWgsl);
         }
@@ -1922,13 +2060,89 @@ ${vizBody}
       preambles.push(`// #import ${imp.name} \u2014 NOT FOUND`);
     }
 
+    // Resolve #link directives: search all libs for exported symbols
+    for (const linkSym of links) {
+      let found = false;
+      for (const [libName, libCode] of this._wgslLibs) {
+        const decls = this._parseWgslDeclarations(libCode);
+        const decl = decls.get(linkSym);
+        if (decl && decl.exported) {
+          // Tree-shake: extract symbol + transitive deps
+          const shakenCode = this._shakeModule(libCode, decls, new Set([linkSym]));
+          const shakenDecls = this._parseWgslDeclarations(shakenCode);
+          const ns = `_${(this._nsCounter++).toString(36).padStart(2, '0')}_`;
+          const namespacedCode = this._namespaceModule(shakenCode, ns, shakenDecls, globalTypes);
+          // Alias the linked symbol back to its original name
+          aliases.push({ from: ns + linkSym, to: linkSym });
+          preambles.push(namespacedCode);
+          found = true;
+          break;
+        }
+      }
+      if (!found) {
+        this.log(`shader "${shaderName}": #link ${linkSym} not found in any lib`, 'warn');
+        preambles.push(`// #link ${linkSym} \u2014 NOT FOUND`);
+      }
+    }
+
     // Apply aliases: replace original symbol names in the shader body with namespaced versions
     for (const { from, to } of aliases) {
       const re = new RegExp('\\b' + to.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\b', 'g');
       linked = linked.replace(re, from);
     }
 
-    return preambles.join('\n\n') + '\n\n' + linked;
+    let result = preambles.join('\n\n') + '\n\n' + linked;
+
+    // ── Resolve @link / @optional / @infer slot declarations in the shader body ──
+    // Scan the assembled shader for @link fn declarations and fill them from preambles
+    const finalDecls = this._parseWgslDeclarations(result);
+    for (const [name, decl] of finalDecls) {
+      if (!decl.link && !decl.optional && !decl.infer) continue;
+      // Search preambles for an exported implementation of this symbol
+      let implFound = false;
+      for (const [libName, libCode] of this._wgslLibs) {
+        const libDecls = this._parseWgslDeclarations(libCode);
+        const impl = libDecls.get(name);
+        if (impl && impl.exported) {
+          // Extract implementation + transitive deps, namespace, prepend
+          const shakenCode = this._shakeModule(libCode, libDecls, new Set([name]));
+          const shakenDecls = this._parseWgslDeclarations(shakenCode);
+          const ns = `_${(this._nsCounter++).toString(36).padStart(2, '0')}_`;
+          const namespacedCode = this._namespaceModule(shakenCode, ns, shakenDecls, globalTypes);
+          // Replace the @link slot declaration with the implementation
+          // The slot body gets replaced; the namespaced impl is prepended
+          const slotRe = new RegExp('(?:@(?:link|optional|infer)\\s+)+fn\\s+' + name + '\\s*\\([^)]*\\)(?:\\s*->\\s*[^{]+)?\\s*\\{[^}]*\\}');
+          if (slotRe.test(result)) {
+            // For @infer: extract return type from implementation signature
+            const implSig = impl.body.match(/fn\s+\w+\s*\([^)]*\)(?:\s*->\s*([^{]+?))\s*\{/);
+            const implRetType = implSig ? implSig[1].trim() : null;
+            // Remove the slot declaration from result (impl replaces it)
+            result = result.replace(slotRe, '');
+            // Prepend implementation (with namespace)
+            result = namespacedCode + '\n' + result;
+            // Alias: the namespaced name should be callable as the original name
+            const aliasRe = new RegExp('\\b' + name + '\\b', 'g');
+            result = result.replace(aliasRe, ns + name);
+            // But un-namespace the declaration itself
+            result = result.replace(new RegExp('\\b' + ns + ns + name + '\\b', 'g'), ns + name);
+          }
+          implFound = true;
+          break;
+        }
+      }
+      if (!implFound && decl.link && !decl.optional) {
+        // Required @link slot not filled — warn
+        this.log(`shader "${shaderName}": @link slot "${name}" not filled by any lib`, 'warn');
+      }
+      if (!implFound && (decl.optional || decl.infer)) {
+        // @optional: keep the fallback body, just strip the attribute prefix
+        result = result.replace(/(?:@(?:optional|infer)\s+)+fn\s+/g, 'fn ');
+      }
+    }
+    // Clean any remaining @link/@optional/@infer markers
+    result = result.replace(/^@(?:link|optional|infer|global)\s+/gm, '');
+
+    return result;
   }
 
   _compileShaders(tree) {
@@ -1956,6 +2170,7 @@ ${vizBody}
       const enables = [];
       if (this._features.has('shader-f16') && /\bf16\b/.test(code)) enables.push('enable f16;');
       if (this._features.has('subgroups') && /subgroup/.test(code)) enables.push('enable subgroups;');
+      if (this._features.has('subgroups-f16') && /subgroup/.test(code) && /\bf16\b/.test(code)) enables.push('enable subgroups_f16;');
       if (this._features.has('clip-distances') && /clip_distances/.test(code)) enables.push('enable clip_distances;');
       if (this._features.has('dual-source-blending') && /blend_src/.test(code)) enables.push('enable dual_source_blending;');
       if (enables.length > 0) code = enables.join('\n') + '\n' + code;
@@ -2012,6 +2227,28 @@ ${vizBody}
       heapOffset += size;
     }
     this._heapSize = Math.max(Math.ceil(heapOffset / 256) * 256, 256);
+    // Generate virtual heap accessor lib
+    this._generateHeapAccessors();
+  }
+
+  _generateHeapAccessors() {
+    // Generate WGSL accessor functions for each field in each heap buffer.
+    // Shaders can `#import heap { get_camera_x, get_camera_y }` to access heap fields.
+    const lines = [];
+    for (const [bufName, hl] of this._heapLayout) {
+      if (!hl.structDef) continue;
+      for (const field of hl.structDef.layout) {
+        const fnName = `get_${bufName}_${field.name}`;
+        const wgslType = this._toWGSL(field.type);
+        const byteOffset = hl.offset + field.offset;
+        // Generate accessor that reads from the uniform buffer at the compiled byte offset
+        // Note: actual binding depends on shader context — this generates the read logic
+        lines.push(`@export fn ${fnName}() -> ${wgslType} { return u.${field.name}; }`);
+      }
+    }
+    if (lines.length > 0) {
+      this._wgslLibs.set('heap', lines.join('\n'));
+    }
   }
 
   _compileOptics(tree) {
@@ -3647,6 +3884,7 @@ ${assignments}
       ? this.device.createPipelineLayout({ bindGroupLayouts: [resScope.layout] })
       : 'auto';
 
+    const useAsync = pNode.attrs.async === true || pNode.attrs.async === 'true';
     const compName = pNode.attrs.compute;
     if (compName) {
       const mod = this.shaderModules.get(compName);
@@ -3655,7 +3893,18 @@ ${assignments}
       const computeDesc = { module: mod, entryPoint: pNode.attrs.entry || 'main' };
       if (Object.keys(pipeOverrides).length > 0) computeDesc.constants = pipeOverrides;
       try {
-        const pipeline = this.device.createComputePipeline({ layout: explicitLayout, compute: computeDesc });
+        const pipelineDesc = { layout: explicitLayout, compute: computeDesc };
+        if (useAsync) {
+          // Async pipeline creation — non-blocking, doesn't stall GPU
+          this.device.createComputePipelineAsync(pipelineDesc).then(pipeline => {
+            const entryPoint = pNode.attrs.entry || 'main';
+            const activeGroups = resScope ? new Set([0]) : this._getActiveBindGroups([compName], [entryPoint]);
+            this.pipelines.set(key, { pipeline, type: 'compute', resourceScope: resName || null, overrides: { ...pipeOverrides }, shaderKey: compName, _name: key, activeGroups });
+            this.log(`pipeline "${key}": compute ✓ (async) [active groups: ${[...activeGroups].join(',')||'none'}]`,'ok');
+          }).catch(e => this.log(`pipeline "${key}": async compute FAILED: ${e.message}`,'err'));
+          return;
+        }
+        const pipeline = this.device.createComputePipeline(pipelineDesc);
         // Detect which bind groups have bindings actually used by entry points
         // (WGSL compiler optimizes away unused bindings, leaving empty layouts)
         const entryPoint = pNode.attrs.entry || 'main';
@@ -3790,6 +4039,15 @@ ${assignments}
     }
 
     try {
+      if (useAsync) {
+        // Async pipeline creation — non-blocking, doesn't stall GPU
+        this.device.createRenderPipelineAsync(desc).then(newPipeline => {
+          const activeGroups = resScope ? new Set([0]) : this._getActiveBindGroups([vn, fn], [desc.vertex.entryPoint, desc.fragment.entryPoint]);
+          this.pipelines.set(key, {pipeline:newPipeline, type:'render', format, resourceScope: resName || null, sampleCount, _name: key, activeGroups});
+          this.log(`pipeline "${key}": render ✓ (async) [active groups: ${[...activeGroups].join(',')||'none'}]`,'ok');
+        }).catch(e => this.log(`pipeline "${key}": async render FAILED: ${e.message}`,'err'));
+        return;
+      }
       const newPipeline = this.device.createRenderPipeline(desc);
       // Detect which bind groups have bindings actually used by entry points
       const vEntry = desc.vertex.entryPoint;

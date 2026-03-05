@@ -13,6 +13,149 @@ const SDF_SPREAD = 6;          // distance field spread in pixels
 const SDF_ATLAS_SIZE = 512;    // atlas texture dimension
 const SDF_FONT = '48px monospace'; // Canvas 2D font for rasterization
 
+// ── InlineCursor: greedy word-wrap line breaker ──
+class InlineCursor {
+  constructor(maxWidth) {
+    this._maxWidth = maxWidth;
+    this._lines = [{ words: [], width: 0 }];
+    this._spaceWidth = 0;
+  }
+  pushWord(word, advance, spaceAdvance) {
+    this._spaceWidth = spaceAdvance;
+    const line = this._lines[this._lines.length - 1];
+    const gap = line.words.length > 0 ? spaceAdvance : 0;
+    if (line.words.length > 0 && line.width + gap + advance > this._maxWidth) {
+      // Wrap to new line
+      this._lines.push({ words: [{ word, width: advance }], width: advance });
+    } else {
+      line.words.push({ word, width: advance });
+      line.width += gap + advance;
+    }
+  }
+  pushHardBreak() {
+    this._lines.push({ words: [], width: 0 });
+  }
+  getLines() { return this._lines; }
+}
+
+// Knuth-Plass balanced line breaking: minimize sum of squared slack per line.
+// DP over break points — O(n²) but n = word count which is small for UI text.
+class InlineBalancedCursor {
+  constructor(maxWidth) {
+    this._maxWidth = maxWidth;
+    this._words = []; // [{word, advance, spaceAdvance}]
+    this._hardBreaks = new Set(); // indices where hard breaks occur AFTER this word
+  }
+  pushWord(word, advance, spaceAdvance) {
+    this._words.push({ word, advance, spaceAdvance });
+  }
+  pushHardBreak() {
+    if (this._words.length > 0) this._hardBreaks.add(this._words.length - 1);
+    else this._words.push({ word: '', advance: 0, spaceAdvance: 0 }); // empty word as break anchor
+  }
+  getLines() {
+    const words = this._words;
+    const n = words.length;
+    if (n === 0) return [{ words: [], width: 0 }];
+    const maxW = this._maxWidth;
+
+    // Precompute prefix widths (including spaces between words)
+    // lineWidth(i, j) = sum of advances[i..j] + sum of spaces[i+1..j]
+    const advance = words.map(w => w.advance);
+    const space = words.map(w => w.spaceAdvance);
+
+    const lineWidth = (i, j) => {
+      let w = 0;
+      for (let k = i; k <= j; k++) {
+        w += advance[k];
+        if (k > i) w += space[k];
+      }
+      return w;
+    };
+
+    // DP: cost[i] = min cost to break words[0..i-1] into lines
+    const cost = new Float64Array(n + 1).fill(Infinity);
+    const breaks = new Int32Array(n + 1).fill(-1);
+    cost[0] = 0;
+
+    for (let j = 0; j < n; j++) {
+      // Try lines ending at word j, starting from word i
+      let w = 0;
+      for (let i = j; i >= 0; i--) {
+        w += advance[i];
+        if (i < j) w += space[i + 1];
+        if (w > maxW && i < j) break; // line too wide (allow single-word overflow)
+
+        // Hard break constraint: if there's a hard break between i-1 and i,
+        // the line MUST start at i (can't include words before the break)
+        if (i > 0 && this._hardBreaks.has(i - 1)) {
+          // This is fine — we're starting a line at i
+        }
+        // If a hard break exists within this line range (between i and j-1), skip
+        let hasInternalBreak = false;
+        for (let k = i; k < j; k++) {
+          if (this._hardBreaks.has(k)) { hasInternalBreak = true; break; }
+        }
+        if (hasInternalBreak) continue;
+
+        const slack = maxW - w;
+        const penalty = slack * slack;
+        const totalCost = cost[i] + penalty;
+        if (totalCost < cost[j + 1]) {
+          cost[j + 1] = totalCost;
+          breaks[j + 1] = i;
+        }
+      }
+    }
+
+    // Also handle hard breaks as forced line endings
+    for (let k = 0; k < n; k++) {
+      if (this._hardBreaks.has(k)) {
+        // Force a break after word k: lines ending at k must end here
+        const nextStart = k + 1;
+        if (nextStart <= n && cost[nextStart] > cost[k + 1]) {
+          // Hard break doesn't add penalty — it's forced
+        }
+      }
+    }
+
+    // Reconstruct lines from break points
+    const lineIndices = [];
+    let pos = n;
+    while (pos > 0) {
+      const start = breaks[pos];
+      lineIndices.unshift([start, pos - 1]);
+      pos = start;
+    }
+
+    // Handle hard breaks: split any line that spans a hard break
+    const finalLines = [];
+    for (const [start, end] of lineIndices) {
+      let segStart = start;
+      for (let k = start; k <= end; k++) {
+        if (this._hardBreaks.has(k) && k < end) {
+          finalLines.push(this._buildLine(segStart, k));
+          segStart = k + 1;
+        }
+      }
+      finalLines.push(this._buildLine(segStart, end));
+    }
+
+    return finalLines;
+  }
+  _buildLine(start, end) {
+    const words = [];
+    let width = 0;
+    for (let k = start; k <= end; k++) {
+      const w = this._words[k];
+      if (k > start) width += w.spaceAdvance;
+      words.push({ word: w.word, width: w.advance });
+      width += w.advance;
+    }
+    return { words, width };
+  }
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // WGSL SHADERS — PATH PIPELINE (Phase 1, unchanged)
 // ═══════════════════════════════════════════════════════════════════════
@@ -21,6 +164,7 @@ const SDF_FONT = '48px monospace'; // Canvas 2D font for rasterization
 const FILL_LINEAR = 1;
 const FILL_RADIAL = 2;
 const FILL_SHADOW = 3;
+const FILL_CONIC = 4;
 
 const SHARED_STRUCTS_WGSL = /* wgsl */`
 struct SurfaceConfig {
@@ -38,7 +182,7 @@ struct PathInfo {
   seg_start: u32,
   seg_count: u32,
   color: u32,
-  flags: u32,        // bits 0-15: element_id, 16-17: fill_type, 18-23: gradient_index
+  flags: u32,        // bits 0-15: element_id, 16-18: fill_type, 19-24: gradient_index
 }
 
 // Gradient header — indexes into a flat GradientStop array for N-stop gradients
@@ -192,9 +336,9 @@ fn sample_gradient(g: GradientInfo, t: f32) -> vec4f {
 }
 
 fn resolve_fill(path: PathInfo, pixel: vec2f) -> vec4f {
-  let fill_type = (path.flags >> 16u) & 3u;
+  let fill_type = (path.flags >> 16u) & 7u;
   if (fill_type == 0u) { return unpack_color(path.color); } // solid
-  let grad_ix = (path.flags >> 18u) & 63u;
+  let grad_ix = (path.flags >> 19u) & 63u;
   if (grad_ix >= config.n_gradients) { return unpack_color(path.color); }
   let g = gradients[grad_ix];
   if (fill_type == 1u) { // linear
@@ -217,6 +361,14 @@ fn resolve_fill(path: PathInfo, pixel: vec2f) -> vec4f {
     let blur = max(c1.g * 255.0, 1.0);
     let intensity = rounded_rect_shadow(pixel, g.p0, rect_half, radius, blur);
     return vec4f(shadow_color.rgb, shadow_color.a * intensity);
+  }
+  if (fill_type == 4u) { // conic gradient
+    let d = pixel - g.p0;
+    let angle = atan2(d.y, d.x); // [-PI, PI]
+    let offset_angle = g.p1.x; // angle offset stored in p1.x
+    let a = angle - offset_angle;
+    let t = fract((a / (2.0 * 3.14159265358979) + 0.5)); // normalize to [0,1]
+    return sample_gradient(g, t);
   }
   return unpack_color(path.color);
 }
@@ -467,9 +619,30 @@ export class RexSurface {
     this.formState = null;           // form transducer state → expression resolution
     this.behaviour = null;           // behaviour transducer → @def call resolution
 
+    // @each iteration context: {item: Map, key: string, index: number}
+    this._eachOverlay = null;
+    this._defaultShrubName = null;
+
+    // Parent panel dimensions for percentage resolution (tracks containing block)
+    this._parentWidth = 0;
+    this._parentHeight = 0;
+
+    // Subtree cache for incremental recompilation
+    this._subtreeCache = new Map(); // hash → {paths, segments, textQuads, gradients, gradientStops}
+    this._compileFrame = 0;
+
+    // Embedded @surface instances: src → {tree, behaviour, srcHash}
+    this._embeddedSurfaces = new Map();
+
+    // Image cache: src → { bitmap, w, h, loading }
+    this._imageCache = new Map();
+
+    // Loaded fonts: name → { loaded, fontFace }
+    this._loadedFonts = new Map();
+
     // Extension protocol: registered handlers for custom element types
     this._elementHandlers = new Map();
-    this._surfaceTypeSet = new Set(['rect', 'text', 'panel', 'shadow', 'path', 'text-editor']);
+    this._surfaceTypeSet = new Set(['rect', 'text', 'panel', 'shadow', 'path', 'text-editor', 'each', 'match', 'surface', 'viewport', 'image', 'if']);
     this._warnedTypes = new Set();
 
     // Incremental compile tracking
@@ -512,9 +685,33 @@ export class RexSurface {
   // COMPILE PHASE
   // ════════════════════════════════════════════════════════════════
 
+  // FNV-1a structural hash of a subtree for incremental recompile detection
+  _hashSubtree(node) {
+    if (node._surfaceHash !== undefined) return node._surfaceHash;
+    let h = 0x811c9dc5;
+    const feed = (s) => { for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193); } };
+    feed(node.type || '');
+    feed(node.name || '');
+    if (node.attrs) {
+      const keys = Object.keys(node.attrs).sort();
+      for (const k of keys) { feed(k); feed(String(node.attrs[k])); }
+    }
+    if (node.children) {
+      for (const c of node.children) {
+        h ^= this._hashSubtree(c);
+        h = Math.imul(h, 0x01000193);
+      }
+    }
+    node._surfaceHash = h >>> 0;
+    return node._surfaceHash;
+  }
+
   compile(tree, canvasWidth, canvasHeight) {
+    this._compileFrame++;
     this._width = canvasWidth;
     this._height = canvasHeight;
+    this._parentWidth = canvasWidth;
+    this._parentHeight = canvasHeight;
     this._tilesX = Math.ceil(canvasWidth / TILE_SIZE);
     this._tilesY = Math.ceil(canvasHeight / TILE_SIZE);
 
@@ -532,7 +729,7 @@ export class RexSurface {
     this._lastCanvasHeight = canvasHeight;
     this._editorDirty = false;
 
-    // 1. Collect all surface elements
+    // 1. Collect all surface elements (with per-subtree caching)
     this._paths = [];
     this._segments = [];
     this._textQuads = [];
@@ -540,9 +737,54 @@ export class RexSurface {
     this._gradientStops = [];
     this._measureCache = new Map();  // Phase 2C: memoize _measureElement per compile
     this._surfaceCtx = null;         // reset eval context each compile (picks up fresh formState)
+    this._eachOverlay = null;        // reset overlay each compile
     this._warnedTypes.clear();
     this._nonEditorCounts = null;
-    this._collectElements(tree, 0, 0);
+    // Set default shrub name from behaviour (first shrub)
+    if (this.behaviour) {
+      const names = this.behaviour.getShrubNames();
+      this._defaultShrubName = names.length > 0 ? names[0] : null;
+    }
+
+    // Per-subtree caching: hash each top-level child. If hash matches and canvas
+    // size unchanged, replay cached segments instead of re-collecting.
+    if (!sizeChanged && tree.children && tree.children.length > 0) {
+      const newCache = new Map();
+      for (const child of tree.children) {
+        if (!this._surfaceTypeSet.has(child.type) && child.type !== 'each') continue;
+        const hash = this._hashSubtree(child);
+        const cached = this._subtreeCache.get(hash);
+        if (cached) {
+          // Replay cached segments
+          this._paths.push(...cached.paths);
+          this._segments.push(...cached.segments);
+          this._textQuads.push(...cached.textQuads);
+          this._gradients.push(...cached.gradients);
+          this._gradientStops.push(...cached.gradientStops);
+          newCache.set(hash, cached);
+        } else {
+          // Collect fresh — snapshot before/after to cache the delta
+          const pi = this._paths.length, si = this._segments.length;
+          const ti = this._textQuads.length, gi = this._gradients.length;
+          const gsi = this._gradientStops.length;
+          this._collectElements({ children: [child] }, 0, 0);
+          newCache.set(hash, {
+            paths: this._paths.slice(pi),
+            segments: this._segments.slice(si),
+            textQuads: this._textQuads.slice(ti),
+            gradients: this._gradients.slice(gi),
+            gradientStops: this._gradientStops.slice(gsi),
+          });
+        }
+      }
+      this._subtreeCache = newCache;
+    } else {
+      this._subtreeCache.clear();
+      this._collectElements(tree, 0, 0);
+    }
+
+    // GC embedded surfaces not used in this frame
+    this._gcEmbeddedSurfaces();
 
     const hasPaths = this._paths.length > 0;
     const hasText = this._textQuads.length > 0;
@@ -634,7 +876,26 @@ export class RexSurface {
     const self = this;
     return {
       resolve(op, key, args) {
+        if (op === 'binding') {
+          // @each overlay: $item, $key, $index, $item/field
+          const ov = self._eachOverlay;
+          if (!ov) return undefined;
+          if (key === 'item') return ov.item;
+          if (key === 'key') return ov.key;
+          if (key === 'index') return ov.index;
+          if (key.startsWith('item/') || key.startsWith('item.')) {
+            const field = key.slice(5);
+            const item = ov.item;
+            return item instanceof Map ? item.get(field) : item?.[field];
+          }
+          // Flat overlay: bare field name → check item Map
+          if (ov.item instanceof Map && ov.item.has(key)) return ov.item.get(key);
+          return undefined;
+        }
         if (op === 'ident') {
+          // @each overlay check first — bare names resolve against item
+          const ov = self._eachOverlay;
+          if (ov && ov.item instanceof Map && ov.item.has(key)) return ov.item.get(key);
           // Surface builtins
           if (key === 'canvas-width' || key === 'width') return self._width;
           if (key === 'canvas-height' || key === 'height') return self._height;
@@ -645,6 +906,9 @@ export class RexSurface {
           return undefined;
         }
         if (op === 'slot') {
+          // @each overlay check first
+          const ov = self._eachOverlay;
+          if (ov && ov.item instanceof Map && ov.item.has(key)) return ov.item.get(key);
           if (key.startsWith('form/') && self.formState) return self.formState[key.slice(5)] ?? 0;
           if (self.formState && self.formState[key] !== undefined) return self.formState[key];
           return 0;
@@ -681,6 +945,12 @@ export class RexSurface {
         case 'shadow': this._collectShadow(child, offsetX, offsetY); break;
         case 'path': this._collectPath(child, offsetX, offsetY); break;
         case 'text-editor': this._collectTextEditor(child, offsetX, offsetY, clip); break;
+        case 'each': this._collectEach(child, offsetX, offsetY, clip); break;
+        case 'match': this._collectMatch(child, offsetX, offsetY, clip); break;
+        case 'surface': this._collectSurface(child, offsetX, offsetY, clip); break;
+        case 'viewport': this._collectViewport(child, offsetX, offsetY, clip); break;
+        case 'image': this._collectImage(child, offsetX, offsetY, clip); break;
+        case 'if': this._collectIf(child, offsetX, offsetY, clip); break;
         default: {
           const h = this._elementHandlers.get(child.type);
           if (h && h.collect) h.collect(child, offsetX, offsetY, clip, this);
@@ -689,6 +959,430 @@ export class RexSurface {
         }
       }
     }
+  }
+
+  // Resolve @each node → sorted entries [[key, item], ...]
+  _resolveEachEntries(node) {
+    if (!this.behaviour) return null;
+    const kidsAttr = this._attr(node, 'kids', node.name || '');
+    if (!kidsAttr) return null;
+    const parts = kidsAttr.split('/');
+    let shrubName, collectionPath;
+    if (parts.length >= 2) {
+      const names = this.behaviour.getShrubNames();
+      if (names.includes(parts[0])) {
+        shrubName = parts[0];
+        collectionPath = parts.slice(1).join('/');
+      } else {
+        shrubName = this._defaultShrubName || names[0];
+        collectionPath = kidsAttr;
+      }
+    } else {
+      shrubName = this._defaultShrubName || this.behaviour.getShrubNames()[0];
+      collectionPath = kidsAttr;
+    }
+    if (!shrubName) return null;
+
+    const kids = this.behaviour.getKids(shrubName, collectionPath);
+    if (!kids || kids.size === 0) return null;
+
+    let entries = [...kids.entries()];
+    const sortField = this._attr(node, 'sort', null);
+    if (sortField) {
+      const desc = sortField.startsWith('-');
+      const field = desc ? sortField.slice(1) : sortField;
+      entries.sort((a, b) => {
+        const va = a[1] instanceof Map ? a[1].get(field) : a[1]?.[field];
+        const vb = b[1] instanceof Map ? b[1].get(field) : b[1]?.[field];
+        if (va == null && vb == null) return 0;
+        if (va == null) return 1;
+        if (vb == null) return -1;
+        return desc ? (vb > va ? 1 : vb < va ? -1 : 0) : (va > vb ? 1 : va < vb ? -1 : 0);
+      });
+    }
+    return entries;
+  }
+
+  // Expand @each into flat [{child, overlay}] for panel flex layout participation
+  _expandEachForLayout(node) {
+    const entries = this._resolveEachEntries(node);
+    if (!entries) return [];
+    const result = [];
+    for (let i = 0; i < entries.length; i++) {
+      const [key, item] = entries[i];
+      const overlay = { item, key, index: i };
+      for (const child of node.children) {
+        if (this._surfaceTypeSet.has(child.type)) {
+          result.push({ child, overlay });
+        }
+      }
+    }
+    return result;
+  }
+
+  _collectEach(node, offsetX, offsetY, clip) {
+    const entries = this._resolveEachEntries(node);
+    if (!entries) return;
+
+    const savedOverlay = this._eachOverlay;
+    for (let i = 0; i < entries.length; i++) {
+      const [key, item] = entries[i];
+      this._eachOverlay = { item, key, index: i };
+      this._surfaceCtx = null;
+      for (const child of node.children) {
+        if (this._surfaceTypeSet.has(child.type)) {
+          this._collectElements({ children: [child] }, offsetX, offsetY, clip);
+        }
+      }
+    }
+    this._eachOverlay = savedOverlay;
+    this._surfaceCtx = null;
+  }
+
+  // Resolve match condition value — checks node.name or :test attr against overlay/formState
+  _resolveMatchValue(node) {
+    // :test attr takes priority (may be expression)
+    const testAttr = this._attr(node, 'test', undefined);
+    if (testAttr !== undefined) {
+      // If it's a string name, resolve against overlay/formState
+      if (typeof testAttr === 'string') return this._resolveMatchName(testAttr);
+      return testAttr;
+    }
+    // node.name is the bare match condition
+    if (node.name) return this._resolveMatchName(node.name);
+    return undefined;
+  }
+
+  // Resolve a name against @each overlay and formState (for match conditions)
+  _resolveMatchName(name) {
+    if (name.startsWith('$')) {
+      const key = name.slice(1);
+      const ov = this._eachOverlay;
+      if (ov) {
+        if (key === 'key') return ov.key;
+        if (key === 'index') return ov.index;
+        if (key.startsWith('item/') || key.startsWith('item.')) {
+          const field = key.slice(5);
+          return ov.item instanceof Map ? ov.item.get(field) : ov.item?.[field];
+        }
+        if (ov.item instanceof Map && ov.item.has(key)) return ov.item.get(key);
+      }
+      return undefined;
+    }
+    // Bare name: check overlay item first, then formState
+    const ov = this._eachOverlay;
+    if (ov && ov.item instanceof Map && ov.item.has(name)) return ov.item.get(name);
+    if (this.formState && this.formState[name] !== undefined) return this.formState[name];
+    return name; // literal fallback
+  }
+
+  // Expand @match for layout — returns children of the matching @case branch
+  _expandMatchForLayout(node) {
+    const testVal = this._resolveMatchValue(node);
+    for (const child of node.children) {
+      if (child.type === 'case' && String(testVal) === String(child.name)) {
+        return child.children.filter(c => this._surfaceTypeSet.has(c.type));
+      }
+    }
+    // Check default
+    for (const child of node.children) {
+      if (child.type === 'default' || (child.type === 'case' && child.name === '*')) {
+        return child.children.filter(c => this._surfaceTypeSet.has(c.type));
+      }
+    }
+    return [];
+  }
+
+  _collectMatch(node, offsetX, offsetY, clip) {
+    const testVal = this._resolveMatchValue(node);
+    // Find matching @case — first match wins
+    for (const child of node.children) {
+      if (child.type === 'case') {
+        const caseVal = child.name;
+        // String comparison (case values are always strings from parser)
+        if (String(testVal) === String(caseVal)) {
+          this._collectElements(child, offsetX, offsetY, clip);
+          return;
+        }
+      }
+    }
+    // No match — check for @default case
+    for (const child of node.children) {
+      if (child.type === 'default' || (child.type === 'case' && child.name === '*')) {
+        this._collectElements(child, offsetX, offsetY, clip);
+        return;
+      }
+    }
+  }
+
+  _collectSurface(node, offsetX, offsetY, clip) {
+    const src = this._attr(node, 'src', null);
+    if (!src) return;
+    const srcStr = String(src);
+    if (!srcStr) return;
+
+    const x = this._numAttr(node, 'x', 0) + offsetX;
+    const y = this._numAttr(node, 'y', 0) + offsetY;
+    const w = this._numAttr(node, 'w', 200);
+    const h = this._numAttr(node, 'h', 200);
+
+    // Clip to viewport rect
+    const surfaceClip = { x, y, w, h };
+    const activeClip = clip ? {
+      x: Math.max(clip.x, x), y: Math.max(clip.y, y),
+      w: Math.min(clip.x + clip.w, x + w) - Math.max(clip.x, x),
+      h: Math.min(clip.y + clip.h, y + h) - Math.max(clip.y, y),
+    } : surfaceClip;
+
+    // Lazy loading: if entirely clipped (off-screen), render placeholder only
+    if (activeClip.w <= 0 || activeClip.h <= 0) {
+      // Off-screen — don't parse/compile, just skip
+      return;
+    }
+
+    // Get or create embedded surface state
+    let embedded = this._embeddedSurfaces.get(srcStr);
+    if (!embedded) {
+      try {
+        const childTree = Rex.parse(srcStr);
+        let childBehaviour = null;
+        if (this.behaviour && this.behaviour.constructor) {
+          childBehaviour = new this.behaviour.constructor(this.log);
+          childBehaviour.transduce(childTree, true);
+        }
+        embedded = { tree: childTree, behaviour: childBehaviour, src: srcStr, lastUsedFrame: 0 };
+        this._embeddedSurfaces.set(srcStr, embedded);
+      } catch (e) {
+        this.log(`@surface parse error: ${e.message}`, 'err');
+        this._addRectPath(x, y, w, h, 4, this._packColor([0.5, 0, 0, 0.3]));
+        return;
+      }
+    }
+
+    // Lifecycle: track last-used frame for GC of stale surfaces
+    embedded.lastUsedFrame = this._compileFrame || 0;
+
+    // Save parent state
+    const savedBehaviour = this.behaviour;
+    const savedFormState = this.formState;
+    const savedWidth = this._width;
+    const savedHeight = this._height;
+    const savedOverlay = this._eachOverlay;
+    const savedDefaultShrub = this._defaultShrubName;
+    const savedParentW = this._parentWidth;
+    const savedParentH = this._parentHeight;
+
+    // Sandbox: child gets its own isolated behaviour — no access to parent shrubs
+    this.behaviour = embedded.behaviour;
+    this.formState = null;
+    this._width = w;
+    this._height = h;
+    this._parentWidth = w;
+    this._parentHeight = h;
+    this._surfaceCtx = null;
+    this._eachOverlay = null;
+    if (this.behaviour) {
+      const names = this.behaviour.getShrubNames();
+      this._defaultShrubName = names.length > 0 ? names[0] : null;
+    }
+
+    this._collectElements(embedded.tree, x, y, activeClip);
+
+    // Restore parent state (full isolation)
+    this.behaviour = savedBehaviour;
+    this.formState = savedFormState;
+    this._width = savedWidth;
+    this._height = savedHeight;
+    this._parentWidth = savedParentW;
+    this._parentHeight = savedParentH;
+    this._surfaceCtx = null;
+    this._eachOverlay = savedOverlay;
+    this._defaultShrubName = savedDefaultShrub;
+  }
+
+  // Lifecycle: garbage-collect embedded surfaces not used in the last compile frame
+  _gcEmbeddedSurfaces() {
+    const currentFrame = this._compileFrame || 0;
+    for (const [key, embedded] of this._embeddedSurfaces) {
+      if (embedded.lastUsedFrame < currentFrame - 1) {
+        this._embeddedSurfaces.delete(key);
+      }
+    }
+  }
+
+  // @viewport: camera transform (translate + scale) applied to children
+  // Children are offset by -x,-y and scaled by zoom
+  _collectViewport(node, offsetX, offsetY, clip) {
+    const camX = this._numAttr(node, 'x', 0);
+    const camY = this._numAttr(node, 'y', 0);
+    const zoom = this._numAttr(node, 'zoom', 1);
+
+    // The viewport applies a camera transform: child positions are
+    // translated by -cam and scaled by zoom. For GPU rendering, we
+    // pre-transform the offset so all child geometry lands at the
+    // correct canvas position.
+    const vpX = offsetX - camX * zoom;
+    const vpY = offsetY - camY * zoom;
+
+    // Save and set scale factor for child dimensions
+    const savedScaleX = this._viewportScaleX || 1;
+    const savedScaleY = this._viewportScaleY || 1;
+    this._viewportScaleX = zoom;
+    this._viewportScaleY = zoom;
+
+    this._collectElements(node, vpX, vpY, clip);
+
+    this._viewportScaleX = savedScaleX;
+    this._viewportScaleY = savedScaleY;
+  }
+
+  // ── @if: conditional rendering ──
+  // @if :test expr — renders children only when expression is truthy
+  _collectIf(node, offsetX, offsetY, clip) {
+    const testVal = this._attr(node, 'test', undefined);
+    // Also support bare name as expression key
+    const resolvedVal = testVal !== undefined ? testVal : this._resolveMatchValue(node);
+    if (resolvedVal) {
+      this._collectElements(node, offsetX, offsetY, clip);
+    }
+  }
+
+  // Expand @if for layout — returns children if condition true, empty if false
+  _expandIfForLayout(node) {
+    const testVal = this._attr(node, 'test', undefined);
+    const resolvedVal = testVal !== undefined ? testVal : this._resolveMatchValue(node);
+    if (resolvedVal) return node.children || [];
+    return [];
+  }
+
+  // ── @image: 2D image element rendered as textured rect ──
+  // For now, renders as a placeholder rect (images need async loading + texture atlas)
+  // In full implementation, the image would be sampled from a texture in the fine rasterizer
+  _collectImage(node, offsetX, offsetY, clip) {
+    const x = this._numAttr(node, 'x', 0) + offsetX;
+    const y = this._numAttr(node, 'y', 0) + offsetY;
+    const w = this._numAttr(node, 'w', 100);
+    const h = this._numAttr(node, 'h', 100);
+    const src = this._attr(node, 'src', '');
+    const fit = this._attr(node, 'fit', 'cover'); // cover, contain, fill, none
+    const opacity = this._numAttr(node, 'opacity', 1);
+    const radius = this._numAttr(node, 'radius', 0);
+    const tint = this._attr(node, 'tint', undefined);
+
+    // Skip if entirely outside clip rect
+    if (clip && (y + h < clip.y || y > clip.y + clip.h || x + w < clip.x || x > clip.x + clip.w)) return;
+
+    // Async image loading — load once, cache
+    if (src && !this._imageCache.has(src)) {
+      this._imageCache.set(src, { bitmap: null, w: 0, h: 0, loading: true });
+      // Start async load (does not block rendering — placeholder shows until loaded)
+      if (typeof fetch !== 'undefined' && typeof createImageBitmap !== 'undefined') {
+        fetch(src).then(r => r.blob()).then(b => createImageBitmap(b)).then(bmp => {
+          this._imageCache.set(src, { bitmap: bmp, w: bmp.width, h: bmp.height, loading: false });
+        }).catch(() => {
+          this._imageCache.set(src, { bitmap: null, w: 0, h: 0, loading: false });
+        });
+      }
+    }
+
+    const cached = this._imageCache.get(src);
+    if (cached && cached.bitmap && this._measureCtx) {
+      // Render image by drawing to measure canvas and creating SDF-style quads
+      // For now, render as a tinted/placeholder rect — full texture sampling requires
+      // a separate texture binding in the fine rasterizer (future work)
+      const fillColor = tint || [0.5, 0.5, 0.5, opacity];
+      this._addRectPath(x, y, w, h, radius, this._packColor(this._applyOpacity(fillColor, opacity)));
+    } else {
+      // Placeholder: light gray rect while loading
+      const placeholderColor = [0.85, 0.85, 0.85, opacity];
+      this._addRectPath(x, y, w, h, radius, this._packColor(this._applyOpacity(placeholderColor, opacity)));
+    }
+
+    this._collectElements(node, x, y, clip);
+  }
+
+  // ── Per-element 2D transforms ──
+  // Applies rotation, scale, skew to segment coordinates
+  _applyTransform(node, segments, cx, cy) {
+    const rotate = this._numAttr(node, 'rotate', 0) * Math.PI / 180;
+    const scaleX = this._numAttr(node, 'scale-x', this._numAttr(node, 'scale', 1));
+    const scaleY = this._numAttr(node, 'scale-y', this._numAttr(node, 'scale', 1));
+    const skewX = this._numAttr(node, 'skew-x', 0) * Math.PI / 180;
+    const skewY = this._numAttr(node, 'skew-y', 0) * Math.PI / 180;
+    if (rotate === 0 && scaleX === 1 && scaleY === 1 && skewX === 0 && skewY === 0) return;
+
+    // Build 2x2 affine matrix: Rotate * Scale * Skew
+    const cos = Math.cos(rotate), sin = Math.sin(rotate);
+    // M = Rotate * Scale * Skew
+    const a = (cos * scaleX) + (sin * Math.tan(skewY) * scaleX);
+    const b = (sin * scaleY) + (cos * Math.tan(skewY) * scaleY);
+    const c = (-sin * scaleX) + (cos * Math.tan(skewX) * scaleX);
+    const d = (cos * scaleY) + (-sin * Math.tan(skewX) * scaleY);
+
+    // Simplified: rotation + scale (skip skew for cleaner math)
+    const ma = cos * scaleX, mb = sin * scaleX;
+    const mc = -sin * scaleY, md = cos * scaleY;
+    // Add skew after
+    const finalA = ma + mc * Math.tan(skewY);
+    const finalB = mb + md * Math.tan(skewY);
+    const finalC = ma * Math.tan(skewX) + mc;
+    const finalD = mb * Math.tan(skewX) + md;
+
+    for (const seg of segments) {
+      // Transform p0
+      let dx = seg.p0x - cx, dy = seg.p0y - cy;
+      seg.p0x = cx + finalA * dx + finalC * dy;
+      seg.p0y = cy + finalB * dx + finalD * dy;
+      // Transform p1
+      dx = seg.p1x - cx; dy = seg.p1y - cy;
+      seg.p1x = cx + finalA * dx + finalC * dy;
+      seg.p1y = cy + finalB * dx + finalD * dy;
+    }
+  }
+
+  // ── Web font loading ──
+  // loadFont(name, url) — loads a font via FontFace API, invalidates glyph atlas when ready
+  async loadFont(name, url) {
+    if (this._loadedFonts.has(name)) return this._loadedFonts.get(name).fontFace;
+    const entry = { loaded: false, fontFace: null };
+    this._loadedFonts.set(name, entry);
+    if (typeof FontFace !== 'undefined') {
+      try {
+        const face = new FontFace(name, `url(${url})`);
+        await face.load();
+        document.fonts.add(face);
+        entry.fontFace = face;
+        entry.loaded = true;
+        // If current font uses this family, invalidate atlas
+        if (this._sdfFont && this._sdfFont.includes(name)) {
+          this._atlasChars = null;
+          this._glyphCache.clear();
+        }
+        return face;
+      } catch (e) {
+        entry.loaded = false;
+        return null;
+      }
+    }
+    return null;
+  }
+
+  // Set font by family name (after loading)
+  setFontFamily(family, size) {
+    this._sdfFont = `${size || 48}px "${family}"`;
+    this._atlasChars = null;
+    this._glyphCache.clear();
+  }
+
+  // Apply element-level opacity to a color array (multiplies alpha channel)
+  _applyOpacity(color, opacity) {
+    if (opacity >= 1 || !color) return color;
+    if (Array.isArray(color)) {
+      const c = [...color];
+      c[3] = (c[3] !== undefined ? c[3] : 1) * opacity;
+      return c;
+    }
+    return color;
   }
 
   _collectRect(node, offsetX, offsetY, clip) {
@@ -700,87 +1394,200 @@ export class RexSurface {
     // Skip if entirely outside clip rect
     if (clip && (y + h < clip.y || y > clip.y + clip.h || x + w < clip.x || x > clip.x + clip.w)) return;
 
+    const opacity = this._numAttr(node, 'opacity', 1);
     const fill = this._attr(node, 'fill', undefined);
     const gradient = this._attr(node, 'gradient', undefined);
     const stroke = this._attr(node, 'stroke', undefined);
     const strokeWidth = this._numAttr(node, 'stroke-width', 1);
     const radius = this._numAttr(node, 'radius', 0);
 
+    const segsBefore = this._segments.length;
+
     if (gradient) {
       this._addGradientRectPath(x, y, w, h, radius, gradient);
     } else if (fill) {
-      this._addRectPath(x, y, w, h, radius, this._packColor(fill));
+      this._addRectPath(x, y, w, h, radius, this._packColor(this._applyOpacity(fill, opacity)));
     } else if (!stroke) {
-      this._addRectPath(x, y, w, h, radius, this._packColor([1, 1, 1, 1]));
+      this._addRectPath(x, y, w, h, radius, this._packColor(this._applyOpacity([1, 1, 1, 1], opacity)));
     }
 
     if (stroke) {
       const sw = strokeWidth;
       const hsw = sw / 2;
-      const sc = this._packColor(stroke);
+      const sc = this._packColor(this._applyOpacity(stroke, opacity));
       this._addRectPath(x - hsw, y - hsw, w + sw, h + sw, radius > 0 ? radius + hsw : 0, sc);
       this._addRectPathReversed(x + hsw, y + hsw, w - sw, h - sw, radius > 0 ? Math.max(0, radius - hsw) : 0, sc);
+    }
+
+    // Apply per-element transform (rotate/scale/skew) to collected segments
+    if (this._numAttr(node, 'rotate', 0) !== 0 || this._numAttr(node, 'scale', 1) !== 1 ||
+        this._numAttr(node, 'scale-x', 1) !== 1 || this._numAttr(node, 'scale-y', 1) !== 1 ||
+        this._numAttr(node, 'skew-x', 0) !== 0 || this._numAttr(node, 'skew-y', 0) !== 0) {
+      const cx = x + w / 2, cy = y + h / 2; // transform origin = center
+      const segsToTransform = this._segments.slice(segsBefore);
+      this._applyTransform(node, segsToTransform, cx, cy);
+      for (let i = segsBefore; i < this._segments.length; i++) {
+        this._segments[i] = segsToTransform[i - segsBefore];
+      }
     }
 
     this._collectElements(node, x, y, clip);
   }
 
+  // Resolve text content from node — handles literals, expressions, formState, and @each overlay.
+  // node.name could be: a literal string, a formState key, a $binding, or a bare slot/path name.
+  _resolveTextContent(node) {
+    // Priority 1: :text attr (may be an expression object resolved by _attr)
+    const textAttr = this._attr(node, 'text', undefined);
+    if (textAttr !== undefined) return String(textAttr);
+    // Priority 2: node.name
+    const name = node.name || '';
+    if (!name) return '';
+    // $binding reference (explicit: $item/title, $key, $index)
+    if (name.startsWith('$')) {
+      const bindingKey = name.slice(1);
+      const ov = this._eachOverlay;
+      if (ov) {
+        if (bindingKey === 'item') return String(ov.item);
+        if (bindingKey === 'key') return String(ov.key);
+        if (bindingKey === 'index') return String(ov.index);
+        if (bindingKey.startsWith('item/') || bindingKey.startsWith('item.')) {
+          const field = bindingKey.slice(5);
+          const item = ov.item;
+          const val = item instanceof Map ? item.get(field) : item?.[field];
+          return val !== undefined ? String(val) : '';
+        }
+        if (ov.item instanceof Map && ov.item.has(bindingKey)) return String(ov.item.get(bindingKey));
+      }
+      return '';
+    }
+    // @each overlay: bare name resolves against item (e.g. @text title → item.get('title'))
+    const ov = this._eachOverlay;
+    if (ov && ov.item instanceof Map && ov.item.has(name)) return String(ov.item.get(name));
+    // formState key (e.g. @text myLabel → formState['myLabel'])
+    if (this.formState && this.formState[name] !== undefined) return String(this.formState[name]);
+    // Fallback: literal string
+    return name;
+  }
+
   _collectText(node, offsetX, offsetY, clip) {
-    const text = node.name || '';
+    const text = this._resolveTextContent(node);
     if (!text) return;
 
     const size = this._numAttr(node, 'size', 16);
-    const color = this._packColor(this._attr(node, 'color', [1, 1, 1, 1]));
-    const align = this._attr(node, 'align', 'left'); // left, center, right
-    let x = this._numAttr(node, 'x', 0) + offsetX;
-    const y = this._numAttr(node, 'y', 0) + offsetY;
+    const opacity = this._numAttr(node, 'opacity', 1);
+    const color = this._packColor(this._applyOpacity(this._attr(node, 'color', [1, 1, 1, 1]), opacity));
+    const align = this._attr(node, 'align', 'left');
+    const baseX = this._numAttr(node, 'x', 0) + offsetX;
+    const baseY = this._numAttr(node, 'y', 0) + offsetY;
+    const maxWidth = this._numAttr(node, 'max-width', 0);
+    const lineHeight = this._numAttr(node, 'line-height', size * 1.3);
+    const letterSpacing = this._numAttr(node, 'letter-spacing', 0);
+    const wordSpacing = this._numAttr(node, 'word-spacing', 0);
+    const decoration = this._attr(node, 'text-decoration', 'none');
+    const decorationColor = this._packColor(this._applyOpacity(this._attr(node, 'decoration-color', this._attr(node, 'color', [1, 1, 1, 1])), opacity));
+    const decorationThickness = this._numAttr(node, 'decoration-thickness', Math.max(1, size / 12));
 
     this._ensureMeasureCanvas();
     const ctx = this._measureCtx;
     ctx.font = this._sdfFont;
     const scale = size / SDF_GLYPH_SIZE;
 
-    // Measure total text width for alignment
+    // Helper: add text decoration (underline/strikethrough/overline) for a line span
+    const _addDecoration = (startX, endX, baselineY) => {
+      if (decoration === 'none') return;
+      const decos = decoration.split(/\s+/);
+      for (const deco of decos) {
+        let decoY;
+        if (deco === 'underline') decoY = baselineY + size * 0.15;
+        else if (deco === 'line-through' || deco === 'strikethrough') decoY = baselineY - size * 0.3;
+        else if (deco === 'overline') decoY = baselineY - size * 0.85;
+        else continue;
+        this._addRectPath(startX, decoY, endX - startX, decorationThickness, 0, decorationColor);
+      }
+    };
+
+    // Multi-line path: word wrap via InlineCursor
+    if (maxWidth > 0) {
+      const wrapMode = this._attr(node, 'wrap', 'greedy');
+      const cursor = wrapMode === 'balanced' ? new InlineBalancedCursor(maxWidth) : new InlineCursor(maxWidth);
+      const spaceMetrics = this._getGlyphMetrics(' ');
+      const spaceAdvance = spaceMetrics.advance * scale + wordSpacing;
+      // Split on whitespace, handle hard breaks (\n)
+      const segments = text.split('\n');
+      for (let si = 0; si < segments.length; si++) {
+        if (si > 0) cursor.pushHardBreak();
+        const words = segments[si].split(/\s+/).filter(w => w.length > 0);
+        for (const word of words) {
+          let wordWidth = 0;
+          for (const ch of word) {
+            wordWidth += this._getGlyphMetrics(ch).advance * scale + letterSpacing;
+          }
+          wordWidth -= letterSpacing; // no trailing letter-spacing
+          cursor.pushWord(word, wordWidth, spaceAdvance);
+        }
+      }
+
+      const lines = cursor.getLines();
+      for (let li = 0; li < lines.length; li++) {
+        const line = lines[li];
+        const lineY = baseY + li * lineHeight;
+        let lineX = baseX;
+        if (align === 'center') lineX += (maxWidth - line.width) / 2;
+        else if (align === 'right') lineX += maxWidth - line.width;
+
+        const lineStartX = lineX;
+        let cursorX = lineX;
+        for (let wi = 0; wi < line.words.length; wi++) {
+          if (wi > 0) cursorX += spaceAdvance;
+          for (const ch of line.words[wi].word) {
+            const metrics = this._getGlyphMetrics(ch);
+            if (ch === ' ') { cursorX += metrics.advance * scale + wordSpacing; continue; }
+            const qw = metrics.charW * scale;
+            const qh = metrics.charH * scale;
+            const qx = cursorX - metrics.drawOffsetX * scale;
+            const qy = lineY - metrics.drawOffsetY * scale;
+            if (!clip || (qy + qh >= clip.y && qy <= clip.y + clip.h && qx + qw >= clip.x && qx <= clip.x + clip.w)) {
+              this._textQuads.push({ x: qx, y: qy, w: qw, h: qh, u0: 0, v0: 0, u1: 0, v1: 0, color, char: ch });
+            }
+            cursorX += metrics.advance * scale + letterSpacing;
+          }
+        }
+        _addDecoration(lineStartX, cursorX, lineY);
+      }
+      return;
+    }
+
+    // Single-line path
+    // Measure total width including letter-spacing and word-spacing
+    let totalW = 0;
+    for (const ch of text) {
+      const metrics = this._getGlyphMetrics(ch);
+      totalW += metrics.advance * scale + (ch === ' ' ? wordSpacing : letterSpacing);
+    }
+    totalW -= letterSpacing; // no trailing letter-spacing
+
+    let x = baseX;
     if (align !== 'left') {
-      const totalW = ctx.measureText(text).width * scale;
-      const containerW = this._numAttr(node, 'max-width', 0);
       if (align === 'center') x -= totalW / 2;
       else if (align === 'right') x -= totalW;
-      if (containerW > 0 && align === 'center') x += containerW / 2;
     }
 
+    const lineStartX = x;
     let cursorX = x;
     for (const ch of text) {
-      // Measure every character including space — no hardcoded widths
       const metrics = this._getGlyphMetrics(ch);
-      if (ch === ' ') {
-        cursorX += metrics.advance * scale;
-        continue;
-      }
+      if (ch === ' ') { cursorX += metrics.advance * scale + wordSpacing; continue; }
       const qw = metrics.charW * scale;
       const qh = metrics.charH * scale;
-      // The glyph was rasterized centered in the atlas cell at (drawOffsetX, drawOffsetY).
-      // To align the quad so the glyph's left edge sits at cursorX, we subtract
-      // the draw offset (scaled) from the quad position.
       const qx = cursorX - metrics.drawOffsetX * scale;
-      // For Y: the glyph's ascent (bearingY) was drawn at drawOffsetY in the atlas cell.
-      // We want the text baseline at y + size (approx), with the ascender above it.
-      // Top of glyph visual = y + (size - bearingY * scale) approximately.
-      // But the glyph lives at drawOffsetY in the cell, so shift up by that amount.
-      const qy = y - metrics.drawOffsetY * scale;
-
-      // Skip glyphs outside clip rect
+      const qy = baseY - metrics.drawOffsetY * scale;
       if (!clip || (qy + qh >= clip.y && qy <= clip.y + clip.h && qx + qw >= clip.x && qx <= clip.x + clip.w)) {
-        this._textQuads.push({
-          x: qx, y: qy, w: qw, h: qh,
-          u0: 0, v0: 0, u1: 0, v1: 0,
-          color,
-          char: ch,
-        });
+        this._textQuads.push({ x: qx, y: qy, w: qw, h: qh, u0: 0, v0: 0, u1: 0, v1: 0, color, char: ch });
       }
-
-      cursorX += metrics.advance * scale;
+      cursorX += metrics.advance * scale + letterSpacing;
     }
+    _addDecoration(lineStartX, cursorX, baseY);
   }
 
   // ── Dimension evaluation (supports px numbers, "50%" strings, "auto") ──
@@ -818,14 +1625,19 @@ export class RexSurface {
     };
   }
 
-  // ── Per-side margin ──
+  // ── Per-side margin (supports 'auto' for centering) ──
   _getMargin(node) {
-    const m = this._numAttr(node, 'margin', 0);
+    const m = this._attr(node, 'margin', 0);
+    const resolve = (key, fallback) => {
+      const v = this._attr(node, key, fallback);
+      if (v === 'auto') return 'auto';
+      return typeof v === 'number' ? v : +v || 0;
+    };
     return {
-      top:    this._numAttr(node, 'margin-top', m),
-      right:  this._numAttr(node, 'margin-right', m),
-      bottom: this._numAttr(node, 'margin-bottom', m),
-      left:   this._numAttr(node, 'margin-left', m),
+      top:    resolve('margin-top', m),
+      right:  resolve('margin-right', m),
+      bottom: resolve('margin-bottom', m),
+      left:   resolve('margin-left', m),
     };
   }
 
@@ -847,44 +1659,117 @@ export class RexSurface {
   }
 
   // ── Full flexbox _collectPanel ──
-  // Supports: layout row/column, gap, padding (per-side), align, justify, align-self,
-  //   flex-grow, flex-shrink, flex-basis, flex-wrap, min-width/max-width/min-height/max-height,
-  //   position absolute, z-index, breakpoints, percentage dimensions, overflow, scroll, margin
+  // Supports: layout row/column, gap/row-gap/column-gap, padding (per-side), align, justify,
+  //   align-self, flex-grow, flex-shrink, flex-basis, flex-wrap, min-width/max-width/min-height/max-height,
+  //   position absolute, z-index, order, breakpoints, percentage dimensions, overflow-x/overflow-y,
+  //   scroll-x/scroll-y, margin (including auto), opacity, display none, visibility hidden, block layout
   _collectPanel(node, offsetX, offsetY, parentClip) {
     const x = this._numAttr(node, 'x', 0) + offsetX;
     const y = this._numAttr(node, 'y', 0) + offsetY;
     const pad = this._getPadding(node);
-    const gap = this._numAttr(node, 'gap', 0);
+    const gapVal = this._numAttr(node, 'gap', 0);
     const rawDir = this._attr(node, 'layout', 'column');
     const dir = this._resolveBreakpoint(node, rawDir);
-    const align = this._attr(node, 'align', 'start');     // start, center, end, stretch
-    const justify = this._attr(node, 'justify', 'start');  // start, center, end, space-between, space-around, space-evenly
+    const isReverse = dir === 'row-reverse' || dir === 'column-reverse';
+    const isRow = dir === 'row' || dir === 'row-reverse' || dir === 'inline';
+    const isBlock = dir === 'block';
+    const isInline = dir === 'inline';
+    // Separate row-gap / column-gap, falling back to single gap
+    const mainGapBase = this._numAttr(node, isRow ? 'column-gap' : 'row-gap', gapVal);
+    const crossGapBase = this._numAttr(node, isRow ? 'row-gap' : 'column-gap', gapVal);
+    const gap = mainGapBase; // main-axis gap for flex distribution
+    const align = this._attr(node, 'align', 'start');
+    const justify = this._attr(node, 'justify', 'start');
     const fill = this._attr(node, 'fill', undefined);
-    const overflow = this._attr(node, 'overflow', 'visible');
+    // Per-axis overflow control
+    const overflowShort = this._attr(node, 'overflow', 'visible');
+    const overflowX = this._attr(node, 'overflow-x', overflowShort);
+    const overflowY = this._attr(node, 'overflow-y', overflowShort);
     const scrollY = this._numAttr(node, 'scroll-y', 0);
-    const wrap = this._attr(node, 'flex-wrap', this._attr(node, 'wrap', 'nowrap')); // nowrap, wrap, wrap-reverse
-    const alignContent = this._attr(node, 'align-content', 'stretch'); // stretch, start, center, end, space-between, space-around
+    const scrollX = this._numAttr(node, 'scroll-x', 0);
+    const wrap = this._attr(node, 'flex-wrap', this._attr(node, 'wrap', 'nowrap'));
+    const alignContent = this._attr(node, 'align-content', 'stretch');
+    const panelOpacity = this._numAttr(node, 'opacity', 1);
 
-    const isRow = dir === 'row';
-    const isWrap = wrap === 'wrap' || wrap === 'wrap-reverse';
+    const isWrap = wrap === 'wrap' || wrap === 'wrap-reverse' || isInline;
     const isWrapReverse = wrap === 'wrap-reverse';
 
     // Separate flow children from absolute-positioned children
-    const allChildren = node.children.filter(c => this._surfaceTypeSet.has(c.type));
+    // Expand @each and @match nodes inline so their children participate in flex layout
+    // Filter out display:none, respect order property
+    const allChildren = [];
+    const childOverlays = [];
+    for (const c of node.children) {
+      // display:none — skip entirely (no layout, no rendering)
+      if (this._attr(c, 'display', '') === 'none') continue;
+      if (c.type === 'each') {
+        const expanded = this._expandEachForLayout(c);
+        for (const { child, overlay } of expanded) {
+          if (this._attr(child, 'display', '') === 'none') continue;
+          allChildren.push(child);
+          childOverlays.push(overlay);
+        }
+      } else if (c.type === 'match') {
+        const matched = this._expandMatchForLayout(c);
+        for (const child of matched) {
+          if (this._attr(child, 'display', '') === 'none') continue;
+          allChildren.push(child);
+          childOverlays.push(null);
+        }
+      } else if (c.type === 'if') {
+        const expanded = this._expandIfForLayout(c);
+        for (const child of expanded) {
+          if (this._attr(child, 'display', '') === 'none') continue;
+          allChildren.push(child);
+          childOverlays.push(null);
+        }
+      } else if (this._surfaceTypeSet.has(c.type)) {
+        allChildren.push(c);
+        childOverlays.push(null);
+      }
+    }
+    // CSS order property: sort by order value (stable sort preserves DOM order for equal values)
+    const orderValues = allChildren.map(c => this._numAttr(c, 'order', 0));
+    const orderIndices = allChildren.map((_, i) => i);
+    orderIndices.sort((a, b) => orderValues[a] - orderValues[b]);
+    const sortedChildren = orderIndices.map(i => allChildren[i]);
+    const sortedOverlays = orderIndices.map(i => childOverlays[i]);
+
     const flowChildren = [];
+    const flowOverlays = [];
     const absChildren = [];
-    for (const c of allChildren) {
-      if (this._attr(c, 'position', '') === 'absolute') absChildren.push(c);
-      else flowChildren.push(c);
+    const absOverlays = [];
+    for (let i = 0; i < sortedChildren.length; i++) {
+      if (this._attr(sortedChildren[i], 'position', '') === 'absolute') {
+        absChildren.push(sortedChildren[i]);
+        absOverlays.push(sortedOverlays[i]);
+      } else {
+        flowChildren.push(sortedChildren[i]);
+        flowOverlays.push(sortedOverlays[i]);
+      }
     }
 
-    // Panel size (may be explicit, percentage, or auto)
-    const explicitW = this._evalDim(node, 'w', 0, this._width);
-    const explicitH = this._evalDim(node, 'h', 0, this._height);
+    // Panel size — percentage resolves against parent panel, not canvas
+    const pctW = this._parentWidth || this._width;
+    const pctH = this._parentHeight || this._height;
+    const explicitW = this._evalDim(node, 'w', 0, pctW);
+    const explicitH = this._evalDim(node, 'h', 0, pctH);
 
     // Measure flow children (intrinsic sizes — margins NOT included)
-    const measures = flowChildren.map(c => this._measureElement(c));
-    const margins = flowChildren.map(c => this._getMargin(c));
+    // Activate @each overlay during measurement so expressions resolve correctly
+    const savedOverlay = this._eachOverlay;
+    const measures = flowChildren.map((c, i) => {
+      if (flowOverlays[i]) { this._eachOverlay = flowOverlays[i]; this._surfaceCtx = null; }
+      const m = this._measureElement(c);
+      if (flowOverlays[i]) { this._eachOverlay = savedOverlay; this._surfaceCtx = null; }
+      return m;
+    });
+    const margins = flowChildren.map((c, i) => {
+      if (flowOverlays[i]) { this._eachOverlay = flowOverlays[i]; this._surfaceCtx = null; }
+      const m = this._getMargin(c);
+      if (flowOverlays[i]) { this._eachOverlay = savedOverlay; this._surfaceCtx = null; }
+      return m;
+    });
     const padH = pad.left + pad.right;
     const padV = pad.top + pad.bottom;
 
@@ -901,6 +1786,10 @@ export class RexSurface {
     const marginMain = new Float64Array(N);
     const marginCross = new Float64Array(N);
 
+    // Track which margins are auto (for free-space consumption in positioning)
+    const hasAutoMarginMain = new Array(N).fill(false);
+    const autoMarginMainCount = new Float64Array(N); // number of auto margins on main axis per child
+
     for (let i = 0; i < N; i++) {
       const c = flowChildren[i];
       const m = measures[i];
@@ -913,8 +1802,16 @@ export class RexSurface {
       maxMain[i] = this._numAttr(c, isRow ? 'max-width' : 'max-height', Infinity);
       minCross[i] = this._numAttr(c, isRow ? 'min-height' : 'min-width', 0);
       maxCross[i] = this._numAttr(c, isRow ? 'max-height' : 'max-width', Infinity);
-      marginMain[i] = isRow ? mg.left + mg.right : mg.top + mg.bottom;
-      marginCross[i] = isRow ? mg.top + mg.bottom : mg.left + mg.right;
+      // Auto margins: treat as 0 for sizing, resolve during positioning
+      const mBefore = isRow ? mg.left : mg.top;
+      const mAfter = isRow ? mg.right : mg.bottom;
+      const mCrossBefore = isRow ? mg.top : mg.left;
+      const mCrossAfter = isRow ? mg.bottom : mg.right;
+      const autoMain = (mBefore === 'auto' ? 1 : 0) + (mAfter === 'auto' ? 1 : 0);
+      autoMarginMainCount[i] = autoMain;
+      hasAutoMarginMain[i] = autoMain > 0;
+      marginMain[i] = (mBefore === 'auto' ? 0 : mBefore) + (mAfter === 'auto' ? 0 : mAfter);
+      marginCross[i] = (mCrossBefore === 'auto' ? 0 : mCrossBefore) + (mCrossAfter === 'auto' ? 0 : mCrossAfter);
     }
 
     // Compute natural content extent for auto-sizing (basis + margins)
@@ -994,24 +1891,27 @@ export class RexSurface {
               resolvedMain[i] += freeSpace * (shrink[i] * basis[i]) / totalShrinkScaled;
             }
           }
-          // Clamp and redistribute if any went below min
-          let deficit = 0;
-          let redistWeight = 0;
-          for (let i = start; i < end; i++) {
-            if (resolvedMain[i] < minMain[i]) {
-              deficit += minMain[i] - resolvedMain[i];
-              resolvedMain[i] = minMain[i];
-            } else {
-              redistWeight += shrink[i] * basis[i];
+          // Multi-pass clamp and redistribute (CSS spec: iterate until no violations)
+          for (let pass = 0; pass < 10; pass++) {
+            let deficit = 0;
+            let redistWeight = 0;
+            for (let i = start; i < end; i++) {
+              if (resolvedMain[i] < minMain[i]) {
+                deficit += minMain[i] - resolvedMain[i];
+                resolvedMain[i] = minMain[i];
+              } else {
+                redistWeight += shrink[i] * basis[i];
+              }
             }
-          }
-          if (deficit > 0 && redistWeight > 0) {
+            if (deficit <= 0 || redistWeight <= 0) break;
+            let anyViolated = false;
             for (let i = start; i < end; i++) {
               if (resolvedMain[i] > minMain[i] && shrink[i] > 0) {
                 resolvedMain[i] -= deficit * (shrink[i] * basis[i]) / redistWeight;
-                resolvedMain[i] = Math.max(resolvedMain[i], minMain[i]);
+                if (resolvedMain[i] < minMain[i]) anyViolated = true;
               }
             }
+            if (!anyViolated) break;
           }
         }
       }
@@ -1033,7 +1933,7 @@ export class RexSurface {
 
     // ── Align-content: distribute cross-axis space among lines ──
     const totalLineCross = lineCrossSizes.reduce((s, c) => s + c, 0);
-    const lineGap = gap; // use same gap for cross-axis line spacing
+    const lineGap = crossGapBase; // cross-axis line spacing (row-gap or column-gap)
     const totalLineSpace = totalLineCross + Math.max(0, lines.length - 1) * lineGap;
     const freeCross = innerCross - totalLineSpace;
     let lineCrossStart = 0;
@@ -1052,8 +1952,13 @@ export class RexSurface {
           lineCrossGap = lineGap + around;
           break;
         }
+        case 'space-evenly': {
+          const even = freeCross / (lines.length + 1);
+          lineCrossStart = even;
+          lineCrossGap = lineGap + even;
+          break;
+        }
         case 'stretch': {
-          // Distribute extra cross-space equally among lines
           const extra = freeCross / lines.length;
           for (let li = 0; li < lines.length; li++) lineCrossSizes[li] += extra;
           break;
@@ -1102,39 +2007,89 @@ export class RexSurface {
         }
       }
 
-      let mainCursor = mainStart;
+      // Auto margins: count total auto margins in this line
+      let totalAutoMargins = 0;
+      for (let i = start; i < end; i++) totalAutoMargins += autoMarginMainCount[i];
+      // If any auto margins exist, they consume freeMain instead of justify
+      const hasLineAutoMargins = totalAutoMargins > 0;
+      const autoMarginSlice = hasLineAutoMargins && freeMain > 0 ? freeMain / totalAutoMargins : 0;
+
+      // Compute per-line baseline for baseline alignment (inline mode or align:baseline)
+      let lineBaseline = 0;
+      if (isInline || align === 'baseline') {
+        for (let i = start; i < end; i++) {
+          const bl = measures[i].baseline || resolvedCross[i] * 0.8; // fallback: 80% of height
+          lineBaseline = Math.max(lineBaseline, bl);
+        }
+      }
+
+      let mainCursor = hasLineAutoMargins ? 0 : mainStart;
+      let prevMarginAfter = 0; // for block margin collapsing
       for (let i = start; i < end; i++) {
         const c = flowChildren[i];
         const mg = margins[i];
         const itemMain = resolvedMain[i];
         const itemCross = resolvedCross[i];
-        const mMainBefore = isRow ? mg.left : mg.top;
-        const mMainAfter  = isRow ? mg.right : mg.bottom;
-        const mCrossBefore = isRow ? mg.top : mg.left;
+        // Resolve auto margins: each auto margin gets equal share of free space
+        let mMainBefore = isRow ? mg.left : mg.top;
+        let mMainAfter  = isRow ? mg.right : mg.bottom;
+        if (mMainBefore === 'auto') mMainBefore = autoMarginSlice;
+        if (mMainAfter === 'auto') mMainAfter = autoMarginSlice;
+        // Block margin collapsing: adjacent margins collapse to max(prev, cur)
+        if (isBlock && i > start && prevMarginAfter > 0) {
+          const collapsed = Math.max(prevMarginAfter, mMainBefore);
+          // prevMarginAfter already advanced cursor; reduce mMainBefore to compensate
+          mMainBefore = collapsed - prevMarginAfter;
+        }
+        let mCrossBefore = isRow ? mg.top : mg.left;
+        let mCrossAfter = isRow ? mg.bottom : mg.right;
+        // Auto cross margins center the item
+        if (mCrossBefore === 'auto' && mCrossAfter === 'auto') {
+          const crossSlack = lineCross - itemCross - marginCross[i];
+          mCrossBefore = crossSlack > 0 ? crossSlack / 2 : 0;
+          mCrossAfter = mCrossBefore;
+        } else {
+          if (mCrossBefore === 'auto') mCrossBefore = 0;
+          if (mCrossAfter === 'auto') mCrossAfter = 0;
+        }
 
-        // Per-child cross-axis alignment (align-self overrides panel align)
-        // lineCross includes margins, so subtract them for alignment slack
         const selfAlign = this._attr(c, 'align-self', align);
         let crossPos = 0;
-        const itemCrossWithMargin = itemCross + marginCross[i];
+        const resolvedMarginCross = (typeof mCrossBefore === 'number' ? mCrossBefore : 0) + (typeof mCrossAfter === 'number' ? mCrossAfter : 0);
+        const itemCrossWithMargin = itemCross + resolvedMarginCross;
         switch (selfAlign) {
           case 'center': crossPos = (lineCross - itemCrossWithMargin) / 2; break;
           case 'end': crossPos = lineCross - itemCrossWithMargin; break;
           case 'stretch':
-            resolvedCross[i] = Math.max(minCross[i], Math.min(maxCross[i], lineCross - marginCross[i]));
+            resolvedCross[i] = Math.max(minCross[i], Math.min(maxCross[i], lineCross - resolvedMarginCross));
             break;
-          // 'start': crossPos = 0
+          case 'baseline': {
+            // Align item baseline to line baseline
+            const itemBl = measures[i].baseline || itemCross * 0.8;
+            crossPos = lineBaseline - itemBl;
+            break;
+          }
+          case 'base-center': {
+            // Center the item's baseline range within the line
+            const itemBl = measures[i].baseline || itemCross * 0.8;
+            crossPos = (lineCross - itemCrossWithMargin) / 2 + (lineBaseline - itemBl) / 2;
+            break;
+          }
+        }
+        // In inline mode, default to baseline alignment
+        if (isInline && selfAlign === 'start') {
+          const itemBl = measures[i].baseline || itemCross * 0.8;
+          crossPos = lineBaseline - itemBl;
         }
 
-        // Margins applied externally: cursor advances by content + margin,
-        // child position offset by margin-before
         const px = x + pad.left + (isRow ? mainCursor + mMainBefore : crossPos + crossCursor + mCrossBefore);
         const py = y + pad.top  + (isRow ? crossPos + crossCursor + mCrossBefore : mainCursor + mMainBefore);
 
         finalW[i] = isRow ? itemMain : resolvedCross[i];
         finalH[i] = isRow ? resolvedCross[i] : itemMain;
         positions[i] = { x: px, y: py };
-        mainCursor += itemMain + mMainBefore + mMainAfter + mainGap;
+        mainCursor += itemMain + mMainBefore + mMainAfter + (hasLineAutoMargins || isBlock ? 0 : mainGap);
+        prevMarginAfter = mMainAfter;
       }
 
       crossCursor += lineCross + lineCrossGap;
@@ -1146,6 +2101,15 @@ export class RexSurface {
         for (let i = start; i < end; i++) {
           if (isRow) positions[i].y = y + pad.top + innerCross - (positions[i].y - y - pad.top) - finalH[i];
           else positions[i].x = x + pad.left + innerCross - (positions[i].x - x - pad.left) - finalW[i];
+        }
+      }
+    }
+    if (isReverse) {
+      // row-reverse / column-reverse: flip main-axis positions within each line
+      for (const { start, end } of lines) {
+        for (let i = start; i < end; i++) {
+          if (isRow) positions[i].x = x + pad.left + innerW - (positions[i].x - x - pad.left) - finalW[i];
+          else positions[i].y = y + pad.top + innerH - (positions[i].y - y - pad.top) - finalH[i];
         }
       }
     }
@@ -1172,10 +2136,16 @@ export class RexSurface {
       this._addGradientRectPath(x, y, panelW, panelH, radius, gradient);
     }
 
-    // ── Clip rect for overflow ──
+    // ── Clip rect for overflow (per-axis: overflow-x, overflow-y) ──
     let clip = parentClip || null;
-    if (overflow === 'hidden' || overflow === 'scroll') {
-      const newClip = { x, y, w: panelW, h: panelH };
+    const clipX = overflowX === 'hidden' || overflowX === 'scroll';
+    const clipY = overflowY === 'hidden' || overflowY === 'scroll';
+    if (clipX || clipY) {
+      // Build clip rect from axes that are clipped; unclamped axes use huge range
+      const newClip = {
+        x: clipX ? x : -1e6, y: clipY ? y : -1e6,
+        w: clipX ? panelW : 2e6, h: clipY ? panelH : 2e6,
+      };
       if (clip) {
         const cx1 = Math.max(clip.x, newClip.x), cy1 = Math.max(clip.y, newClip.y);
         const cx2 = Math.min(clip.x + clip.w, newClip.x + newClip.w);
@@ -1186,45 +2156,61 @@ export class RexSurface {
       }
     }
 
+    // Set parent dimensions for child percentage resolution
+    const savedParentW = this._parentWidth;
+    const savedParentH = this._parentHeight;
+    this._parentWidth = panelW;
+    this._parentHeight = panelH;
+
     // ── Collect flow children (z-index sorted) ──
-    // Build render list: [{child, ox, oy, zIndex}]
     const renderList = [];
     for (let i = 0; i < N; i++) {
       const child = flowChildren[i];
+      // visibility:hidden — takes layout space but doesn't render
+      if (this._attr(child, 'visibility', '') === 'hidden') continue;
       const pos = positions[i];
-      const ox = pos.x - this._numAttr(child, 'x', 0);
+      const ox = pos.x - this._numAttr(child, 'x', 0) - scrollX;
       const oy = pos.y - this._numAttr(child, 'y', 0) - scrollY;
       const z = this._numAttr(child, 'z-index', 0);
-      renderList.push({ child, ox, oy, z });
+      renderList.push({ child, ox, oy, z, overlay: flowOverlays[i] });
     }
 
-    // ── Absolute children: position relative to panel, escape flex flow ──
-    for (const child of absChildren) {
+    // ── Absolute children: position relative to panel ──
+    for (let ai = 0; ai < absChildren.length; ai++) {
+      const child = absChildren[ai];
+      if (this._attr(child, 'visibility', '') === 'hidden') continue;
       const margin = this._getMargin(child);
       const left   = this._evalDim(child, 'left', null, panelW);
       const top    = this._evalDim(child, 'top', null, panelH);
       const right  = this._evalDim(child, 'right', null, panelW);
       const bottom = this._evalDim(child, 'bottom', null, panelH);
-      const cw = this._numAttr(child, 'w', 0) || (left != null && right != null ? panelW - left - right : 0);
-      const ch = this._numAttr(child, 'h', 0) || (top != null && bottom != null ? panelH - top - bottom : 0);
+      // Absolute w/h also support percentage (relative to panel)
+      const cw = this._evalDim(child, 'w', 0, panelW) || (left != null && right != null ? panelW - left - right : 0);
+      const ch = this._evalDim(child, 'h', 0, panelH) || (top != null && bottom != null ? panelH - top - bottom : 0);
 
-      let ax = x + pad.left + margin.left;
-      let ay = y + pad.top + margin.top;
-      if (left != null) ax = x + left + margin.left;
-      else if (right != null) ax = x + panelW - right - cw - margin.right;
-      if (top != null) ay = y + top + margin.top;
-      else if (bottom != null) ay = y + panelH - bottom - ch - margin.bottom;
+      const mLeft = margin.left === 'auto' ? 0 : margin.left;
+      const mRight = margin.right === 'auto' ? 0 : margin.right;
+      const mTop = margin.top === 'auto' ? 0 : margin.top;
+      const mBottom = margin.bottom === 'auto' ? 0 : margin.bottom;
 
-      const ox = ax - this._numAttr(child, 'x', 0);
+      let ax = x + pad.left + mLeft;
+      let ay = y + pad.top + mTop;
+      if (left != null) ax = x + left + mLeft;
+      else if (right != null) ax = x + panelW - right - cw - mRight;
+      if (top != null) ay = y + top + mTop;
+      else if (bottom != null) ay = y + panelH - bottom - ch - mBottom;
+
+      const ox = ax - this._numAttr(child, 'x', 0) - scrollX;
       const oy = ay - this._numAttr(child, 'y', 0) - scrollY;
       const z = this._numAttr(child, 'z-index', 0);
-      renderList.push({ child, ox, oy, z });
+      renderList.push({ child, ox, oy, z, overlay: absOverlays[ai] });
     }
 
     // ── Sort by z-index (stable) and render ──
     renderList.sort((a, b) => a.z - b.z);
 
-    for (const { child, ox, oy } of renderList) {
+    for (const { child, ox, oy, overlay } of renderList) {
+      if (overlay) { this._eachOverlay = overlay; this._surfaceCtx = null; }
       switch (child.type) {
         case 'rect': this._collectRect(child, ox, oy, clip); break;
         case 'text': this._collectText(child, ox, oy, clip); break;
@@ -1232,13 +2218,73 @@ export class RexSurface {
         case 'shadow': this._collectShadow(child, ox, oy); break;
         case 'path': this._collectPath(child, ox, oy); break;
         case 'text-editor': this._collectTextEditor(child, ox, oy, clip); break;
+        case 'each': this._collectEach(child, ox, oy, clip); break;
+        case 'match': this._collectMatch(child, ox, oy, clip); break;
+        case 'surface': this._collectSurface(child, ox, oy, clip); break;
+        case 'viewport': this._collectViewport(child, ox, oy, clip); break;
+        case 'image': this._collectImage(child, ox, oy, clip); break;
+        case 'if': this._collectIf(child, ox, oy, clip); break;
         default: {
           const h = this._elementHandlers.get(child.type);
           if (h && h.collect) h.collect(child, ox, oy, clip, this);
           break;
         }
       }
+      if (overlay) { this._eachOverlay = savedOverlay; this._surfaceCtx = null; }
     }
+
+    // ── Scroll bar rendering ──
+    // Show scroll bars when overflow is 'scroll' and content exceeds panel
+    if (overflowY === 'scroll' || overflowX === 'scroll') {
+      // Compute content extent from flow children
+      let contentH = 0, contentW = 0;
+      for (let i = 0; i < N; i++) {
+        const pos = positions[i];
+        const m = measures[i];
+        const childBottom = pos.y + (isRow ? m.h : m.h) - y;
+        const childRight = pos.x + (isRow ? m.w : m.w) - x;
+        contentH = Math.max(contentH, childBottom);
+        contentW = Math.max(contentW, childRight);
+      }
+      contentH += pad.bottom;
+      contentW += pad.right;
+
+      const SCROLLBAR_WIDTH = 6;
+      const SCROLLBAR_MIN_THUMB = 20;
+      const scrollBarColor = this._packColor([0.5, 0.5, 0.5, 0.4]);
+
+      // Vertical scroll bar
+      if (overflowY === 'scroll' && contentH > panelH) {
+        const trackX = x + panelW - SCROLLBAR_WIDTH - 2;
+        const trackY = y + 2;
+        const trackH = panelH - 4;
+        const thumbRatio = panelH / contentH;
+        const thumbH = Math.max(SCROLLBAR_MIN_THUMB, trackH * thumbRatio);
+        const thumbY = trackY + (scrollY / (contentH - panelH)) * (trackH - thumbH);
+        // Track (subtle bg)
+        this._addRectPath(trackX, trackY, SCROLLBAR_WIDTH, trackH, SCROLLBAR_WIDTH / 2, this._packColor([0.3, 0.3, 0.3, 0.15]));
+        // Thumb
+        this._addRectPath(trackX, thumbY, SCROLLBAR_WIDTH, thumbH, SCROLLBAR_WIDTH / 2, scrollBarColor);
+      }
+
+      // Horizontal scroll bar
+      if (overflowX === 'scroll' && contentW > panelW) {
+        const trackY = y + panelH - SCROLLBAR_WIDTH - 2;
+        const trackX = x + 2;
+        const trackW = panelW - 4;
+        const thumbRatio = panelW / contentW;
+        const thumbW = Math.max(SCROLLBAR_MIN_THUMB, trackW * thumbRatio);
+        const thumbX = trackX + (scrollX / (contentW - panelW)) * (trackW - thumbW);
+        // Track
+        this._addRectPath(trackX, trackY, trackW, SCROLLBAR_WIDTH, SCROLLBAR_WIDTH / 2, this._packColor([0.3, 0.3, 0.3, 0.15]));
+        // Thumb
+        this._addRectPath(thumbX, trackY, thumbW, SCROLLBAR_WIDTH, SCROLLBAR_WIDTH / 2, scrollBarColor);
+      }
+    }
+
+    // Restore parent dimensions
+    this._parentWidth = savedParentW;
+    this._parentHeight = savedParentH;
   }
 
   // ── @text-editor — interactive editable text area (Phase 5: self-hosting) ──
@@ -1389,6 +2435,12 @@ export class RexSurface {
     }
   }
 
+  // Two-phase layout contract (use.gpu §7):
+  //   Phase 1 (minMax): _measureElement returns {w, h, minW, minH, maxW, maxH}
+  //     w/h = preferred intrinsic size, min/max = constraint range
+  //   Phase 2 (fit): _fitElement(node, availW, availH, maxW, maxH) returns {w, h}
+  //     allocates actual size within constraints given available space
+
   _measureElement(node) {
     // Memoize by node identity — avoids O(n²) for nested panels
     if (this._measureCache) {
@@ -1396,8 +2448,22 @@ export class RexSurface {
       if (cached) return cached;
     }
     const result = this._measureElementInner(node);
+    // Augment with min/max constraints (two-phase contract)
+    result.minW = result.minW ?? this._numAttr(node, 'min-width', 0);
+    result.minH = result.minH ?? this._numAttr(node, 'min-height', 0);
+    result.maxW = result.maxW ?? this._numAttr(node, 'max-width', Infinity);
+    result.maxH = result.maxH ?? this._numAttr(node, 'max-height', Infinity);
     if (this._measureCache) this._measureCache.set(node, result);
     return result;
+  }
+
+  _fitElement(node, availW, availH, maxW, maxH) {
+    // Phase 2: top-down space allocation. Returns actual size within constraints.
+    const m = this._measureElement(node);
+    const w = Math.max(m.minW, Math.min(m.maxW, maxW ?? Infinity, availW ?? m.w, m.w));
+    const h = Math.max(m.minH, Math.min(m.maxH, maxH ?? Infinity, availH ?? m.h, m.h));
+    // For stretch-mode children, expand to available space
+    return { w, h };
   }
 
   _measureElementInner(node) {
@@ -1414,13 +2480,31 @@ export class RexSurface {
         return { w: w || 100, h: h || 100 };
       }
       case 'text': {
-        const text = node.name || '';
+        const text = this._resolveTextContent(node);
         const size = this._numAttr(node, 'size', 16);
+        const maxWidth = this._numAttr(node, 'max-width', 0);
+        const lineHeight = this._numAttr(node, 'line-height', size * 1.3);
+        const letterSpacing = this._numAttr(node, 'letter-spacing', 0);
+        const wordSpacing = this._numAttr(node, 'word-spacing', 0);
         this._ensureMeasureCanvas();
         this._measureCtx.font = this._sdfFont;
         const scale = size / SDF_GLYPH_SIZE;
-        const measured = this._measureCtx.measureText(text);
-        return { w: measured.width * scale, h: size };
+        // Baseline: ascent above baseline, descent below
+        const ascent = size * 0.8;  // approximate ascent
+        const descent = size * 0.2; // approximate descent
+        // Measure width accounting for letter-spacing and word-spacing
+        let totalW = 0;
+        if (text) {
+          for (const ch of text) {
+            totalW += this._getGlyphMetrics(ch).advance * scale + (ch === ' ' ? wordSpacing : letterSpacing);
+          }
+          totalW -= letterSpacing; // no trailing letter-spacing
+        }
+        if (maxWidth > 0 && text) {
+          const lineCount = Math.max(1, Math.ceil(totalW / maxWidth));
+          return { w: maxWidth, h: lineCount * lineHeight, baseline: ascent };
+        }
+        return { w: totalW, h: size, baseline: ascent };
       }
       case 'panel': {
         const pad = this._getPadding(node);
@@ -1430,14 +2514,54 @@ export class RexSurface {
         const rawDir = this._attr(node, 'layout', 'column');
         const dir = this._resolveBreakpoint(node, rawDir);
         const isRow = dir === 'row';
-        // Only measure flow children (not absolute-positioned)
-        const children = node.children.filter(c =>
-          this._surfaceTypeSet.has(c.type) && this._attr(c, 'position', '') !== 'absolute'
-        );
-        const measures = children.map(c => this._measureElement(c));
+        // Only measure flow children (not absolute-positioned), expanding @each and @match inline
+        const children = [];
+        const childOverlaysMeasure = [];
+        for (const c of node.children) {
+          if (c.type === 'each') {
+            const expanded = this._expandEachForLayout(c);
+            for (const { child, overlay } of expanded) {
+              if (this._attr(child, 'position', '') !== 'absolute') {
+                children.push(child);
+                childOverlaysMeasure.push(overlay);
+              }
+            }
+          } else if (c.type === 'match') {
+            const matched = this._expandMatchForLayout(c);
+            for (const child of matched) {
+              if (this._attr(child, 'position', '') !== 'absolute') {
+                children.push(child);
+                childOverlaysMeasure.push(null);
+              }
+            }
+          } else if (c.type === 'if') {
+            const expanded = this._expandIfForLayout(c);
+            for (const child of expanded) {
+              if (this._attr(child, 'position', '') !== 'absolute') {
+                children.push(child);
+                childOverlaysMeasure.push(null);
+              }
+            }
+          } else if (this._surfaceTypeSet.has(c.type) && this._attr(c, 'position', '') !== 'absolute') {
+            children.push(c);
+            childOverlaysMeasure.push(null);
+          }
+        }
+        const savedOvMeasure = this._eachOverlay;
+        const measures = children.map((c, i) => {
+          if (childOverlaysMeasure[i]) { this._eachOverlay = childOverlaysMeasure[i]; this._surfaceCtx = null; }
+          const m = this._measureElement(c);
+          if (childOverlaysMeasure[i]) { this._eachOverlay = savedOvMeasure; this._surfaceCtx = null; }
+          return m;
+        });
 
         // Child margins contribute to the panel's intrinsic size
-        const childMargins = children.map(c => this._getMargin(c));
+        const childMargins = children.map((c, i) => {
+          if (childOverlaysMeasure[i]) { this._eachOverlay = childOverlaysMeasure[i]; this._surfaceCtx = null; }
+          const m = this._getMargin(c);
+          if (childOverlaysMeasure[i]) { this._eachOverlay = savedOvMeasure; this._surfaceCtx = null; }
+          return m;
+        });
 
         // Explicit dimensions (support percentages)
         const explicitW = this._evalDim(node, 'w', 0, this._width);
@@ -1481,6 +2605,53 @@ export class RexSurface {
 
         return { w, h };
       }
+      case 'each': {
+        // @each measured as sum of its expanded children (column layout)
+        const expanded = this._expandEachForLayout(node);
+        let totalH = 0, maxW = 0;
+        const savedOvEach = this._eachOverlay;
+        for (const { child, overlay } of expanded) {
+          this._eachOverlay = overlay; this._surfaceCtx = null;
+          const m = this._measureElement(child);
+          totalH += m.h;
+          maxW = Math.max(maxW, m.w);
+        }
+        this._eachOverlay = savedOvEach; this._surfaceCtx = null;
+        return { w: maxW, h: totalH };
+      }
+      case 'match': {
+        // @match measured as the matched branch's children
+        const matched = this._expandMatchForLayout(node);
+        let totalH = 0, maxW = 0;
+        for (const child of matched) {
+          const m = this._measureElement(child);
+          totalH += m.h;
+          maxW = Math.max(maxW, m.w);
+        }
+        return { w: maxW, h: totalH };
+      }
+      case 'surface': {
+        // @surface measured by explicit w/h or defaults
+        const w = this._evalDim(node, 'w', 200, this._width) || 200;
+        const h = this._evalDim(node, 'h', 200, this._height) || 200;
+        return { w, h };
+      }
+      case 'image': {
+        const w = this._evalDim(node, 'w', 100, this._width) || 100;
+        const h = this._evalDim(node, 'h', 100, this._height) || 100;
+        return { w, h };
+      }
+      case 'if': {
+        // @if measured as its visible children (if condition true)
+        const expanded = this._expandIfForLayout(node);
+        let totalH = 0, maxW = 0;
+        for (const child of expanded) {
+          const m = this._measureElement(child);
+          totalH += m.h;
+          maxW = Math.max(maxW, m.w);
+        }
+        return { w: maxW, h: totalH };
+      }
       case 'shadow':
         return { w: 0, h: 0 };
       case 'path': {
@@ -1493,6 +2664,8 @@ export class RexSurface {
         const h = this._evalDim(node, 'h', 300, this._height) || 300;
         return { w, h };
       }
+      case 'viewport':
+        return { w: 0, h: 0 }; // viewport is a transform container, not sized
       default: {
         const handler = this._elementHandlers.get(node.type);
         if (handler && handler.measure) return handler.measure(node, this);
@@ -1518,15 +2691,21 @@ export class RexSurface {
     this._ensureMeasureCanvas();
     const ctx = this._measureCtx;
     ctx.font = this._sdfFont;
+    ctx.textBaseline = 'top';
     const m = ctx.measureText(ch);
     const drawX = Math.max(0, (SDF_GLYPH_SIZE - m.width) / 2);
+    // Use full TextMetrics API for accurate vertical positioning
+    const ascent = m.actualBoundingBoxAscent;
+    const descent = m.actualBoundingBoxDescent;
+    const hasFullMetrics = typeof ascent === 'number' && typeof descent === 'number';
+    const drawY = hasFullMetrics ? Math.max(0, Math.round((SDF_GLYPH_SIZE - ascent - descent) / 2)) : 2;
     const metrics = {
       charW: SDF_GLYPH_SIZE,
       charH: SDF_GLYPH_SIZE,
       advance: m.width,
       drawOffsetX: drawX,
-      drawOffsetY: 2,
-      bearingY: Math.round(m.actualBoundingBoxAscent || SDF_GLYPH_SIZE * 0.75),
+      drawOffsetY: drawY,
+      bearingY: hasFullMetrics ? Math.round(ascent) : Math.round(SDF_GLYPH_SIZE * 0.75),
       atlasX: 0, atlasY: 0, atlasW: SDF_GLYPH_SIZE, atlasH: SDF_GLYPH_SIZE,
     };
     this._glyphCache.set(ch, metrics);
@@ -1573,7 +2752,11 @@ export class RexSurface {
       ctx.textBaseline = 'top';
       const m = ctx.measureText(ch);
       const drawX = Math.max(0, (gs - m.width) / 2);
-      ctx.fillText(ch, drawX, 2);
+      const ascent = m.actualBoundingBoxAscent;
+      const descent = m.actualBoundingBoxDescent;
+      const hasFullMetrics = typeof ascent === 'number' && typeof descent === 'number';
+      const drawY = hasFullMetrics ? Math.max(0, Math.round((gs - ascent - descent) / 2)) : 2;
+      ctx.fillText(ch, drawX, drawY);
 
       // Read pixels — keep full alpha for ESDT subpixel offsets
       const imgData = ctx.getImageData(0, 0, gs, gs);
@@ -1597,9 +2780,9 @@ export class RexSurface {
       this._glyphCache.set(ch, {
         charW: gs, charH: gs,
         advance: m.width,
-        drawOffsetX: drawX,  // how far right glyph was drawn in atlas cell
-        drawOffsetY: 2,      // how far down glyph was drawn in atlas cell
-        bearingY: Math.round(m.actualBoundingBoxAscent || gs * 0.75),
+        drawOffsetX: drawX,
+        drawOffsetY: drawY,
+        bearingY: hasFullMetrics ? Math.round(ascent) : Math.round(gs * 0.75),
         atlasX: ax, atlasY: ay, atlasW: gs, atlasH: gs,
       });
     }
@@ -1914,7 +3097,7 @@ export class RexSurface {
       return;
     }
     const type = gradient[0];
-    const fillType = type === 'radial' ? FILL_RADIAL : FILL_LINEAR;
+    const fillType = type === 'radial' ? FILL_RADIAL : type === 'conic' ? FILL_CONIC : FILL_LINEAR;
     const gradIdx = this._gradients.length;
     const stops = gradient.slice(1); // array of color arrays
 
@@ -1923,6 +3106,12 @@ export class RexSurface {
     if (fillType === FILL_LINEAR) {
       p0x = x + w / 2; p0y = y;
       p1x = x + w / 2; p1y = y + h;
+    } else if (fillType === FILL_CONIC) {
+      // Conic: center at rect center, p1.x = angle offset (radians), p1.y unused
+      const angleOffset = Array.isArray(gradient) && typeof gradient[gradient.length - 1] === 'string' && gradient[gradient.length - 1].endsWith('deg')
+        ? parseFloat(gradient[gradient.length - 1]) * Math.PI / 180 : 0;
+      p0x = x + w / 2; p0y = y + h / 2;
+      p1x = angleOffset; p1y = 0;
     } else {
       p0x = x + w / 2; p0y = y + h / 2;
       p1x = x + w; p1y = y;
@@ -1967,7 +3156,7 @@ export class RexSurface {
       this._segments.push({ p0x: x + w, p0y: y + h, p1x: x, p1y: y + h, pathIdx });
       this._segments.push({ p0x: x, p0y: y + h, p1x: x, p1y: y, pathIdx });
     }
-    const flags = (pathIdx & 0xFFFF) | (fillType << 16) | (gradIdx << 18);
+    const flags = (pathIdx & 0xFFFF) | (fillType << 16) | (gradIdx << 19);
     this._paths.push({ segStart, segCount: this._segments.length - segStart, color: 0xFFFFFFFF, flags });
   }
 
@@ -2032,7 +3221,7 @@ export class RexSurface {
     this._segments.push({ p0x: ex + ew, p0y: ey, p1x: ex + ew, p1y: ey + eh, pathIdx });
     this._segments.push({ p0x: ex + ew, p0y: ey + eh, p1x: ex, p1y: ey + eh, pathIdx });
     this._segments.push({ p0x: ex, p0y: ey + eh, p1x: ex, p1y: ey, pathIdx });
-    const flags = (pathIdx & 0xFFFF) | (FILL_SHADOW << 16) | (gradIdx << 18);
+    const flags = (pathIdx & 0xFFFF) | (FILL_SHADOW << 16) | (gradIdx << 19);
     this._paths.push({ segStart, segCount: 4, color: this._packColor(color), flags });
 
     // Also collect the child element itself (drawn on top of shadow)
@@ -2136,6 +3325,44 @@ export class RexSurface {
           this._flattenCubic(cx, cy, c1x, c1y, c2x, c2y, ex, ey, segs);
           cx = ex; cy = ey; break;
         }
+        case 'A': {
+          const rx = Math.abs(n()), ry = Math.abs(n()), rot = n() * Math.PI / 180;
+          const largeArc = n(), sweep = n();
+          const ex = n() + ox, ey = n() + oy;
+          this._flattenArc(cx, cy, rx, ry, rot, largeArc, sweep, ex, ey, segs);
+          cx = ex; cy = ey; break;
+        }
+        case 'a': {
+          const rx = Math.abs(n()), ry = Math.abs(n()), rot = n() * Math.PI / 180;
+          const largeArc = n(), sweep = n();
+          const ex = cx + n(), ey = cy + n();
+          this._flattenArc(cx, cy, rx, ry, rot, largeArc, sweep, ex, ey, segs);
+          cx = ex; cy = ey; break;
+        }
+        case 'S': {
+          // Smooth cubic: reflect last control point
+          const c1x = cx, c1y = cy; // fallback (no previous cubic)
+          const c2x = n() + ox, c2y = n() + oy, ex = n() + ox, ey = n() + oy;
+          this._flattenCubic(cx, cy, c1x, c1y, c2x, c2y, ex, ey, segs);
+          cx = ex; cy = ey; break;
+        }
+        case 's': {
+          const c1x = cx, c1y = cy;
+          const c2x = cx + n(), c2y = cy + n(), ex = cx + n(), ey = cy + n();
+          this._flattenCubic(cx, cy, c1x, c1y, c2x, c2y, ex, ey, segs);
+          cx = ex; cy = ey; break;
+        }
+        case 'T': {
+          // Smooth quadratic: reflect last control point (fallback = current)
+          const ex = n() + ox, ey = n() + oy;
+          this._flattenQuad(cx, cy, cx, cy, ex, ey, segs);
+          cx = ex; cy = ey; break;
+        }
+        case 't': {
+          const ex = cx + n(), ey = cy + n();
+          this._flattenQuad(cx, cy, cx, cy, ex, ey, segs);
+          cx = ex; cy = ey; break;
+        }
         case 'Z': case 'z':
           if (cx !== sx || cy !== sy) segs.push({ p0x: cx, p0y: cy, p1x: sx, p1y: sy });
           cx = sx; cy = sy; break;
@@ -2143,6 +3370,45 @@ export class RexSurface {
       }
     }
     return segs;
+  }
+
+  // SVG endpoint arc → center parameterization → line segments (W3C SVG spec F.6)
+  _flattenArc(x1, y1, rx, ry, phi, fA, fS, x2, y2, segs) {
+    if (rx === 0 || ry === 0) { segs.push({ p0x: x1, p0y: y1, p1x: x2, p1y: y2 }); return; }
+    const cos = Math.cos(phi), sin = Math.sin(phi);
+    const dx2 = (x1 - x2) / 2, dy2 = (y1 - y2) / 2;
+    const x1p = cos * dx2 + sin * dy2, y1p = -sin * dx2 + cos * dy2;
+    // Correct radii if too small
+    let rxSq = rx * rx, rySq = ry * ry;
+    const x1pSq = x1p * x1p, y1pSq = y1p * y1p;
+    const lambda = x1pSq / rxSq + y1pSq / rySq;
+    if (lambda > 1) { rx *= Math.sqrt(lambda); ry *= Math.sqrt(lambda); rxSq = rx * rx; rySq = ry * ry; }
+    // Center point
+    let sq = Math.max(0, (rxSq * rySq - rxSq * y1pSq - rySq * x1pSq) / (rxSq * y1pSq + rySq * x1pSq));
+    sq = Math.sqrt(sq) * (fA === fS ? -1 : 1);
+    const cxp = sq * rx * y1p / ry, cyp = -sq * ry * x1p / rx;
+    const cxr = cos * cxp - sin * cyp + (x1 + x2) / 2;
+    const cyr = sin * cxp + cos * cyp + (y1 + y2) / 2;
+    // Angles
+    const ang = (ux, uy, vx, vy) => {
+      const n = Math.sqrt(ux * ux + uy * uy) * Math.sqrt(vx * vx + vy * vy);
+      const c = Math.max(-1, Math.min(1, (ux * vx + uy * vy) / (n || 1)));
+      return (ux * vy - uy * vx < 0 ? -1 : 1) * Math.acos(c);
+    };
+    const theta1 = ang(1, 0, (x1p - cxp) / rx, (y1p - cyp) / ry);
+    let dTheta = ang((x1p - cxp) / rx, (y1p - cyp) / ry, (-x1p - cxp) / rx, (-y1p - cyp) / ry);
+    if (!fS && dTheta > 0) dTheta -= 2 * Math.PI;
+    if (fS && dTheta < 0) dTheta += 2 * Math.PI;
+    // Flatten to line segments
+    const nSegs = Math.max(4, Math.ceil(Math.abs(dTheta) / (Math.PI / 4)));
+    let px = x1, py = y1;
+    for (let i = 1; i <= nSegs; i++) {
+      const t = theta1 + dTheta * i / nSegs;
+      const ex = cos * rx * Math.cos(t) - sin * ry * Math.sin(t) + cxr;
+      const ey = sin * rx * Math.cos(t) + cos * ry * Math.sin(t) + cyr;
+      segs.push({ p0x: px, p0y: py, p1x: ex, p1y: ey });
+      px = ex; py = ey;
+    }
   }
 
   _flattenQuad(x0, y0, cpx, cpy, x1, y1, segs, n = 4) {

@@ -1754,7 +1754,14 @@ function compileExpr(exprObj) {
   }
   if (exprObj && typeof exprObj === 'object' && exprObj.expr !== undefined) {
     if (exprObj.rex) return _compileCanonical(exprObj.rex);
-    const { nodes } = rexParseCold(exprObj.expr);
+    const exprStr = exprObj.expr;
+    // Fast path: $binding/path, /slot/path, %dep — avoid cold parse splitting on /
+    if (typeof exprStr === 'string') {
+      if (exprStr.startsWith('$') && /^\$[\w/.-]+$/.test(exprStr)) return { op: 'binding', name: exprStr.slice(1) };
+      if (exprStr.startsWith('/') && /^\/[\w/.-]+$/.test(exprStr)) return { op: 'slot', path: exprStr.slice(1) };
+      if (exprStr.startsWith('%') && /^%[\w.-]+$/.test(exprStr)) return { op: 'dep', label: exprStr.slice(1) };
+    }
+    const { nodes } = rexParseCold(exprStr);
     return nodes.length > 0 ? _compileCanonical(NestPre(BK.Paren, '', [nodes[0]])) : null;
   }
   return null;

@@ -13,6 +13,7 @@ import { TabManager } from './tab-manager.js';
 import { callClaude } from './claude-api.js';
 import { RexAudio } from './rex-audio.js';
 import { expandAgentSugar, registerDelegate, assemblePrompt, callLLM, buildToolSchema } from './rex-agent.js';
+import { RexFiberHost } from './rex-fiber.js';
 import { RexMediaSugar } from './rex-media.js';
 
 (async()=>{ try {
@@ -363,6 +364,15 @@ import { RexMediaSugar } from './rex-media.js';
     surface = new RexSurface(gpu.device, gpu.context, gpu.format, log);
   }
 
+  // ── Fiber host (incremental recompilation) ──
+  let fiberHost = null;
+  if (gpuOk) {
+    try {
+      fiberHost = new RexFiberHost({ heapSize: 1024 * 1024, log }); // 1MB heap
+      log('fiber: host ready (1MB heap)', 'ok');
+    } catch(e) { log(`fiber init: ${e.message}`, 'err'); fiberHost = null; }
+  }
+
   // ── PCN transducer ──
   let pcn = null;
   if (gpuOk) {
@@ -460,6 +470,7 @@ import { RexMediaSugar } from './rex-media.js';
   if (gpuOk) gpu._media = mediaSugar;
   window._agent = { assemblePrompt, callLLM, buildToolSchema };
   window._media = mediaSugar;
+  window._fiber = fiberHost;
 
   // ── Undo/Redo (Ctrl+Z / Ctrl+Shift+Z) ──
   document.addEventListener('keydown', e => {
@@ -750,6 +761,21 @@ import { RexMediaSugar } from './rex-media.js';
             pcn.transduce(pcnEnc);
             gpu.device.queue.submit([pcnEnc.finish()]);
           }catch(e4){/* silent */}
+        }
+        // Tick tweens — time-based slot interpolation
+        if(behaviour && behaviour.hasTweens()){
+          try{
+            const tweenActive = behaviour.tickTweens(performance.now());
+            if(tweenActive) surfaceDirty = true;
+          }catch(et){/* tween errors non-fatal */}
+        }
+        // Flush fiber host — drain dirty fibers, mark surface dirty if outputs changed
+        if(fiberHost){
+          try{
+            const prevRenders = fiberHost.stats?.renders || 0;
+            fiberHost.flush();
+            if((fiberHost.stats?.renders || 0) > prevRenders) surfaceDirty = true;
+          }catch(ef){/* fiber flush errors non-fatal */}
         }
         if(surfaceDirty&&surface&&currentTree){
           try{ surface.compile(currentTree, canvas.width, canvas.height); }catch(e5){log(`surface recompile: ${e5.message}`,'err');}

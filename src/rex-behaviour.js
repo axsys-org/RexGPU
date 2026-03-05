@@ -33,6 +33,11 @@ export class RexBehaviour {
     // ── Self-healing state ──
     this._recoveryState = new Map();  // shrubName → {attempts, cooldownUntil}
 
+    // ── Tween system ──
+    this._tweens = [];            // compiled tween definitions [{shrub, slot, duration, easing, delay, loop, yoyo}]
+    this._activeTweens = [];      // running tweens [{tween, startTime, from, to, done}]
+    this._tweenDirty = false;     // true when any tween is actively interpolating
+
     // ── Extension hooks ──
     this._schemaHandlers = new Map();
     this._mutationHandlers = new Map();
@@ -136,7 +141,13 @@ export class RexBehaviour {
       }
     }
 
-    // 6. Compile @channel bridges (behaviour → GPU heap)
+    // 6. Compile @tween definitions
+    this._tweens = [];
+    for (const t of Rex.findAll(tree, 'tween')) {
+      this._compileTween(t);
+    }
+
+    // 7. Compile @channel bridges (behaviour → GPU heap)
     this._compileChannels(tree);
 
     // 7. Order derives by dependency
@@ -248,6 +259,123 @@ export class RexBehaviour {
 
     this._talks.set(`${shrubName}/${actionName}`, { shrub: shrubName, inputs, guard, mutations });
   }
+
+  _compileTween(node) {
+    const shrubName = node.attrs.shrub;
+    const slotName = node.attrs.slot || node.name;
+    if (!shrubName || !slotName) return;
+    const duration = +(node.attrs.duration || node.attrs.dur || 300); // ms
+    const delay = +(node.attrs.delay || 0);
+    const easingName = node.attrs.easing || node.attrs.ease || 'ease-out';
+    const loop = node.attrs.loop === 'true' || node.attrs.loop === true;
+    const yoyo = node.attrs.yoyo === 'true' || node.attrs.yoyo === true;
+    const to = node.attrs.to !== undefined ? +node.attrs.to : undefined;
+    this._tweens.push({ shrub: shrubName, slot: slotName, duration, delay, easing: easingName, loop, yoyo, to });
+  }
+
+  // ── Easing functions ──
+  static _easings = {
+    'linear':      t => t,
+    'ease-in':     t => t * t,
+    'ease-out':    t => t * (2 - t),
+    'ease-in-out': t => t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t,
+    'ease-in-cubic':  t => t * t * t,
+    'ease-out-cubic': t => 1 - Math.pow(1 - t, 3),
+    'ease-in-out-cubic': t => t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2,
+    'ease-in-quart':  t => t * t * t * t,
+    'ease-out-quart': t => 1 - Math.pow(1 - t, 4),
+    'ease-in-out-quart': t => t < 0.5 ? 8 * t * t * t * t : 1 - Math.pow(-2 * t + 2, 4) / 2,
+    'ease-in-expo':   t => t === 0 ? 0 : Math.pow(2, 10 * t - 10),
+    'ease-out-expo':  t => t === 1 ? 1 : 1 - Math.pow(2, -10 * t),
+    'ease-in-back':   t => 2.70158 * t * t * t - 1.70158 * t * t,
+    'ease-out-back':  t => { const c = 1.70158; return 1 + (c + 1) * Math.pow(t - 1, 3) + c * Math.pow(t - 1, 2); },
+    'ease-out-bounce': t => {
+      if (t < 1 / 2.75) return 7.5625 * t * t;
+      if (t < 2 / 2.75) return 7.5625 * (t -= 1.5 / 2.75) * t + 0.75;
+      if (t < 2.5 / 2.75) return 7.5625 * (t -= 2.25 / 2.75) * t + 0.9375;
+      return 7.5625 * (t -= 2.625 / 2.75) * t + 0.984375;
+    },
+    'ease-out-elastic': t => t === 0 ? 0 : t === 1 ? 1 : Math.pow(2, -10 * t) * Math.sin((t * 10 - 0.75) * (2 * Math.PI / 3)) + 1,
+    'spring': t => 1 - Math.cos(t * Math.PI * 4.5) * Math.exp(-t * 6),
+  };
+
+  // Start a tween programmatically: tween(shrub, slot, to, opts)
+  tween(shrubName, slotName, toValue, opts = {}) {
+    const shrub = this._shrubs.get(shrubName);
+    if (!shrub) return;
+    const fromValue = +(shrub.slots.get(slotName) || 0);
+    const duration = opts.duration || 300;
+    const delay = opts.delay || 0;
+    const easing = opts.easing || 'ease-out';
+    const loop = opts.loop || false;
+    const yoyo = opts.yoyo || false;
+    // Remove any existing tween on the same slot
+    this._activeTweens = this._activeTweens.filter(a => !(a.shrub === shrubName && a.slot === slotName));
+    this._activeTweens.push({
+      shrub: shrubName, slot: slotName, from: fromValue, to: toValue,
+      duration, delay, easing, loop, yoyo,
+      startTime: performance.now(), direction: 1, done: false,
+    });
+    this._tweenDirty = true;
+  }
+
+  // Tick all active tweens — call from render loop with current time
+  tickTweens(now) {
+    if (this._activeTweens.length === 0) return false;
+    let anyActive = false;
+    for (const tw of this._activeTweens) {
+      if (tw.done) continue;
+      const elapsed = now - tw.startTime - tw.delay;
+      if (elapsed < 0) { anyActive = true; continue; } // still in delay
+      let t = Math.min(1, elapsed / tw.duration);
+      // Yoyo: reverse direction on each loop
+      if (tw.yoyo && tw.direction === -1) t = 1 - t;
+      // Apply easing
+      const easeFn = RexBehaviour._easings[tw.easing] || RexBehaviour._easings['ease-out'];
+      const eased = easeFn(t);
+      // Interpolate
+      const value = tw.from + (tw.to - tw.from) * eased;
+      // Write to slot
+      const shrub = this._shrubs.get(tw.shrub);
+      if (shrub) {
+        shrub.slots.set(tw.slot, value);
+        this._markDeriveDirty(tw.shrub, tw.slot);
+        if (this.onSlotChange) this.onSlotChange(tw.shrub, tw.slot, value);
+      }
+      if (t >= 1) {
+        if (tw.loop) {
+          tw.startTime = now;
+          if (tw.yoyo) tw.direction *= -1;
+          anyActive = true;
+        } else {
+          tw.done = true;
+        }
+      } else {
+        anyActive = true;
+      }
+    }
+    // Clean up done tweens
+    this._activeTweens = this._activeTweens.filter(a => !a.done);
+    if (anyActive) {
+      this._flushDerives();
+      this._tweenDirty = true;
+    } else {
+      this._tweenDirty = false;
+    }
+    return anyActive;
+  }
+
+  // Start all compiled @tween definitions (called after slot changes via talk)
+  startTweens(shrubName, slotName, toValue) {
+    for (const tw of this._tweens) {
+      if (tw.shrub === shrubName && tw.slot === slotName) {
+        this.tween(shrubName, slotName, toValue !== undefined ? toValue : (tw.to !== undefined ? tw.to : 0), tw);
+      }
+    }
+  }
+
+  // Check if any tweens are running
+  hasTweens() { return this._activeTweens.length > 0; }
 
   _compileDepReaction(node) {
     const shrubName = node.attrs.shrub;
